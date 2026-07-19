@@ -1,5 +1,5 @@
 //! Notes TUI: preview/edit modes over one scrollable markdown note, autosaved
-//! to this workspace's note file (see state.rs), heartbeating a pane identity
+//! to this tab's note file (see state.rs), heartbeating a pane identity
 //! token so the launcher can toggle / focus / replace the pane.
 //!
 //! There is no manual save workflow — everything autosaves — and the only

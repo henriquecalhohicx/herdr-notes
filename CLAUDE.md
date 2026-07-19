@@ -1,7 +1,7 @@
 # herdr-notes
 
 A single herdr plugin: a persistent markdown notes pane (one scrollable note
-per workspace, preview/edit modes). Standalone Rust crate — the repo root IS
+per tab, preview/edit modes). Standalone Rust crate — the repo root IS
 the plugin root (`herdr plugin link .` from here).
 
 **Living doc**: when you discover a non-obvious herdr/Windows/TUI behavior the hard
@@ -17,32 +17,37 @@ findings doc (and the reference implementation, `herdr-sidebar`) lives in
   autosave, 5s heartbeat, scrollbars
 - `src/markdown.rs` — hand-rolled renderer (headings, lists, checkboxes, quotes,
   code, bold/italic, hr) + display-width wrapping
-- `src/state.rs` — `{text, mode}` JSON, one file PER WORKSPACE in herdr's
-  plugin state dir (`HERDR_PLUGIN_STATE_DIR/<workspace-id>.json`, e.g.
+- `src/state.rs` — `{text, mode}` JSON, one file PER TAB in herdr's
+  plugin state dir (`HERDR_PLUGIN_STATE_DIR/<tab-key>.json`, e.g.
   `%LOCALAPPDATA%\herdr\plugins\herdr-notes\` — the docs-mandated home for
   durable plugin state; actions get the env var and the launchers pass it
   into the pane via `pane split --env`, the unix `[[panes]]` entry gets it
   natively). Without it (binary run by hand): config-dir fallback
-  `%APPDATA%\herdr\notes\<workspace-id>.json` (unix:
+  `%APPDATA%\herdr\notes\<tab-key>.json` (unix:
   `$XDG_CONFIG_HOME|~/.config/herdr/notes/`); the state dir migrates
-  fallback-layout files in on first load. Keyed by the stable
-  `HERDR_WORKSPACE_ID` herdr injects into every pane (survives workspace
-  renames; a closed workspace leaves a harmless orphan file). Unset or
-  filename-unsafe (non-alphanumeric) id → legacy single-note
-  `herdr/notes.json`; first per-workspace load MOVES a lingering legacy
-  file into the workspace's slot (read-in-place if the rename fails; the
-  per-workspace file wins when both exist). `note_key` exposes the note-FILE
-  identity of a workspace id (None = shared legacy file; Windows folds ASCII
-  case because NTFS filenames are case-insensitive) — the launcher guard
-  compares THESE keys so it can never drift from the on-disk layout.
-  Forgiving parse, atomic save (temp + `sync_all` + rename); path logic
-  takes an injected base dir so tests never touch the real APPDATA
+  fallback-layout files in on first load. Keyed by the
+  `HERDR_TAB_ID` herdr injects into every pane (form `<workspace>:<n>`, e.g.
+  `w1:t2`; monotonic and never reused within a session, so a closed tab
+  leaves a harmless orphan file that no future tab reclaims). The `:`
+  separator is sanitized to `_` for the filename (`w1_t2.json`); herdr ids
+  never contain `_`, so no collision. Unset or filename-unsafe (anything
+  beyond alphanumerics + the single `:`) id → legacy single-note
+  `herdr/notes.json`; first tab load MOVES a lingering legacy
+  file into the tab's slot (read-in-place if the rename fails; the
+  per-tab file wins when both exist). NOTE: old per-workspace `<w>.json`
+  files are NOT migrated — they orphan; delete by hand. `note_key` exposes
+  the note-FILE identity of a tab id (None = shared legacy file; Windows
+  folds ASCII case because NTFS filenames are case-insensitive) — the
+  launcher guard compares THESE keys so it can never drift from the on-disk
+  layout. Forgiving parse, atomic save (temp + `sync_all` + rename); path
+  logic takes an injected base dir so tests never touch the real APPDATA
 - `src/launch.rs` — OPEN/FOCUS/CLOSE/REPLACE toggle decisions (20s stale heartbeat
-  → REPLACE); prefers a same-tab Notes pane but matches any pane whose
-  `note_key` EQUALS the focused pane's, so a second instance on the same note
-  file is never spawned (two live instances = last-writer-wins data loss) even
-  when different raw workspace ids coarsen to one file (unsafe/missing ids →
-  legacy, NTFS case folding); Notes panes on other note files are ignored
+  → REPLACE); matches any pane whose `note_key` (on the tab id) EQUALS the
+  focused pane's, so a second instance on the same note file is never spawned
+  (two live instances = last-writer-wins data loss) even when different raw tab
+  ids coarsen to one file (unsafe/missing ids → legacy, NTFS case folding);
+  Notes panes in other tabs are different documents and are ignored (each tab
+  opens its own)
 - `src/ipc.rs` — socket client: named pipe `\\.\pipe\<HERDR_SOCKET_PATH>` on
   Windows, unix socket elsewhere; one NDJSON request per connection
 - `scripts/open-notes.ps1` / `open-notes.sh` — toggle launchers (right-dock);
@@ -70,8 +75,8 @@ while the TUI is running in a pane — quit/close the pane first (and
   keep the old binary).
 - End-to-end verification: drive the real binary in a throwaway pane —
   `herdr pane split` + `pane run` + `pane send-keys` + `pane read --source visible`,
-  then check `%APPDATA%\herdr\notes\<workspace-id>.json` (the pane's
-  `HERDR_WORKSPACE_ID`). Cheap, catches what unit tests can't.
+  then check `%APPDATA%\herdr\notes\<tab-key>.json` (the pane's
+  `HERDR_TAB_ID` with `:` sanitized to `_`). Cheap, catches what unit tests can't.
 
 ## Gotchas (verified against herdr 0.7.1)
 
@@ -101,23 +106,26 @@ Learned building this plugin:
 - A `pane list` snapshot goes stale the moment you close a pane: the REPLACE path
   must re-run `pane list` after closing the corpse before deriving split targets,
   or the split targets a dead pane id and the action exits 1.
-- Plain `herdr pane list` is GLOBAL — panes from EVERY workspace, exactly one
-  `focused` pane in the whole list. The launchers deliberately pass this
-  GLOBAL list: scoping with `--workspace $HERDR_WORKSPACE_ID` uses the
-  launcher shell's SPAWN-TIME env id, which can diverge from the focused
-  pane's actual workspace (pane moved between workspaces, action invoked
-  under another workspace's env) — the scoped list then omits the focused
-  pane, `--launch-decision` degrades to OPEN, and a duplicate Notes pane
-  spawns beside the focused workspace's live one. All scoping happens in the
-  binary off each pane's `workspace_id` FIELD, compared by note-file identity
-  (`state::note_key`) so the guard matches exactly the panes that share a file.
+- Plain `herdr pane list` is GLOBAL — panes from EVERY workspace/tab, exactly
+  one `focused` pane in the whole list. The launchers deliberately pass this
+  GLOBAL list: scoping with `--workspace`/`--tab` uses the launcher shell's
+  SPAWN-TIME env id, which can diverge from the focused pane's actual tab
+  (pane moved between tabs, action invoked under another tab's env) — the
+  scoped list then omits the focused pane, `--launch-decision` degrades to
+  OPEN, and a duplicate Notes pane spawns beside the focused tab's live one.
+  All scoping happens in the binary off each pane's `tab_id` FIELD, compared
+  by note-file identity (`state::note_key`) so the guard matches exactly the
+  panes that share a file.
 - `herdr plugin action invoke` runs the action in the GLOBALLY focused
-  workspace context, not the invoking pane's. Keybinding use is fine (the
-  focused workspace IS the intended one), but a background/scripted invoke
-  races with the user switching workspaces: it toggles Notes in — and can
-  legacy-migrate a note into — whatever workspace happens to be focused.
-  Scripted invocations MUST focus the target workspace first and verify it
-  stayed focused.
+  tab context, not the invoking pane's. Keybinding use is fine (the focused
+  tab IS the intended one), but a background/scripted invoke races with the
+  user switching tabs/workspaces: it toggles Notes in — and can legacy-migrate
+  a note into — whatever tab happens to be focused. Scripted invocations MUST
+  focus the target tab first and verify it stayed focused.
+- Tab ids (`HERDR_TAB_ID`, e.g. `w1:t2`) are monotonic and NOT reused within a
+  session; the session's id counter persists across a server restart (verified
+  0.7.4). So an orphaned per-tab note file can never be reclaimed by a future
+  tab — no stale-content risk, just dead files that accumulate as tabs close.
 - A pane created with `pane run "<shell command>"` keeps its shell alive after
   the command exits — quitting the TUI with `q` left a dead PowerShell prompt
   still labeled "Notes". The ps1 launcher appends `; exit` to the pane run

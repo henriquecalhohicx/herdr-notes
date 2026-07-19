@@ -1,11 +1,12 @@
-//! Persistent note state: one scrollable markdown note PER WORKSPACE plus the
+//! Persistent note state: one scrollable markdown note PER TAB plus the
 //! last-active mode, stored as a small JSON file beside herdr's own config
-//! (`%APPDATA%\herdr\notes\<workspace-id>.json` on Windows,
+//! (`%APPDATA%\herdr\notes\<tab-key>.json` on Windows,
 //! `$XDG_CONFIG_HOME/herdr/…` elsewhere) so the note survives computer
-//! restarts. The key is the stable `HERDR_WORKSPACE_ID` herdr injects into
-//! every managed pane; outside herdr (or on an id unsafe for a filename) the
-//! pane falls back to the legacy single-note `herdr/notes.json`, and the
-//! first workspace to load notes MOVES that legacy file into its own slot.
+//! restarts. The key is the `HERDR_TAB_ID` herdr injects into every managed
+//! pane (its `:` separator sanitized to `_`); outside herdr (or on an id
+//! unsafe for a filename) the pane falls back to the legacy single-note
+//! `herdr/notes.json`, and the first tab to load notes MOVES that legacy file
+//! into its own slot.
 //!
 //! Loading is forgiving — a missing, hand-edited, or truncated file falls back
 //! to an empty note and never panics. Saving is atomic (temp file + rename)
@@ -59,7 +60,7 @@ pub struct Note {
 /// migration source when the state dir is empty.
 enum StoreBase {
     /// `HERDR_PLUGIN_STATE_DIR`: files live directly in the dir
-    /// (`<dir>/<key>.json`, no-workspace fallback `<dir>/note.json`).
+    /// (`<dir>/<key>.json`, no-tab fallback `<dir>/note.json`).
     PluginState(PathBuf),
     /// Config-dir layout (`<config>/herdr/notes/<key>.json`, legacy
     /// `<config>/herdr/notes.json`).
@@ -87,92 +88,93 @@ fn config_base() -> Option<PathBuf> {
     base
 }
 
-/// The workspace id herdr injects into every managed pane; the per-workspace
-/// note key. Empty = unset (running outside herdr).
-fn workspace_env() -> Option<String> {
-    std::env::var("HERDR_WORKSPACE_ID").ok().filter(|id| !id.is_empty())
+/// The tab id herdr injects into every managed pane; the per-tab note key.
+/// Empty = unset (running outside herdr).
+fn tab_env() -> Option<String> {
+    std::env::var("HERDR_TAB_ID").ok().filter(|id| !id.is_empty())
 }
 
-/// True when the workspace id is safe to embed in a filename. Stricter than
-/// launch.rs's flag-safe check (which also admits `:` `.` `_` `-`): real ids
-/// are plain alphanumeric ("w6"), and anything else — separators, dots,
-/// anything path-traversal-shaped — falls back to the legacy path instead.
+/// True when the tab id is safe to embed in a filename. Real herdr tab ids are
+/// `<workspace>:<n>` (e.g. "w6:t1"), so the single `:` separator is admitted
+/// alongside plain alphanumerics; [`note_key`] sanitizes it to `_`. Everything
+/// else — dots, spaces, `-`, `_`, anything path-traversal-shaped — falls back
+/// to the legacy path instead.
 fn is_filename_safe(id: &str) -> bool {
-    !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric())
+    !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == ':')
 }
 
-/// Pre-per-workspace single-note file; also the fallback when no (safe)
-/// workspace id is available.
+/// Pre-per-tab single-note file; also the fallback when no (safe)
+/// tab id is available.
 fn legacy_path_in(base: &Path) -> PathBuf {
     base.join("herdr").join("notes.json")
 }
 
-/// The note-FILE identity of a workspace id: `Some(key)` when the id gets its
-/// own per-workspace file, `None` when it falls back to the shared legacy
-/// `notes.json`. Panes whose keys are EQUAL load and save the SAME file.
-/// This is the identity the launcher's duplicate-instance guard (launch.rs)
-/// compares — never raw workspace ids — so the guard can't drift from the
-/// on-disk layout: unsafe/missing ids all coarsen to one legacy file, and on
-/// Windows ASCII case is folded because NTFS filenames are case-insensitive
-/// ("W6.json" and "w6.json" are one file).
-pub fn note_key(workspace_id: Option<&str>) -> Option<String> {
-    let id = workspace_id.filter(|id| is_filename_safe(id))?;
+/// The note-FILE identity of a tab id: `Some(key)` when the id gets its own
+/// per-tab file, `None` when it falls back to the shared legacy `notes.json`.
+/// Panes whose keys are EQUAL load and save the SAME file. This is the identity
+/// the launcher's duplicate-instance guard (launch.rs) compares — never raw tab
+/// ids — so the guard can't drift from the on-disk layout: unsafe/missing ids
+/// all coarsen to one legacy file, the `:` separator is sanitized to `_`
+/// (herdr ids never contain `_`, so no collision), and on Windows ASCII case is
+/// folded because NTFS filenames are case-insensitive ("W6_T1.json" and
+/// "w6_t1.json" are one file).
+pub fn note_key(tab_id: Option<&str>) -> Option<String> {
+    let id = tab_id.filter(|id| is_filename_safe(id))?;
+    let key = id.replace(':', "_");
     #[cfg(windows)]
-    let key = id.to_ascii_lowercase();
-    #[cfg(not(windows))]
-    let key = id.to_string();
+    let key = key.to_ascii_lowercase();
     Some(key)
 }
 
 /// Pure path selection: `<base>/herdr/notes/<note-key>.json` for a
 /// filename-safe id, the legacy `<base>/herdr/notes.json` otherwise.
 /// Built from [`note_key`] so path identity and guard identity always agree.
-fn state_path_in(base: &Path, workspace_id: Option<&str>) -> PathBuf {
-    match note_key(workspace_id) {
+fn state_path_in(base: &Path, tab_id: Option<&str>) -> PathBuf {
+    match note_key(tab_id) {
         Some(key) => base.join("herdr").join("notes").join(format!("{key}.json")),
         None => legacy_path_in(base),
     }
 }
 
 /// Path selection for the plugin-state layout: `<dir>/<note-key>.json`, with
-/// the shared `<dir>/note.json` for missing/unsafe workspace ids.
-fn state_dir_path(dir: &Path, workspace_id: Option<&str>) -> PathBuf {
-    match note_key(workspace_id) {
+/// the shared `<dir>/note.json` for missing/unsafe tab ids.
+fn state_dir_path(dir: &Path, tab_id: Option<&str>) -> PathBuf {
+    match note_key(tab_id) {
         Some(key) => dir.join(format!("{key}.json")),
         None => dir.join("note.json"),
     }
 }
 
-/// State file location for THIS process (env-derived base + workspace id).
+/// State file location for THIS process (env-derived base + tab id).
 pub fn state_path() -> Option<PathBuf> {
-    let ws = workspace_env();
+    let tab = tab_env();
     Some(match store_base()? {
-        StoreBase::PluginState(dir) => state_dir_path(&dir, ws.as_deref()),
-        StoreBase::Config(base) => state_path_in(&base, ws.as_deref()),
+        StoreBase::PluginState(dir) => state_dir_path(&dir, tab.as_deref()),
+        StoreBase::Config(base) => state_path_in(&base, tab.as_deref()),
     })
 }
 
 pub fn load() -> Note {
-    let ws = workspace_env();
+    let tab = tab_env();
     match store_base() {
         Some(StoreBase::PluginState(dir)) => {
-            load_state_dir(&dir, config_base().as_deref(), ws.as_deref())
+            load_state_dir(&dir, config_base().as_deref(), tab.as_deref())
         }
-        Some(StoreBase::Config(base)) => load_in(&base, ws.as_deref()),
+        Some(StoreBase::Config(base)) => load_in(&base, tab.as_deref()),
         None => Note::default(),
     }
 }
 
 /// Load from the plugin state dir, migrating from the config-dir layout the
-/// first time: if this workspace's file is missing there, MOVE the config-dir
-/// per-workspace file (or, failing that, the legacy single note) into place.
+/// first time: if this tab's file is missing there, MOVE the config-dir
+/// per-tab file (or, failing that, the legacy single note) into place.
 /// A failed rename falls back to reading the source without moving it.
-fn load_state_dir(dir: &Path, config: Option<&Path>, workspace_id: Option<&str>) -> Note {
-    let path = state_dir_path(dir, workspace_id);
+fn load_state_dir(dir: &Path, config: Option<&Path>, tab_id: Option<&str>) -> Note {
+    let path = state_dir_path(dir, tab_id);
     if !path.exists()
         && let Some(base) = config
     {
-        let sources = [state_path_in(base, workspace_id), legacy_path_in(base)];
+        let sources = [state_path_in(base, tab_id), legacy_path_in(base)];
         if let Some(src) = sources.iter().find(|p| p.exists()) {
             let moved = std::fs::create_dir_all(dir).is_ok() && std::fs::rename(src, &path).is_ok();
             if !moved {
@@ -183,13 +185,13 @@ fn load_state_dir(dir: &Path, config: Option<&Path>, workspace_id: Option<&str>)
     read_note(&path)
 }
 
-/// Load with one-time migration: when the per-workspace file does not exist
+/// Load with one-time migration: when the per-tab file does not exist
 /// yet but the legacy single-note file does, MOVE the legacy file into this
-/// workspace's slot — the first workspace to open notes inherits the old note.
+/// tab's slot — the first tab to open notes inherits the old note.
 /// If the rename fails the legacy file is read in place (not moved); when both
-/// files exist the per-workspace one wins and the legacy file is untouched.
-fn load_in(base: &Path, workspace_id: Option<&str>) -> Note {
-    let path = state_path_in(base, workspace_id);
+/// files exist the per-tab one wins and the legacy file is untouched.
+fn load_in(base: &Path, tab_id: Option<&str>) -> Note {
+    let path = state_path_in(base, tab_id);
     let legacy = legacy_path_in(base);
     if path != legacy && !path.exists() && legacy.exists() {
         let moved = path.parent().is_some_and(|dir| {
@@ -305,16 +307,22 @@ mod tests {
     }
 
     #[test]
-    fn state_path_keys_on_safe_workspace_ids_only() {
+    fn state_path_keys_on_safe_tab_ids_only() {
         let base = Path::new("base");
+        // A tab id (`w6:t1`) sanitizes its `:` separator into the filename.
+        assert_eq!(
+            state_path_in(base, Some("w6:t1")),
+            base.join("herdr").join("notes").join("w6_t1.json")
+        );
+        // A bare alphanumeric id still keys directly.
         assert_eq!(
             state_path_in(base, Some("w6")),
             base.join("herdr").join("notes").join("w6.json")
         );
-        // Unset (outside herdr) and filename-unsafe ids use the legacy path.
+        // Unset (outside herdr) and genuinely unsafe ids use the legacy path.
         let legacy = legacy_path_in(base);
         assert_eq!(state_path_in(base, None), legacy);
-        for bad in ["", "w6:t1", "../evil", "a b", "-w6", "w6.json"] {
+        for bad in ["", "../evil", "a b", "-w6", "w6.json", "w6_t1"] {
             assert_eq!(state_path_in(base, Some(bad)), legacy, "unsafe id {bad:?}");
         }
     }
@@ -322,25 +330,31 @@ mod tests {
     #[test]
     fn note_key_mirrors_file_identity() {
         assert_eq!(note_key(Some("w6")), Some("w6".to_string()));
+        // A tab id's `:` is sanitized to `_` (herdr ids never contain `_`, so
+        // this can't collide with any real id).
+        assert_eq!(note_key(Some("w6:t1")), Some("w6_t1".to_string()));
         // Every id without its own file shares ONE key (None = legacy file).
         assert_eq!(note_key(None), None);
-        for bad in ["", "w6:t1", "../evil", "a b", "-w6", "w6.json"] {
+        for bad in ["", "../evil", "a b", "-w6", "w6.json", "w6_t1"] {
             assert_eq!(note_key(Some(bad)), None, "unsafe id {bad:?}");
         }
-        // NTFS is case-insensitive: "W6" and "w6" hit the same file on
+        // NTFS is case-insensitive: "W6:T1" and "w6:t1" hit the same file on
         // Windows, so their keys (and filenames) must fold together there.
         #[cfg(windows)]
         {
-            assert_eq!(note_key(Some("W6")), Some("w6".to_string()));
+            assert_eq!(note_key(Some("W6:T1")), Some("w6_t1".to_string()));
             let base = Path::new("base");
-            assert_eq!(state_path_in(base, Some("W6")), state_path_in(base, Some("w6")));
+            assert_eq!(
+                state_path_in(base, Some("W6:T1")),
+                state_path_in(base, Some("w6:t1"))
+            );
         }
         #[cfg(not(windows))]
-        assert_eq!(note_key(Some("W6")), Some("W6".to_string()));
+        assert_eq!(note_key(Some("W6:T1")), Some("W6_T1".to_string()));
     }
 
     #[test]
-    fn first_load_moves_the_legacy_note_into_the_workspace_slot() {
+    fn first_load_moves_the_legacy_note_into_the_tab_slot() {
         let base = temp_base("migrate");
         write_note(&legacy_path_in(&base), "old note");
         assert_eq!(load_in(&base, Some("w6")).text, "old note");
@@ -352,11 +366,11 @@ mod tests {
     }
 
     #[test]
-    fn per_workspace_file_wins_over_a_lingering_legacy_file() {
+    fn per_tab_file_wins_over_a_lingering_legacy_file() {
         let base = temp_base("both");
-        let ws_path = state_path_in(&base, Some("w6"));
-        std::fs::create_dir_all(ws_path.parent().unwrap()).unwrap();
-        write_note(&ws_path, "mine");
+        let tab_path = state_path_in(&base, Some("w6"));
+        std::fs::create_dir_all(tab_path.parent().unwrap()).unwrap();
+        write_note(&tab_path, "mine");
         write_note(&legacy_path_in(&base), "stale");
         assert_eq!(load_in(&base, Some("w6")).text, "mine");
         assert!(legacy_path_in(&base).exists(), "legacy file untouched when both exist");
@@ -367,7 +381,7 @@ mod tests {
     fn plugin_state_dir_layout_migrates_from_the_config_layout() {
         let base = temp_base("statedir");
         let dir = base.join("plugin-state");
-        // Per-workspace file moves over from the config layout on first load.
+        // Per-tab file moves over from the config layout on first load.
         let cfg_ws = state_path_in(&base, Some("w6"));
         std::fs::create_dir_all(cfg_ws.parent().unwrap()).unwrap();
         write_note(&cfg_ws, "from config");
@@ -375,7 +389,7 @@ mod tests {
         assert!(!cfg_ws.exists(), "moved, not copied");
         assert!(dir.join("w6.json").exists());
         assert_eq!(load_state_dir(&dir, Some(&base), Some("w6")).text, "from config");
-        // No workspace id: shared note.json, migrating the config legacy file.
+        // No tab id: shared note.json, migrating the config legacy file.
         write_note(&legacy_path_in(&base), "legacy");
         assert_eq!(load_state_dir(&dir, Some(&base), None).text, "legacy");
         assert!(dir.join("note.json").exists());
@@ -385,11 +399,11 @@ mod tests {
     }
 
     #[test]
-    fn unset_workspace_id_reads_the_legacy_file_in_place() {
+    fn unset_tab_id_reads_the_legacy_file_in_place() {
         let base = temp_base("legacy");
         write_note(&legacy_path_in(&base), "global");
         assert_eq!(load_in(&base, None).text, "global");
-        assert!(legacy_path_in(&base).exists(), "no migration without a workspace id");
+        assert!(legacy_path_in(&base).exists(), "no migration without a tab id");
         let _ = std::fs::remove_dir_all(&base);
         // Nothing on disk at all (any key) is still just an empty note.
         let empty = temp_base("empty");

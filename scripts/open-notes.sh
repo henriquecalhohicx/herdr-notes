@@ -2,11 +2,11 @@
 # open-notes.sh — unix launcher for the herdr-notes pane.
 #
 # Idempotent "launch-or-focus, toggle on repeat", scoped to the FOCUSED
-# pane's workspace (each workspace has its own note file; the binary matches
-# panes by note-FILE identity, see state.rs note_key):
+# pane's tab (each tab has its own note file; the binary matches panes by
+# note-FILE identity, see state.rs note_key):
 #   - no Notes pane on that note file       -> open one in the current tab,
-#     DOCKED ON THE RIGHT edge (any-tab scope within the workspace: a second
-#     live instance on the same note file would clobber it on save)
+#     DOCKED ON THE RIGHT edge (a second live instance on the same note file
+#     would clobber it on save)
 #   - a Notes pane exists but isn't focused -> focus it
 #   - the focused pane IS the Notes pane    -> close it (toggle off)
 #   - Notes pane with a stale heartbeat     -> close the corpse, open fresh
@@ -35,16 +35,15 @@ if [ ! -x "$bin" ]; then
     --focus
 fi
 
-# ALWAYS the GLOBAL pane list — never scoped with `--workspace
-# $HERDR_WORKSPACE_ID`. Focus is global (exactly one focused pane across ALL
-# workspaces) and this shell's spawn-time env id can diverge from the focused
-# pane's actual workspace (pane moved between workspaces, action invoked under
-# another workspace's env): a scoped list would then omit the focused pane
-# entirely, the decision would degrade to OPEN, and a duplicate Notes pane
-# would spawn beside the focused workspace's live one — two instances
-# clobbering one note file. The binary does the scoping instead:
-# --launch-decision keys off the FOCUSED pane's own workspace_id field,
-# matching panes by note-FILE identity (state.rs note_key).
+# ALWAYS the GLOBAL pane list — never scoped with `--tab $HERDR_TAB_ID`.
+# Focus is global (exactly one focused pane across ALL tabs) and this shell's
+# spawn-time env id can diverge from the focused pane's actual tab (pane moved
+# between tabs, action invoked under another tab's env): a scoped list would
+# then omit the focused pane entirely, the decision would degrade to OPEN, and
+# a duplicate Notes pane would spawn beside the focused tab's live one — two
+# instances clobbering one note file. The binary does the scoping instead:
+# --launch-decision keys off the FOCUSED pane's own tab_id field, matching
+# panes by note-FILE identity (state.rs note_key).
 panes="$("$herdr_bin" pane list 2>/dev/null || true)"
 
 open_pane() {
