@@ -14,10 +14,20 @@ findings doc (and the reference implementation, `herdr-sidebar`) lives in
 - `src/main.rs` — event loop (500ms poll); `--launch-decision` / `--focused-pane` /
   `--open-plan` stdin modes used by the launcher scripts
 - `src/app.rs` — App state: preview/edit, clear-confirm overlay, 2s debounced
-  autosave, 5s heartbeat, scrollbars
+  autosave, 5s heartbeat, scrollbars, in-note title editing (`r` in preview
+  sets/renames the note's title — Enter saves, Esc cancels — the header
+  shows the title), and a notes-list overlay (`l` in preview: navigate with
+  Up/Down or j/k, `enter` opens a read-only scrollable preview of the
+  selected note, `r` renames it, `d` deletes it with a y/N confirm, `esc`/`l`
+  closes the overlay; each row shows the title (or "(untitled)"), age, and
+  live/closed/`?` status)
 - `src/markdown.rs` — hand-rolled renderer (headings, lists, checkboxes, quotes,
   code, bold/italic, hr) + display-width wrapping
-- `src/state.rs` — `{text, mode}` JSON, one file PER TAB in herdr's
+- `src/state.rs` — `{text, mode, title, tab_id, created, updated}` JSON (v2 —
+  older `{text, mode}` files still load, missing fields fall back to
+  defaults; `created` is stamped once, `updated` bumps on every save). A
+  note with no text AND no title is DELETED on save instead of written —
+  see Gotchas. One file PER TAB in herdr's
   plugin state dir (`HERDR_PLUGIN_STATE_DIR/<tab-key>.json`, e.g.
   `%LOCALAPPDATA%\herdr\plugins\herdr-notes\` — the docs-mandated home for
   durable plugin state; actions get the env var and the launchers pass it
@@ -40,7 +50,12 @@ findings doc (and the reference implementation, `herdr-sidebar`) lives in
   folds ASCII case because NTFS filenames are case-insensitive) — the
   launcher guard compares THESE keys so it can never drift from the on-disk
   layout. Forgiving parse, atomic save (temp + `sync_all` + rename); path
-  logic takes an injected base dir so tests never touch the real APPDATA
+  logic takes an injected base dir so tests never touch the real APPDATA.
+  Notes-manager helpers live here too: `list_notes` (enumerates every note
+  file in the store dir), `store_dir`, `classify_tab`/`TabStatus` (live/
+  closed/unknown, from a `pane.list` socket call matched on `tab_id`),
+  `format_age` (e.g. `2h`), `set_title`, `persist_at`, and `is_blank` (the
+  no-text-no-title check the delete-on-save rule uses)
 - `src/launch.rs` — OPEN/FOCUS/CLOSE/REPLACE toggle decisions (20s stale heartbeat
   → REPLACE); matches any pane whose `note_key` (on the tab id) EQUALS the
   focused pane's, so a second instance on the same note file is never spawned
@@ -142,6 +157,8 @@ Learned building this plugin:
   text insertion or AltGr layouts can't type `@ { [ ] } \`.
 - Wrap and horizontal cursor math must budget by display columns (unicode-width),
   not char count — CJK/emoji are double-width and get clipped otherwise.
+- Empty (no text, no title) notes are deleted on save, so toggling Notes into
+  a tab and closing without typing leaves no file.
 
 ## README screenshots (Alex's criteria — follow on every reshoot)
 
