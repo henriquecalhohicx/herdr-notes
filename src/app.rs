@@ -991,20 +991,23 @@ fn truncate_w(s: &str, max: usize) -> String {
 /// One overlay row, padded to exactly `inner_width` display columns: a
 /// 1-space margin on each side, `{marker}{self_mark}{name}` on the left (name
 /// truncated to fit), `right` (context + age) pinned to the right edge, the
-/// gap between padded with spaces. Degrades (may slightly exceed
-/// `inner_width`) only in pathologically narrow panes — never panics.
+/// gap between padded with spaces. Fits exactly within `inner_width` for any
+/// input wide enough to hold the margins plus the `marker`+`self_mark`
+/// prefix; can only exceed `inner_width` when `inner_width` is too small to
+/// hold even that (a handful of columns) — never panics.
 fn format_row(marker: &str, self_mark: &str, name: &str, right: &str, inner_width: usize) -> String {
     let budget = inner_width.saturating_sub(2);
-    let right_w = dwidth(right).min(budget);
-    let right = truncate_w(right, right_w);
-    let right_w = dwidth(&right);
-    let gap_min = usize::from(right_w > 0);
     let prefix_w = dwidth(marker) + dwidth(self_mark);
+    let gap_min = usize::from(dwidth(right) > 0);
+    // Reserve room for the prefix + minimum gap before the right segment gets
+    // any width, so left + gap + right can never exceed the budget.
+    let right = truncate_w(right, budget.saturating_sub(prefix_w + gap_min));
+    let right_w = dwidth(&right);
     let name_budget = budget.saturating_sub(prefix_w + right_w + gap_min);
     let name = truncate_w(name, name_budget);
     let left = format!("{marker}{self_mark}{name}");
     let left_w = dwidth(&left);
-    let gap = budget.saturating_sub(left_w + right_w).max(gap_min);
+    let gap = budget.saturating_sub(left_w + right_w);
     format!(" {left}{}{right} ", " ".repeat(gap))
 }
 
@@ -1314,5 +1317,17 @@ mod tests {
     fn format_row_truncates_wide_char_names_by_display_width() {
         let row = format_row(" ", " ", "文文文文文文文文文文文文文文文文文文文文", "closed  5d", 30);
         assert_eq!(dwidth(&row), 30, "CJK double-width chars must not overflow the row");
+    }
+
+    #[test]
+    fn format_row_never_exceeds_width_when_right_fills_budget() {
+        for (m, s, name, right, w) in [
+            (">", "*", "Note", "workspace-name - claude  2h", 20usize),
+            (">", "*", "X", "abcdefgh", 10),
+            (" ", " ", "anything", "spec-droid · claude  5d", 24),
+        ] {
+            let row = format_row(m, s, name, right, w);
+            assert!(dwidth(&row) <= w, "row {row:?} = {} cols, want <= {w}", dwidth(&row));
+        }
     }
 }
