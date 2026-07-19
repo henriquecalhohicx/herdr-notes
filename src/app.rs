@@ -62,6 +62,8 @@ pub struct App {
     last_beat: Instant,
     /// Disabled in unit tests so exercising keys never touches disk.
     persist: bool,
+    /// Some(buf) while editing THIS note's title (opened with `r`).
+    title_input: Option<String>,
 }
 
 impl App {
@@ -87,6 +89,7 @@ impl App {
             pane_id: None,
             last_beat: Instant::now(),
             persist,
+            title_input: None,
         };
         if app.note.mode == Mode::Edit {
             app.enter_edit();
@@ -158,6 +161,10 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return false;
         }
+        if self.title_input.is_some() {
+            self.on_key_title(key);
+            return false;
+        }
         if self.confirm_clear {
             if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
                 self.note.text.clear();
@@ -192,9 +199,33 @@ impl App {
             KeyCode::Home | KeyCode::Char('g') => self.preview_scroll = 0,
             KeyCode::End | KeyCode::Char('G') => self.preview_scroll = usize::MAX, // clamped in draw
             KeyCode::Char('x') => self.confirm_clear = true,
+            KeyCode::Char('r') => self.title_input = Some(self.note.title.clone()),
             _ => {}
         }
         false
+    }
+
+    fn on_key_title(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Enter => {
+                if let Some(buf) = self.title_input.take() {
+                    self.note.title = buf.trim().to_string();
+                    self.save();
+                }
+            }
+            KeyCode::Esc => self.title_input = None,
+            KeyCode::Backspace => {
+                if let Some(buf) = self.title_input.as_mut() {
+                    buf.pop();
+                }
+            }
+            KeyCode::Char(c) => {
+                if let Some(buf) = self.title_input.as_mut() {
+                    buf.push(c);
+                }
+            }
+            _ => {}
+        }
     }
 
     fn enter_edit(&mut self) {
@@ -340,21 +371,41 @@ impl App {
         };
 
         // The pane border already says "Notes" (metadata title) — repeating it
-        // here read as a duplicate, so the header carries only mode + scroll.
-        let mut title = vec![Span::styled(
-            format!(" [{mode}]"),
-            Style::default().fg(Color::Cyan),
-        )];
-        if let Some(hint) = scroll_hint {
+        // here read as a duplicate, so the header carries only the note's own
+        // title (or the live title editor) plus mode + scroll.
+        let mut title: Vec<Span> = Vec::new();
+        if let Some(buf) = &self.title_input {
             title.push(Span::styled(
-                format!("  {hint}"),
+                format!(" Title: {buf}"),
+                Style::default().fg(Color::Yellow),
+            ));
+            title.push(Span::styled(
+                "  (Enter save, Esc cancel)",
                 Style::default().add_modifier(Modifier::DIM),
             ));
+        } else {
+            if !self.note.title.trim().is_empty() {
+                title.push(Span::styled(
+                    format!(" {}", self.note.title),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ));
+                title.push(Span::raw(" —"));
+            }
+            title.push(Span::styled(
+                format!(" [{mode}]"),
+                Style::default().fg(Color::Cyan),
+            ));
+            if let Some(hint) = scroll_hint {
+                title.push(Span::styled(
+                    format!("  {hint}"),
+                    Style::default().add_modifier(Modifier::DIM),
+                ));
+            }
         }
         frame.render_widget(Paragraph::new(Line::from(title)), title_a);
 
         let hints = match self.note.mode {
-            Mode::Preview => " e/Enter edit   Up/Dn scroll   g/G top/end   x clear   q quit",
+            Mode::Preview => " e edit  r title  l list  Up/Dn scroll  x clear  q quit",
             Mode::Edit => " Esc preview (saves)   Ctrl+S save",
         };
         frame.render_widget(
@@ -587,5 +638,23 @@ mod tests {
         assert_eq!(a.lines, vec!["a".to_string(), "b".to_string()]);
         a.on_key(key(KeyCode::Esc));
         assert_eq!(a.note.text, "a\nb", "leaving edit commits losslessly");
+    }
+
+    #[test]
+    fn r_edits_title_enter_saves_esc_cancels() {
+        let mut a = app("body");
+        a.on_key(key(KeyCode::Char('r')));
+        assert!(a.title_input.is_some(), "r opens the title editor");
+        a.on_key(key(KeyCode::Char('H')));
+        a.on_key(key(KeyCode::Char('i')));
+        a.on_key(key(KeyCode::Enter));
+        assert!(a.title_input.is_none());
+        assert_eq!(a.note.title, "Hi");
+        // Esc cancels an edit without changing the saved title
+        a.on_key(key(KeyCode::Char('r')));
+        a.on_key(key(KeyCode::Char('X')));
+        a.on_key(key(KeyCode::Esc));
+        assert_eq!(a.note.title, "Hi", "Esc discards the title edit");
+        assert!(!a.on_key(key(KeyCode::Esc)), "Esc still never quits");
     }
 }
