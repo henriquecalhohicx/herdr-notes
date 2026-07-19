@@ -152,12 +152,33 @@ fn state_dir_path(dir: &Path, tab_id: Option<&str>) -> PathBuf {
     }
 }
 
+/// Fixed filename for the cross-session global note — not tab-keyed, shared
+/// by every tab/session that opens Notes.
+fn global_path_in(base: &Path) -> PathBuf {
+    base.join("herdr").join("notes").join("global.json")
+}
+
+fn global_dir_path(dir: &Path) -> PathBuf {
+    dir.join("global.json")
+}
+
 /// State file location for THIS process (env-derived base + tab id).
 pub fn state_path() -> Option<PathBuf> {
     let tab = tab_env();
     Some(match store_base()? {
         StoreBase::PluginState(dir) => state_dir_path(&dir, tab.as_deref()),
         StoreBase::Config(base) => state_path_in(&base, tab.as_deref()),
+    })
+}
+
+/// Global note file location for THIS process (env-derived base), independent
+/// of any tab id. Deliberately last-writer-wins if two tabs edit it at once —
+/// same single-user assumption as the rest of the cross-session note sharing.
+#[allow(dead_code)]
+pub fn global_path() -> Option<PathBuf> {
+    Some(match store_base()? {
+        StoreBase::PluginState(dir) => global_dir_path(&dir),
+        StoreBase::Config(base) => global_path_in(&base),
     })
 }
 
@@ -260,6 +281,30 @@ pub fn list_notes(dir: &Path) -> Vec<NoteSummary> {
     out
 }
 
+/// Minimal fields `filter_rows` matches against — title and the already
+/// formatted context string — so the matcher has no dependency on socket
+/// types and stays trivially unit-testable.
+#[allow(dead_code)]
+pub struct FilterRow<'a> {
+    pub title: &'a str,
+    pub context: &'a str,
+}
+
+/// Indices of rows whose title OR context contains `query` (case-insensitive
+/// substring). An empty query matches everything.
+#[allow(dead_code)]
+pub fn filter_rows(rows: &[FilterRow], query: &str) -> Vec<usize> {
+    if query.is_empty() {
+        return (0..rows.len()).collect();
+    }
+    let q = query.to_lowercase();
+    rows.iter()
+        .enumerate()
+        .filter(|(_, r)| r.title.to_lowercase().contains(&q) || r.context.to_lowercase().contains(&q))
+        .map(|(i, _)| i)
+        .collect()
+}
+
 /// Forgiving parse: any missing/garbled field falls back to the default, so a
 /// hand-edited or truncated file can never wedge the pane.
 pub fn parse(json: &str) -> Note {
@@ -323,6 +368,43 @@ pub fn classify_tab(tab_id: &str, live: Option<&std::collections::HashSet<String
                 TabStatus::Closed
             }
         }
+    }
+}
+
+/// Sort bucket for the overlay: LIVE first, everything else (closed/unknown)
+/// after. Combine with `Reverse(updated)` for "live first, then newest
+/// within each bucket".
+#[allow(dead_code)]
+pub fn sort_rank(status: TabStatus) -> u8 {
+    match status {
+        TabStatus::Live => 0,
+        TabStatus::Closed | TabStatus::Unknown => 1,
+    }
+}
+
+/// Live-tab context shown in an overlay row: workspace label + optional
+/// agent name (`claude`/`codex`/…).
+#[derive(Clone, PartialEq, Eq, Debug)]
+#[allow(dead_code)]
+pub struct RowContext {
+    pub workspace: String,
+    pub agent: Option<String>,
+}
+
+/// Row context string: `"{workspace} · {agent}"` for a live tab with a known
+/// context (agent omitted when none), `"closed"` / `"?"` otherwise. A Live
+/// status with no context (socket raced between the two lookups, or the tab
+/// has no live pane info) reads blank rather than guessing. Never panics.
+#[allow(dead_code)]
+pub fn format_context(status: TabStatus, ctx: Option<&RowContext>) -> String {
+    match status {
+        TabStatus::Live => match ctx {
+            Some(RowContext { workspace, agent: Some(agent) }) => format!("{workspace} · {agent}"),
+            Some(RowContext { workspace, agent: None }) => workspace.clone(),
+            None => String::new(),
+        },
+        TabStatus::Closed => "closed".to_string(),
+        TabStatus::Unknown => "?".to_string(),
     }
 }
 
@@ -645,5 +727,75 @@ mod tests {
         assert_eq!(format_age(86_400), "1d");
         assert_eq!(format_age(604_799), "6d");
         assert_eq!(format_age(604_800), "1w");
+    }
+
+    #[test]
+    fn global_path_selects_by_layout() {
+        let base = Path::new("base");
+        assert_eq!(
+            global_path_in(base),
+            base.join("herdr").join("notes").join("global.json")
+        );
+        let dir = Path::new("plugin-state");
+        assert_eq!(global_dir_path(dir), dir.join("global.json"));
+    }
+
+    #[test]
+    fn blank_global_note_deletes_its_file_via_persist_at() {
+        let base = temp_base("global-blank");
+        let path = global_path_in(&base);
+        persist_at(&path, &Note { text: "hi".into(), ..Default::default() }, "", 1);
+        assert!(path.exists());
+        // now blank -> file removed, same rule as any other note
+        persist_at(&path, &Note::default(), "", 2);
+        assert!(!path.exists(), "blank global note deletes its file");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn format_context_covers_live_closed_unknown() {
+        let ctx = RowContext { workspace: "spec-droid".into(), agent: Some("claude".into()) };
+        assert_eq!(format_context(TabStatus::Live, Some(&ctx)), "spec-droid · claude");
+        let no_agent = RowContext { workspace: "spec-droid".into(), agent: None };
+        assert_eq!(format_context(TabStatus::Live, Some(&no_agent)), "spec-droid");
+        assert_eq!(format_context(TabStatus::Live, None), "", "live but no context yet (socket raced)");
+        assert_eq!(format_context(TabStatus::Closed, None), "closed");
+        assert_eq!(format_context(TabStatus::Unknown, None), "?");
+    }
+
+    #[test]
+    fn filter_rows_matches_title_or_context_case_insensitively() {
+        let rows = [
+            FilterRow { title: "Release Notes", context: "spec-droid · claude" },
+            FilterRow { title: "Scratch", context: "closed" },
+            FilterRow { title: "", context: "acme-api · codex" },
+        ];
+        assert_eq!(filter_rows(&rows, ""), vec![0, 1, 2], "empty query matches all");
+        assert_eq!(filter_rows(&rows, "release"), vec![0], "title match, case-insensitive");
+        assert_eq!(filter_rows(&rows, "CODEX"), vec![2], "context match, case-insensitive");
+        assert_eq!(filter_rows(&rows, "nope"), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn sort_rank_puts_live_before_closed_and_unknown() {
+        assert!(sort_rank(TabStatus::Live) < sort_rank(TabStatus::Closed));
+        assert_eq!(sort_rank(TabStatus::Closed), sort_rank(TabStatus::Unknown));
+
+        let mut rows = vec![
+            (TabStatus::Closed, 500u64),
+            (TabStatus::Live, 100u64),
+            (TabStatus::Live, 300u64),
+            (TabStatus::Closed, 900u64),
+        ];
+        rows.sort_by_key(|&(status, updated)| (sort_rank(status), std::cmp::Reverse(updated)));
+        assert_eq!(
+            rows,
+            vec![
+                (TabStatus::Live, 300),
+                (TabStatus::Live, 100),
+                (TabStatus::Closed, 900),
+                (TabStatus::Closed, 500),
+            ]
+        );
     }
 }
