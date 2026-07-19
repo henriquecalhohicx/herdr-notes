@@ -43,41 +43,55 @@ struct OverlayEntry {
     /// instead of previewing; immune to rename/delete/go-to-tab/filter.
     is_global: bool,
     /// Precomputed row context string ("workspace · agent" / "closed" / "?" /
-    /// "global") — see `state::format_context`. Not yet read anywhere (rendering
-    /// lands in Task 6).
-    #[allow(dead_code)]
+    /// "global") — see `state::format_context`. Matched against by the filter
+    /// (`recompute_visible`); not yet rendered in the row itself (Task 6).
     context: String,
 }
 
 /// Sub-mode of the open list overlay.
 enum OverlayMode {
     List,
+    Filter,
     Preview { scroll: usize },
     Rename(String),
     ConfirmDelete,
 }
 
 /// The list overlay: all notes on disk, browsable/manageable over the note.
-/// `selected` indexes into `visible`, not `entries` directly, so a filter
-/// (Task 5) can narrow which rows are shown without disturbing `entries`.
+/// `selected` indexes into `visible`, not `entries` directly, so the filter
+/// can narrow which rows are shown without disturbing `entries`.
 struct Overlay {
     entries: Vec<OverlayEntry>,
     visible: Vec<usize>,
     selected: usize,
     mode: OverlayMode,
+    filter: String,
 }
 
 impl Overlay {
     fn from_entries(entries: Vec<OverlayEntry>) -> Self {
-        let mut ov = Overlay { entries, visible: Vec::new(), selected: 0, mode: OverlayMode::List };
+        let mut ov =
+            Overlay { entries, visible: Vec::new(), selected: 0, mode: OverlayMode::List, filter: String::new() };
         ov.recompute_visible();
         ov
     }
 
-    /// Recomputes which entries are shown. No filter concept yet (Task 5
-    /// adds one) — everything is visible. Clamps `selected` into range.
+    /// Recomputes which entries are shown for the current filter (empty =
+    /// all). The pinned global row (if present) is always first and always
+    /// visible — a fixed anchor, not a searchable note. Clamps `selected`.
     fn recompute_visible(&mut self) {
-        self.visible = (0..self.entries.len()).collect();
+        let global_idx = self.entries.iter().position(|e| e.is_global);
+        let rows: Vec<state::FilterRow> = self
+            .entries
+            .iter()
+            .map(|e| state::FilterRow { title: &e.title, context: &e.context })
+            .collect();
+        let mut visible = state::filter_rows(&rows, &self.filter);
+        if let Some(gi) = global_idx {
+            visible.retain(|&i| i != gi);
+            visible.insert(0, gi);
+        }
+        self.visible = visible;
         self.selected = self.selected.min(self.visible.len().saturating_sub(1));
     }
 
@@ -478,6 +492,24 @@ impl App {
                 {
                     ov.mode = OverlayMode::ConfirmDelete;
                 }
+                KeyCode::Char('/') => ov.mode = OverlayMode::Filter,
+                _ => {}
+            },
+            OverlayMode::Filter => match key.code {
+                KeyCode::Enter => ov.mode = OverlayMode::List,
+                KeyCode::Esc => {
+                    ov.filter.clear();
+                    ov.recompute_visible();
+                    ov.mode = OverlayMode::List;
+                }
+                KeyCode::Backspace => {
+                    ov.filter.pop();
+                    ov.recompute_visible();
+                }
+                KeyCode::Char(c) => {
+                    ov.filter.push(c);
+                    ov.recompute_visible();
+                }
                 _ => {}
             },
             OverlayMode::Preview { scroll } => match key.code {
@@ -834,7 +866,7 @@ fn draw_overlay(frame: &mut Frame, area: Rect, ov: &Overlay) {
     // the one-line rename/confirm prompts stay short.
     let h = match &ov.mode {
         OverlayMode::Preview { .. } => area.height.saturating_sub(2).max(3).min(area.height),
-        OverlayMode::List => {
+        OverlayMode::List | OverlayMode::Filter => {
             let content_h = u16::try_from(ov.entries.len() + 2).unwrap_or(u16::MAX);
             area.height.saturating_sub(2).min(content_h).max(3).min(area.height)
         }
@@ -877,7 +909,7 @@ fn draw_overlay(frame: &mut Frame, area: Rect, ov: &Overlay) {
                 rect,
             );
         }
-        OverlayMode::List => {
+        OverlayMode::List | OverlayMode::Filter => {
             let now = state::unix_now();
             let mut lines: Vec<Line> = Vec::new();
             for (i, &idx) in ov.visible.iter().enumerate() {
@@ -904,11 +936,18 @@ fn draw_overlay(frame: &mut Frame, area: Rect, ov: &Overlay) {
             if lines.is_empty() {
                 lines.push(Line::from("(no notes)"));
             }
+            let title_top = if matches!(ov.mode, OverlayMode::Filter) {
+                format!(" All notes   filter: {}_ ", ov.filter)
+            } else if ov.filter.is_empty() {
+                " All notes   ↑↓ move  enter preview ".to_string()
+            } else {
+                format!(" All notes   filter: {} ", ov.filter)
+            };
             frame.render_widget(
                 Paragraph::new(lines).block(
                     Block::bordered()
-                        .title(" All notes   ↑↓ move  enter preview ")
-                        .title_bottom(" r rename  d delete  esc "),
+                        .title(title_top)
+                        .title_bottom(" r rename  d delete  / filter  esc "),
                 ),
                 rect,
             );
@@ -1172,5 +1211,49 @@ mod tests {
         assert!(matches!(a.overlay.as_ref().unwrap().mode, OverlayMode::List), "r is a no-op on the global row");
         a.on_key(key(KeyCode::Char('d')));
         assert!(matches!(a.overlay.as_ref().unwrap().mode, OverlayMode::List), "d is a no-op on the global row");
+    }
+
+    #[test]
+    fn filter_narrows_rows_live_as_you_type() {
+        let mut a = app("body");
+        a.overlay = Some(Overlay::from_entries(vec![
+            entry("Release Notes", state::TabStatus::Closed),
+            entry("Scratch", state::TabStatus::Closed),
+        ]));
+        a.on_key(key(KeyCode::Char('/')));
+        assert!(matches!(a.overlay.as_ref().unwrap().mode, OverlayMode::Filter));
+        a.on_key(key(KeyCode::Char('r')));
+        a.on_key(key(KeyCode::Char('e')));
+        assert_eq!(a.overlay.as_ref().unwrap().visible, vec![0], "narrows to the matching row live");
+        a.on_key(key(KeyCode::Enter));
+        assert!(matches!(a.overlay.as_ref().unwrap().mode, OverlayMode::List), "Enter commits, returns to List");
+        assert_eq!(a.overlay.as_ref().unwrap().visible, vec![0], "filter stays applied");
+    }
+
+    #[test]
+    fn filter_esc_clears_and_restores_all_rows() {
+        let mut a = app("body");
+        a.overlay = Some(Overlay::from_entries(vec![
+            entry("Release Notes", state::TabStatus::Closed),
+            entry("Scratch", state::TabStatus::Closed),
+        ]));
+        a.on_key(key(KeyCode::Char('/')));
+        a.on_key(key(KeyCode::Char('z')));
+        assert!(a.overlay.as_ref().unwrap().visible.is_empty(), "no row matches 'z'");
+        a.on_key(key(KeyCode::Esc));
+        assert!(matches!(a.overlay.as_ref().unwrap().mode, OverlayMode::List));
+        assert_eq!(a.overlay.as_ref().unwrap().visible, vec![0, 1], "Esc clears the filter");
+    }
+
+    #[test]
+    fn filter_never_hides_the_pinned_global_row() {
+        let mut a = app("body");
+        a.overlay = Some(Overlay::from_entries(vec![
+            global_row("★ Global note"),
+            entry("Release Notes", state::TabStatus::Closed),
+        ]));
+        a.on_key(key(KeyCode::Char('/')));
+        a.on_key(key(KeyCode::Char('z'))); // matches nothing
+        assert_eq!(a.overlay.as_ref().unwrap().visible, vec![0], "global row stays pinned even with 0 matches");
     }
 }

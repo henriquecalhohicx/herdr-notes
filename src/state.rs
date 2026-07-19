@@ -283,7 +283,6 @@ pub fn list_notes(dir: &Path) -> Vec<NoteSummary> {
 /// Minimal fields `filter_rows` matches against — title and the already
 /// formatted context string — so the matcher has no dependency on socket
 /// types and stays trivially unit-testable.
-#[allow(dead_code)]
 pub struct FilterRow<'a> {
     pub title: &'a str,
     pub context: &'a str,
@@ -291,7 +290,6 @@ pub struct FilterRow<'a> {
 
 /// Indices of rows whose title OR context contains `query` (case-insensitive
 /// substring). An empty query matches everything.
-#[allow(dead_code)]
 pub fn filter_rows(rows: &[FilterRow], query: &str) -> Vec<usize> {
     if query.is_empty() {
         return (0..rows.len()).collect();
