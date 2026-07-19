@@ -4,7 +4,7 @@
 
 ### The scratch note that lives beside your agents.
 
-One markdown note per workspace in a dockable [herdr](https://github.com/ogulcancelik/herdr)
+One markdown note per tab in a dockable [herdr](https://github.com/ogulcancelik/herdr)
 pane — rendered preview, plain-text editing, and it never forgets: everything
 autosaves and survives computer restarts.
 
@@ -37,9 +37,9 @@ herdr plugin install alexarthurs/herdr-notes
 - **Rendered markdown** — headings, checkboxes, lists, quotes, code blocks
   and inline styles, drawn natively in the terminal with a scrollbar.
 - **Zero-friction editing** — `e` to type, `Esc` to go back. That's it.
-- **A note per workspace** — every herdr space keeps its own note, keyed to
-  the workspace itself (renames don't lose it).
-- **Actually persistent** — atomic autosaves to a per-workspace JSON file in
+- **A note per tab** — every herdr tab keeps its own note, keyed to the tab
+  itself. Open Notes in as many tabs as you like; each is its own document.
+- **Actually persistent** — atomic autosaves to a per-tab JSON file in
   herdr's config directory. Close the pane, kill the terminal, reboot: it
   comes back.
 - **A polite pane** — one toggle action opens, focuses, or closes it;
@@ -99,17 +99,16 @@ Edit:
 
 ## Persistence
 
-Each herdr workspace gets its own note, stored as
-`<workspace-id>.json` in herdr's per-plugin state directory
-(`HERDR_PLUGIN_STATE_DIR` — e.g. `%LOCALAPPDATA%\herdr\plugins\herdr-notes\`
-on Windows), keyed by the stable `HERDR_WORKSPACE_ID` herdr injects into
-every pane — ids survive workspace renames, so the note follows the
-workspace, not its label. Closing a workspace just orphans its file; delete
-`<workspace-id>.json` by hand if you want it gone. Run outside herdr, the
+Each herdr tab gets its own note, stored as `<tab-key>.json` in herdr's
+per-plugin state directory (`HERDR_PLUGIN_STATE_DIR` — e.g.
+`%LOCALAPPDATA%\herdr\plugins\herdr-notes\` on Windows), keyed by the
+`HERDR_TAB_ID` herdr injects into every pane (its `:` separator sanitized to
+`_`, so tab `w1:t2` → `w1_t2.json`). Closing a tab just orphans its file;
+delete `<tab-key>.json` by hand if you want it gone. Run outside herdr, the
 pane falls back to `herdr/notes/` under the platform config dir (single
-shared `notes.json` when there's no workspace id), and any note found in
-the fallback layout is moved into the state dir on first load — an
-existing note is inherited, never lost.
+shared `notes.json` when there's no tab id), and any note found in the
+fallback layout is moved into the state dir on first load — an existing note
+is inherited, never lost.
 
 The format is `{ "text": "...", "mode": "preview"|"edit" }`. Saves are
 atomic (temp file + fsync + rename) and happen on leaving edit mode, clear,
