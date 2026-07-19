@@ -50,6 +50,13 @@ pub struct Note {
     /// Raw markdown of the single note.
     pub text: String,
     pub mode: Mode,
+    /// Optional user-set title (blank shows as "(untitled)").
+    pub title: String,
+    /// Raw herdr tab id that owns this note (e.g. "w9:t1"); "" if unknown.
+    pub tab_id: String,
+    /// Unix seconds; 0 = unknown. `created` is set once, `updated` per save.
+    pub created: u64,
+    pub updated: u64,
 }
 
 /// Where notes live. herdr's plugin docs say durable state belongs in
@@ -224,7 +231,11 @@ pub fn parse(json: &str) -> Note {
         Some("edit") => Mode::Edit,
         _ => Mode::Preview,
     };
-    Note { text, mode }
+    let title = value.get("title").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let tab_id = value.get("tab_id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let created = value.get("created").and_then(|v| v.as_u64()).unwrap_or(0);
+    let updated = value.get("updated").and_then(|v| v.as_u64()).unwrap_or(0);
+    Note { text, mode, title, tab_id, created, updated }
 }
 
 /// The JSON that goes on disk: `{ "text": …, "mode": "preview"|"edit" }`.
@@ -232,6 +243,10 @@ pub fn to_json(note: &Note) -> String {
     serde_json::json!({
         "text": note.text,
         "mode": note.mode.name(),
+        "title": note.title,
+        "tab_id": note.tab_id,
+        "created": note.created,
+        "updated": note.updated,
     })
     .to_string()
 }
@@ -263,9 +278,9 @@ mod tests {
 
     #[test]
     fn roundtrip_preserves_text_and_mode() {
-        let note = Note { text: "# one\n\ntwo `lines`\n".into(), mode: Mode::Edit };
+        let note = Note { text: "# one\n\ntwo `lines`\n".into(), mode: Mode::Edit, ..Default::default() };
         assert_eq!(parse(&to_json(&note)), note);
-        let preview = Note { text: String::new(), mode: Mode::Preview };
+        let preview = Note { text: String::new(), mode: Mode::Preview, ..Default::default() };
         assert_eq!(parse(&to_json(&preview)), preview);
     }
 
@@ -282,7 +297,7 @@ mod tests {
 
     #[test]
     fn bom_from_powershell_pipe_is_stripped() {
-        let note = Note { text: "hi".into(), mode: Mode::Preview };
+        let note = Note { text: "hi".into(), mode: Mode::Preview, ..Default::default() };
         let json = format!("\u{feff}{}", to_json(&note));
         assert_eq!(parse(&json), note);
     }
@@ -303,7 +318,7 @@ mod tests {
     }
 
     fn write_note(path: &Path, text: &str) {
-        std::fs::write(path, to_json(&Note { text: text.into(), mode: Mode::Preview })).unwrap();
+        std::fs::write(path, to_json(&Note { text: text.into(), mode: Mode::Preview, ..Default::default() })).unwrap();
     }
 
     #[test]
@@ -396,6 +411,30 @@ mod tests {
         // Nothing anywhere is still just an empty note.
         assert_eq!(load_state_dir(&dir, Some(&base), Some("w9")), Note::default());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn v2_roundtrip_preserves_all_fields() {
+        let note = Note {
+            text: "body".into(),
+            mode: Mode::Edit,
+            title: "My Title".into(),
+            tab_id: "w9:t1".into(),
+            created: 100,
+            updated: 200,
+        };
+        assert_eq!(parse(&to_json(&note)), note);
+    }
+
+    #[test]
+    fn pre_v2_file_still_parses_with_defaults() {
+        let note = parse("{\"text\":\"hi\",\"mode\":\"edit\"}");
+        assert_eq!(note.text, "hi");
+        assert_eq!(note.mode, Mode::Edit);
+        assert_eq!(note.title, "");
+        assert_eq!(note.tab_id, "");
+        assert_eq!(note.created, 0);
+        assert_eq!(note.updated, 0);
     }
 
     #[test]

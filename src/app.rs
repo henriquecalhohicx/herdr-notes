@@ -465,7 +465,7 @@ mod tests {
 
     fn app(text: &str) -> App {
         App::with_note(
-            Note { text: text.to_string(), mode: Mode::Preview },
+            Note { text: text.to_string(), mode: Mode::Preview, ..Default::default() },
             false, // never touch the real state file from tests
         )
     }
@@ -566,7 +566,7 @@ mod tests {
 
     #[test]
     fn startup_in_edit_mode_loads_the_buffer() {
-        let mut a = App::with_note(Note { text: "a\nb".into(), mode: Mode::Edit }, false);
+        let mut a = App::with_note(Note { text: "a\nb".into(), mode: Mode::Edit, ..Default::default() }, false);
         assert_eq!(a.lines, vec!["a".to_string(), "b".to_string()]);
         a.on_key(key(KeyCode::Esc));
         assert_eq!(a.note.text, "a\nb", "leaving edit commits losslessly");
