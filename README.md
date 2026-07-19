@@ -39,6 +39,10 @@ herdr plugin install alexarthurs/herdr-notes
 - **Zero-friction editing** — `e` to type, `Esc` to go back. That's it.
 - **A note per tab** — every herdr tab keeps its own note, keyed to the tab
   itself. Open Notes in as many tabs as you like; each is its own document.
+- **Titled, and always findable** — press `r` in preview to set or rename a
+  note's title (it shows in the header); `l` opens an overlay listing every
+  note across tabs with its age and live/closed status, for a quick preview,
+  rename, or delete without hunting down the right tab.
 - **Actually persistent** — atomic autosaves to a per-tab JSON file in
   herdr's config directory. Close the pane, kill the terminal, reboot: it
   comes back.
@@ -110,10 +114,20 @@ shared `notes.json` when there's no tab id), and any note found in the
 fallback layout is moved into the state dir on first load — an existing note
 is inherited, never lost.
 
-The format is `{ "text": "...", "mode": "preview"|"edit" }`. Saves are
-atomic (temp file + fsync + rename) and happen on leaving edit mode, clear,
-quit, and debounced while typing. A missing or corrupt file falls back to
-an empty note — it never wedges the pane.
+The format is `{ "text": "...", "mode": "preview"|"edit", "title": "...",
+"tab_id": "...", "created": ..., "updated": ... }`. Older `{ text, mode }`
+files still load fine — the newer fields fill in with defaults. `created`
+is stamped once; `updated` bumps on every save. Saves are atomic (temp file
++ fsync + rename) and happen on leaving edit mode, clear, quit, and
+debounced while typing. A missing or corrupt file falls back to an empty
+note — it never wedges the pane.
+
+A note with no text and no title is deleted on save instead of written, so
+opening Notes in a tab and closing it again without typing anything leaves
+nothing behind. Press `l` in preview for an overlay listing every note
+across tabs — title (or "(untitled)"), age, and whether its tab is still
+open (`live`/`closed`/`?`) — with read-only preview, rename, and delete
+built in.
 
 ## Hacking
 
