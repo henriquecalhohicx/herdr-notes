@@ -217,7 +217,6 @@ pub(crate) fn read_note(path: &Path) -> Note {
 
 /// The directory holding per-note files for THIS process, or None outside herdr
 /// with no config dir. Mirrors `state_path` but yields the containing dir.
-#[allow(dead_code)] // consumed by the notes overlay (later task)
 pub fn store_dir() -> Option<PathBuf> {
     Some(match store_base()? {
         StoreBase::PluginState(dir) => dir,
@@ -227,7 +226,6 @@ pub fn store_dir() -> Option<PathBuf> {
 
 /// One row of the notes list.
 #[derive(Clone, PartialEq, Eq, Debug)]
-#[allow(dead_code)] // consumed by the notes overlay (later task)
 pub struct NoteSummary {
     pub file: PathBuf,
     pub tab_id: String,
@@ -239,7 +237,6 @@ pub struct NoteSummary {
 
 /// All notes in `dir`, newest `updated` first. Skips non-`.json` files (so the
 /// `.json.tmp` write-temp is ignored). Never panics on a garbled file.
-#[allow(dead_code)] // consumed by the notes overlay (later task)
 pub fn list_notes(dir: &Path) -> Vec<NoteSummary> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else { return out };
@@ -286,7 +283,8 @@ pub fn parse(json: &str) -> Note {
     Note { text, mode, title, tab_id, created, updated }
 }
 
-/// The JSON that goes on disk: `{ "text": …, "mode": "preview"|"edit" }`.
+/// The JSON that goes on disk: `{ "text", "mode", "title", "tab_id", "created",
+/// "updated" }`.
 pub fn to_json(note: &Note) -> String {
     serde_json::json!({
         "text": note.text,
@@ -306,7 +304,6 @@ pub fn is_blank(note: &Note) -> bool {
 
 /// Whether the tab that owns a note is still open.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[allow(dead_code)] // consumed by the notes overlay (later task)
 pub enum TabStatus {
     Live,
     Closed,
@@ -315,7 +312,6 @@ pub enum TabStatus {
 
 /// Classify a note's owner tab against the set of live tab ids. `None` (socket
 /// unreachable) or an empty owner id is Unknown; otherwise Live iff present.
-#[allow(dead_code)] // consumed by the notes overlay (later task)
 pub fn classify_tab(tab_id: &str, live: Option<&std::collections::HashSet<String>>) -> TabStatus {
     match live {
         None => TabStatus::Unknown,
@@ -331,7 +327,6 @@ pub fn classify_tab(tab_id: &str, live: Option<&std::collections::HashSet<String
 }
 
 /// Human age from a "seconds ago" delta: just now / Nm / Nh / Nd / Nw.
-#[allow(dead_code)] // consumed by the notes overlay (later task)
 pub fn format_age(secs_ago: u64) -> String {
     match secs_ago {
         0..=59 => "just now".to_string(),
@@ -378,11 +373,9 @@ pub fn set_title(file: &Path, title: &str) {
     persist_at(file, &note, &tab_id, unix_now());
 }
 
-/// Atomic best-effort persist: write a temp file, fsync it, then rename over
-/// the real one (std's rename replaces existing files on Windows too). The
-/// fsync BEFORE the rename matters: without it a crash or power loss can make
-/// the rename durable ahead of the data, leaving an empty/truncated file the
-/// forgiving loader would silently turn into an empty note.
+/// Resolves the path, "now", and this process's tab id, then delegates the
+/// atomic write-or-delete to [`persist_at`] (temp file + fsync + rename, or
+/// delete when blank).
 pub fn save(note: &Note) {
     let Some(path) = state_path() else { return };
     persist_at(&path, note, &tab_env().unwrap_or_default(), unix_now());

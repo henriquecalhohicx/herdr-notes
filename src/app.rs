@@ -325,6 +325,7 @@ impl App {
                             state::set_title(&e.file, &title);
                         }
                         e.title = title.clone();
+                        e.updated = state::unix_now();
                         if e.is_self {
                             self.note.title = title;
                         }
