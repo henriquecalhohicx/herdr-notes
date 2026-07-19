@@ -97,7 +97,7 @@ fn config_base() -> Option<PathBuf> {
 
 /// The tab id herdr injects into every managed pane; the per-tab note key.
 /// Empty = unset (running outside herdr).
-fn tab_env() -> Option<String> {
+pub(crate) fn tab_env() -> Option<String> {
     std::env::var("HERDR_TAB_ID").ok().filter(|id| !id.is_empty())
 }
 

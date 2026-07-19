@@ -28,9 +28,38 @@ const HEARTBEAT_EVERY: Duration = Duration::from_secs(5);
 /// Shown in preview when the note is empty; doubles as the quick-start help.
 const EMPTY_HELP: &str = "(empty note)\n\n  e or Enter        start writing\n  Esc               back to preview (saves)\n  Up/Dn PgUp/PgDn   scroll, g/G top/bottom\n  x                 clear the note (asks first)\n  q                 quit\n\nEverything autosaves and survives restarts.";
 
+/// One row in the list overlay.
+struct OverlayEntry {
+    #[allow(dead_code)] // consumed by rename/delete in a later task
+    file: std::path::PathBuf,
+    title: String,
+    updated: u64,
+    status: state::TabStatus,
+    #[allow(dead_code)] // consumed by Preview mode in a later task
+    text: String,
+    is_self: bool,
+}
+
+/// Sub-mode of the open list overlay.
+enum OverlayMode {
+    List,
+    #[allow(dead_code)] // constructed in a later task
+    Preview { scroll: usize },
+    #[allow(dead_code)] // constructed in a later task
+    Rename(String),
+    #[allow(dead_code)] // constructed in a later task
+    ConfirmDelete,
+}
+
+/// The list overlay: all notes on disk, browsable/manageable over the note.
+struct Overlay {
+    entries: Vec<OverlayEntry>,
+    selected: usize,
+    mode: OverlayMode,
+}
+
 /// Distinct tab ids of all live panes (one `pane.list` round-trip). None when
 /// the socket is unavailable (running the binary by hand outside herdr).
-#[allow(dead_code)] // used by the overlay in a later task
 fn live_tab_ids() -> Option<std::collections::HashSet<String>> {
     let resp = crate::ipc::call_text("pane.list", serde_json::json!({})).ok()?;
     let value: serde_json::Value =
@@ -64,6 +93,8 @@ pub struct App {
     persist: bool,
     /// Some(buf) while editing THIS note's title (opened with `r`).
     title_input: Option<String>,
+    /// Some while the `l` list overlay is open.
+    overlay: Option<Overlay>,
 }
 
 impl App {
@@ -90,6 +121,7 @@ impl App {
             last_beat: Instant::now(),
             persist,
             title_input: None,
+            overlay: None,
         };
         if app.note.mode == Mode::Edit {
             app.enter_edit();
@@ -161,6 +193,10 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return false;
         }
+        if self.overlay.is_some() {
+            self.on_key_overlay(key);
+            return false;
+        }
         if self.title_input.is_some() {
             self.on_key_title(key);
             return false;
@@ -200,6 +236,7 @@ impl App {
             KeyCode::End | KeyCode::Char('G') => self.preview_scroll = usize::MAX, // clamped in draw
             KeyCode::Char('x') => self.confirm_clear = true,
             KeyCode::Char('r') => self.title_input = Some(self.note.title.clone()),
+            KeyCode::Char('l') => self.open_overlay(),
             _ => {}
         }
         false
@@ -226,6 +263,48 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    fn open_overlay(&mut self) {
+        let Some(dir) = state::store_dir() else { return };
+        let live = live_tab_ids();
+        let self_tab = state::tab_env().unwrap_or_default();
+        let entries = state::list_notes(&dir)
+            .into_iter()
+            .map(|s| {
+                let text = state::read_note(&s.file).text;
+                OverlayEntry {
+                    status: state::classify_tab(&s.tab_id, live.as_ref()),
+                    is_self: !self_tab.is_empty() && s.tab_id == self_tab,
+                    file: s.file,
+                    title: s.title,
+                    updated: s.updated,
+                    text,
+                }
+            })
+            .collect();
+        self.overlay = Some(Overlay { entries, selected: 0, mode: OverlayMode::List });
+    }
+
+    fn on_key_overlay(&mut self, key: KeyEvent) {
+        let Some(mut ov) = self.overlay.take() else { return };
+        if self.handle_overlay(&mut ov, key) {
+            self.overlay = Some(ov);
+        }
+    }
+
+    /// Returns false when the overlay should close.
+    fn handle_overlay(&mut self, ov: &mut Overlay, key: KeyEvent) -> bool {
+        let last = ov.entries.len().saturating_sub(1);
+        if let OverlayMode::List = &mut ov.mode {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('l') => return false,
+                KeyCode::Up | KeyCode::Char('k') => ov.selected = ov.selected.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => ov.selected = (ov.selected + 1).min(last),
+                _ => {}
+            }
+        }
+        true
     }
 
     fn enter_edit(&mut self) {
@@ -416,6 +495,9 @@ impl App {
         if self.confirm_clear {
             draw_confirm(frame, area);
         }
+        if let Some(ov) = &self.overlay {
+            draw_overlay(frame, area, ov);
+        }
     }
 
     /// Renders the preview body; returns a "top-line/total" scroll hint when
@@ -511,6 +593,49 @@ fn draw_confirm(frame: &mut Frame, area: Rect) {
     frame.render_widget(Clear, rect);
     frame.render_widget(
         Paragraph::new(" Clear the note? y/N").block(Block::bordered().title(" Clear ")),
+        rect,
+    );
+}
+
+fn draw_overlay(frame: &mut Frame, area: Rect, ov: &Overlay) {
+    let w = area.width.saturating_sub(4).clamp(20, 60);
+    let content_h = u16::try_from(ov.entries.len() + 2).unwrap_or(u16::MAX);
+    let h = area.height.saturating_sub(2).min(content_h).max(3);
+    let rect = Rect {
+        x: area.x + (area.width - w) / 2,
+        y: area.y + (area.height - h) / 2,
+        width: w,
+        height: h,
+    };
+    frame.render_widget(Clear, rect);
+    let now = state::unix_now();
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, e) in ov.entries.iter().enumerate() {
+        let marker = if i == ov.selected { ">" } else { " " };
+        let name = if e.title.trim().is_empty() { "(untitled)".to_string() } else { e.title.clone() };
+        let age = if e.updated == 0 { "—".to_string() } else { state::format_age(now.saturating_sub(e.updated)) };
+        let status = match e.status {
+            state::TabStatus::Live => "live",
+            state::TabStatus::Closed => "closed",
+            state::TabStatus::Unknown => "?",
+        };
+        let self_mark = if e.is_self { "*" } else { " " };
+        let style = if i == ov.selected {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::styled(
+            format!("{marker}{self_mark}{name:<28.28} {age:>7}  {status}"),
+            style,
+        ));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from("(no notes)"));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::bordered().title(" All notes   ↑↓ move  enter preview  r rename  d delete  esc ")),
         rect,
     );
 }
@@ -656,5 +781,28 @@ mod tests {
         a.on_key(key(KeyCode::Esc));
         assert_eq!(a.note.title, "Hi", "Esc discards the title edit");
         assert!(!a.on_key(key(KeyCode::Esc)), "Esc still never quits");
+    }
+
+    #[test]
+    fn overlay_opens_navigates_and_closes() {
+        let mut a = app("body");
+        a.overlay = Some(Overlay {
+            entries: vec![
+                OverlayEntry { file: "a.json".into(), title: "A".into(), updated: 0,
+                    status: state::TabStatus::Live, text: "aa".into(), is_self: true },
+                OverlayEntry { file: "b.json".into(), title: String::new(), updated: 0,
+                    status: state::TabStatus::Closed, text: "bb".into(), is_self: false },
+            ],
+            selected: 0,
+            mode: OverlayMode::List,
+        });
+        a.on_key(key(KeyCode::Down));
+        assert_eq!(a.overlay.as_ref().unwrap().selected, 1);
+        a.on_key(key(KeyCode::Down)); // clamps at last
+        assert_eq!(a.overlay.as_ref().unwrap().selected, 1);
+        a.on_key(key(KeyCode::Up));
+        assert_eq!(a.overlay.as_ref().unwrap().selected, 0);
+        assert!(!a.on_key(key(KeyCode::Esc)), "Esc closes overlay, never quits");
+        assert!(a.overlay.is_none());
     }
 }
