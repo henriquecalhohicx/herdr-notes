@@ -43,8 +43,8 @@ struct OverlayEntry {
     /// instead of previewing; immune to rename/delete/go-to-tab/filter.
     is_global: bool,
     /// Precomputed row context string ("workspace · agent" / "closed" / "?" /
-    /// "global") — see `state::format_context`. Filled in for real in Task 4;
-    /// regular rows are `""` until then.
+    /// "global") — see `state::format_context`. Not yet read anywhere (rendering
+    /// lands in Task 6).
     #[allow(dead_code)]
     context: String,
 }
@@ -91,20 +91,63 @@ impl Overlay {
     }
 }
 
-/// Distinct tab ids of all live panes (one `pane.list` round-trip). None when
-/// the socket is unavailable (running the binary by hand outside herdr).
-fn live_tab_ids() -> Option<std::collections::HashSet<String>> {
-    let resp = crate::ipc::call_text("pane.list", serde_json::json!({})).ok()?;
-    let value: serde_json::Value =
-        serde_json::from_str(resp.trim_start_matches('\u{feff}')).ok()?;
-    let panes = value.get("result")?.get("panes")?.as_array()?;
-    let mut set = std::collections::HashSet::new();
-    for pane in panes {
-        if let Some(tab) = pane.get("tab_id").and_then(|t| t.as_str()) {
-            set.insert(tab.to_string());
-        }
+/// Live tabs plus their session context (workspace + agent), built from one
+/// `tab.list` + `workspace.list` + `pane.list` round-trip when the overlay
+/// opens. `None` when any call/parse fails (socket unreachable, or running
+/// outside herdr) — every row then falls back to Unknown.
+struct TabIndex {
+    live: std::collections::HashSet<String>,
+    ctx: std::collections::HashMap<String, state::RowContext>,
+}
+
+fn tab_contexts() -> Option<TabIndex> {
+    let tabs = fetch_array("tab.list", "tabs")?;
+    let workspaces = fetch_array("workspace.list", "workspaces")?;
+    let panes = fetch_array("pane.list", "panes")?;
+
+    let mut ws_label: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for w in &workspaces {
+        let (Some(id), Some(label)) = (
+            w.get("workspace_id").and_then(|v| v.as_str()),
+            w.get("label").and_then(|v| v.as_str()),
+        ) else {
+            continue;
+        };
+        ws_label.insert(id.to_string(), label.to_string());
     }
-    Some(set)
+
+    let mut agent_by_tab: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for p in &panes {
+        let Some(tab_id) = p.get("tab_id").and_then(|v| v.as_str()) else { continue };
+        let Some(agent) = p.get("agent").and_then(|v| v.as_str()) else { continue };
+        if agent == "usage" {
+            continue;
+        }
+        agent_by_tab.entry(tab_id.to_string()).or_insert_with(|| agent.to_string());
+    }
+
+    let mut live = std::collections::HashSet::new();
+    let mut ctx = std::collections::HashMap::new();
+    for t in &tabs {
+        let Some(tab_id) = t.get("tab_id").and_then(|v| v.as_str()) else { continue };
+        live.insert(tab_id.to_string());
+        let Some(ws_id) = t.get("workspace_id").and_then(|v| v.as_str()) else { continue };
+        let Some(workspace) = ws_label.get(ws_id).cloned() else { continue };
+        ctx.insert(
+            tab_id.to_string(),
+            state::RowContext { workspace, agent: agent_by_tab.get(tab_id).cloned() },
+        );
+    }
+    Some(TabIndex { live, ctx })
+}
+
+/// One `method` round-trip, returning `result.<key>` as a JSON array — `None`
+/// on any socket/parse failure (best-effort, never panics; the overlay just
+/// shows Unknown context for every row when this fails).
+fn fetch_array(method: &str, key: &str) -> Option<Vec<serde_json::Value>> {
+    let resp = crate::ipc::call_text(method, serde_json::json!({})).ok()?;
+    let value: serde_json::Value = serde_json::from_str(resp.trim_start_matches('\u{feff}')).ok()?;
+    value.get("result")?.get(key)?.as_array().cloned()
 }
 
 /// Which note THIS pane currently shows — its own tab note, or the shared
@@ -352,7 +395,8 @@ impl App {
 
     fn open_overlay(&mut self) {
         let Some(dir) = state::store_dir() else { return };
-        let live = live_tab_ids();
+        let index = tab_contexts();
+        let live = index.as_ref().map(|i| &i.live);
         let self_tab = state::tab_env().unwrap_or_default();
         let global = state::global_path();
         let mut entries: Vec<OverlayEntry> = state::list_notes(&dir)
@@ -360,11 +404,13 @@ impl App {
             .filter(|s| Some(&s.file) != global.as_ref())
             .map(|s| {
                 let text = state::read_note(&s.file).text;
+                let status = state::classify_tab(&s.tab_id, live);
+                let context = state::format_context(status, index.as_ref().and_then(|i| i.ctx.get(&s.tab_id)));
                 OverlayEntry {
-                    status: state::classify_tab(&s.tab_id, live.as_ref()),
+                    status,
                     is_self: !self_tab.is_empty() && s.tab_id == self_tab,
                     is_global: false,
-                    context: String::new(),
+                    context,
                     tab_id: s.tab_id,
                     file: s.file,
                     title: s.title,

@@ -384,7 +384,6 @@ pub fn sort_rank(status: TabStatus) -> u8 {
 /// Live-tab context shown in an overlay row: workspace label + optional
 /// agent name (`claude`/`codex`/…).
 #[derive(Clone, PartialEq, Eq, Debug)]
-#[allow(dead_code)]
 pub struct RowContext {
     pub workspace: String,
     pub agent: Option<String>,
@@ -394,7 +393,6 @@ pub struct RowContext {
 /// context (agent omitted when none), `"closed"` / `"?"` otherwise. A Live
 /// status with no context (socket raced between the two lookups, or the tab
 /// has no live pane info) reads blank rather than guessing. Never panics.
-#[allow(dead_code)]
 pub fn format_context(status: TabStatus, ctx: Option<&RowContext>) -> String {
     match status {
         TabStatus::Live => match ctx {
