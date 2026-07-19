@@ -241,6 +241,15 @@ impl App {
         }
     }
 
+    /// True when `self.note` is the pane's own tab note (not the shared
+    /// global note) — so an `is_self` overlay row corresponds to the buffer
+    /// currently in memory. Guards the self-mutation on delete/rename: acting
+    /// on your own tab-note row while viewing the global note must NOT touch
+    /// the global buffer (that path silently deleted global.json).
+    fn showing_tab_note(&self) -> bool {
+        self.active == ActiveNote::Tab
+    }
+
     fn save(&self) {
         if !self.persist {
             return;
@@ -539,7 +548,7 @@ impl App {
                         }
                         e.title = title.clone();
                         e.updated = state::unix_now();
-                        if e.is_self {
+                        if e.is_self && self.showing_tab_note() {
                             self.note.title = title;
                         }
                     }
@@ -558,7 +567,7 @@ impl App {
                         if self.persist {
                             let _ = std::fs::remove_file(&e.file);
                         }
-                        if e.is_self {
+                        if e.is_self && self.showing_tab_note() {
                             self.note.text.clear();
                             self.note.title.clear();
                         }
@@ -879,7 +888,7 @@ fn draw_overlay(frame: &mut Frame, area: Rect, ov: &Overlay) {
     let h = match &ov.mode {
         OverlayMode::Preview { .. } => area.height.saturating_sub(2).max(3).min(area.height),
         OverlayMode::List | OverlayMode::Filter => {
-            let content_h = u16::try_from(ov.entries.len() + 2).unwrap_or(u16::MAX);
+            let content_h = u16::try_from(ov.visible.len() + 2).unwrap_or(u16::MAX);
             area.height.saturating_sub(2).min(content_h).max(3).min(area.height)
         }
         OverlayMode::Rename(_) | OverlayMode::ConfirmDelete => 3.min(area.height).max(1),
@@ -1160,7 +1169,9 @@ mod tests {
     #[test]
     fn overlay_delete_confirm_removes_row() {
         let mut a = app("body");
-        a.overlay = Some(Overlay::from_entries(vec![entry("X", state::TabStatus::Closed)]));
+        a.overlay = Some(Overlay::from_entries(vec![
+            OverlayEntry { is_self: true, ..entry("X", state::TabStatus::Closed) },
+        ]));
         a.on_key(key(KeyCode::Char('d')));
         assert!(matches!(a.overlay.as_ref().unwrap().mode, OverlayMode::ConfirmDelete));
         a.on_key(key(KeyCode::Char('n'))); // decline
@@ -1168,17 +1179,26 @@ mod tests {
         a.on_key(key(KeyCode::Char('d')));
         a.on_key(key(KeyCode::Char('y'))); // confirm — file path doesn't exist, remove_file is best-effort
         assert!(a.overlay.as_ref().unwrap().entries.is_empty(), "row removed after confirm");
+        // Normal case (active == Tab, the default): deleting your own tab-note
+        // row still clears the in-memory buffer, same as before the guard.
+        assert_eq!(a.note.text, "", "own tab-note row delete still clears the buffer on the tab-note path");
+        assert_eq!(a.note.title, "", "own tab-note row delete still clears the title on the tab-note path");
     }
 
     #[test]
     fn overlay_rename_enter_updates_row() {
         let mut a = app("body");
-        a.overlay = Some(Overlay::from_entries(vec![entry("", state::TabStatus::Closed)]));
+        a.overlay = Some(Overlay::from_entries(vec![
+            OverlayEntry { is_self: true, ..entry("", state::TabStatus::Closed) },
+        ]));
         a.on_key(key(KeyCode::Char('r')));
         a.on_key(key(KeyCode::Char('Z')));
         a.on_key(key(KeyCode::Enter));
         assert_eq!(a.overlay.as_ref().unwrap().entries[0].title, "Z");
         assert!(matches!(a.overlay.as_ref().unwrap().mode, OverlayMode::List));
+        // Normal case (active == Tab, the default): renaming your own
+        // tab-note row still updates the in-memory buffer, same as before.
+        assert_eq!(a.note.title, "Z", "own tab-note row rename still updates the buffer on the tab-note path");
     }
 
     #[test]
@@ -1361,5 +1381,33 @@ mod tests {
         b.overlay = Some(Overlay::from_entries(vec![global_row("★ Global note")]));
         b.on_key(key(KeyCode::Char('g')));
         assert!(b.overlay.is_some(), "g on the global row is a no-op, overlay stays open");
+    }
+
+    #[test]
+    fn deleting_own_tab_row_while_on_global_does_not_touch_global_buffer() {
+        let mut a = app("GLOBAL BODY");
+        a.active = ActiveNote::Global; // pane is showing the global note
+        a.note.title = "Global Title".into();
+        let mut e = entry_with_tab("Mine", state::TabStatus::Live, "w1:t1");
+        e.is_self = true; // the row IS this pane's own tab note (by file identity)
+        a.overlay = Some(Overlay::from_entries(vec![e]));
+        a.on_key(key(KeyCode::Char('d')));
+        a.on_key(key(KeyCode::Char('y'))); // confirm delete
+        assert_eq!(a.note.text, "GLOBAL BODY", "global buffer text must survive deleting a tab-note row");
+        assert_eq!(a.note.title, "Global Title", "global buffer title must survive");
+    }
+
+    #[test]
+    fn renaming_own_tab_row_while_on_global_does_not_touch_global_buffer() {
+        let mut a = app("GLOBAL BODY");
+        a.active = ActiveNote::Global;
+        a.note.title = "Global Title".into();
+        let mut e = entry_with_tab("Mine", state::TabStatus::Live, "w1:t1");
+        e.is_self = true;
+        a.overlay = Some(Overlay::from_entries(vec![e]));
+        a.on_key(key(KeyCode::Char('r')));
+        a.on_key(key(KeyCode::Char('Z')));
+        a.on_key(key(KeyCode::Enter));
+        assert_eq!(a.note.title, "Global Title", "global buffer title must not be overwritten by a tab-row rename");
     }
 }
