@@ -370,6 +370,14 @@ pub fn persist_at(path: &Path, note: &Note, tab_id: &str, now: u64) {
     }
 }
 
+/// Set a note file's title in place (blank text + blank title would delete it).
+pub fn set_title(file: &Path, title: &str) {
+    let mut note = read_note(file);
+    note.title = title.trim().to_string();
+    let tab_id = note.tab_id.clone();
+    persist_at(file, &note, &tab_id, unix_now());
+}
+
 /// Atomic best-effort persist: write a temp file, fsync it, then rename over
 /// the real one (std's rename replaces existing files on Windows too). The
 /// fsync BEFORE the rename matters: without it a crash or power loss can make
@@ -610,6 +618,17 @@ mod tests {
         persist_at(&path, &Note::default(), "w1:t2", 2);
         assert!(!path.exists(), "blank note deletes its file");
         let _ = std::fs::remove_dir_all(dir.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn set_title_updates_the_file() {
+        let dir = temp_base("settitle").join("notes");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("w1_t1.json");
+        persist_at(&path, &Note { text: "body".into(), ..Default::default() }, "w1:t1", 10);
+        set_title(&path, "  New Name  ");
+        assert_eq!(read_note(&path).title, "New Name");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -30,12 +30,10 @@ const EMPTY_HELP: &str = "(empty note)\n\n  e or Enter        start writing\n  E
 
 /// One row in the list overlay.
 struct OverlayEntry {
-    #[allow(dead_code)] // consumed by rename/delete in a later task
     file: std::path::PathBuf,
     title: String,
     updated: u64,
     status: state::TabStatus,
-    #[allow(dead_code)] // consumed by Preview mode in a later task
     text: String,
     is_self: bool,
 }
@@ -43,11 +41,8 @@ struct OverlayEntry {
 /// Sub-mode of the open list overlay.
 enum OverlayMode {
     List,
-    #[allow(dead_code)] // constructed in a later task
     Preview { scroll: usize },
-    #[allow(dead_code)] // constructed in a later task
     Rename(String),
-    #[allow(dead_code)] // constructed in a later task
     ConfirmDelete,
 }
 
@@ -296,12 +291,66 @@ impl App {
     /// Returns false when the overlay should close.
     fn handle_overlay(&mut self, ov: &mut Overlay, key: KeyEvent) -> bool {
         let last = ov.entries.len().saturating_sub(1);
-        if let OverlayMode::List = &mut ov.mode {
-            match key.code {
+        match &mut ov.mode {
+            OverlayMode::List => match key.code {
                 KeyCode::Esc | KeyCode::Char('l') => return false,
                 KeyCode::Up | KeyCode::Char('k') => ov.selected = ov.selected.saturating_sub(1),
                 KeyCode::Down | KeyCode::Char('j') => ov.selected = (ov.selected + 1).min(last),
+                KeyCode::Enter => {
+                    if !ov.entries.is_empty() {
+                        ov.mode = OverlayMode::Preview { scroll: 0 };
+                    }
+                }
+                KeyCode::Char('r') => {
+                    if let Some(e) = ov.entries.get(ov.selected) {
+                        ov.mode = OverlayMode::Rename(e.title.clone());
+                    }
+                }
+                KeyCode::Char('d') if !ov.entries.is_empty() => {
+                    ov.mode = OverlayMode::ConfirmDelete;
+                }
                 _ => {}
+            },
+            OverlayMode::Preview { scroll } => match key.code {
+                KeyCode::Esc => ov.mode = OverlayMode::List,
+                KeyCode::Up => *scroll = scroll.saturating_sub(1),
+                KeyCode::Down => *scroll = scroll.saturating_add(1),
+                _ => {}
+            },
+            OverlayMode::Rename(buf) => match key.code {
+                KeyCode::Enter => {
+                    let title = buf.trim().to_string();
+                    if let Some(e) = ov.entries.get_mut(ov.selected) {
+                        state::set_title(&e.file, &title);
+                        e.title = title.clone();
+                        if e.is_self {
+                            self.note.title = title;
+                        }
+                    }
+                    ov.mode = OverlayMode::List;
+                }
+                KeyCode::Esc => ov.mode = OverlayMode::List,
+                KeyCode::Backspace => {
+                    buf.pop();
+                }
+                KeyCode::Char(c) => buf.push(c),
+                _ => {}
+            },
+            OverlayMode::ConfirmDelete => {
+                if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+                    if let Some(e) = ov.entries.get(ov.selected) {
+                        let _ = std::fs::remove_file(&e.file);
+                        if e.is_self {
+                            self.note.text.clear();
+                            self.note.title.clear();
+                        }
+                    }
+                    if ov.selected <= last && !ov.entries.is_empty() {
+                        ov.entries.remove(ov.selected);
+                    }
+                    ov.selected = ov.selected.min(ov.entries.len().saturating_sub(1));
+                }
+                ov.mode = OverlayMode::List;
             }
         }
         true
@@ -598,46 +647,83 @@ fn draw_confirm(frame: &mut Frame, area: Rect) {
 }
 
 fn draw_overlay(frame: &mut Frame, area: Rect, ov: &Overlay) {
-    let w = area.width.saturating_sub(4).clamp(20, 60);
+    // Centering below relies on w <= area.width and h <= area.height — on a
+    // very narrow/short pane the clamp(20, 60) / .max(3) floors can otherwise
+    // exceed the area and underflow the saturating_sub centering math (a
+    // panic on `.saturating_sub` never happens, but plain subtraction would).
+    let w = area.width.saturating_sub(4).clamp(20, 60).min(area.width);
     let content_h = u16::try_from(ov.entries.len() + 2).unwrap_or(u16::MAX);
-    let h = area.height.saturating_sub(2).min(content_h).max(3);
+    let h = area.height.saturating_sub(2).min(content_h).max(3).min(area.height);
     let rect = Rect {
-        x: area.x + (area.width - w) / 2,
-        y: area.y + (area.height - h) / 2,
+        x: area.x + area.width.saturating_sub(w) / 2,
+        y: area.y + area.height.saturating_sub(h) / 2,
         width: w,
         height: h,
     };
     frame.render_widget(Clear, rect);
-    let now = state::unix_now();
-    let mut lines: Vec<Line> = Vec::new();
-    for (i, e) in ov.entries.iter().enumerate() {
-        let marker = if i == ov.selected { ">" } else { " " };
-        let name = if e.title.trim().is_empty() { "(untitled)".to_string() } else { e.title.clone() };
-        let age = if e.updated == 0 { "—".to_string() } else { state::format_age(now.saturating_sub(e.updated)) };
-        let status = match e.status {
-            state::TabStatus::Live => "live",
-            state::TabStatus::Closed => "closed",
-            state::TabStatus::Unknown => "?",
-        };
-        let self_mark = if e.is_self { "*" } else { " " };
-        let style = if i == ov.selected {
-            Style::default().add_modifier(Modifier::REVERSED)
-        } else {
-            Style::default()
-        };
-        lines.push(Line::styled(
-            format!("{marker}{self_mark}{name:<28.28} {age:>7}  {status}"),
-            style,
-        ));
+    match &ov.mode {
+        OverlayMode::Preview { scroll } => {
+            let text = ov.entries.get(ov.selected).map(|e| e.text.as_str()).unwrap_or("");
+            let text_w = usize::from(rect.width).saturating_sub(2).max(1);
+            let rendered = render_markdown(text, text_w);
+            let s = u16::try_from(*scroll).unwrap_or(u16::MAX);
+            frame.render_widget(
+                Paragraph::new(rendered)
+                    .scroll((s, 0))
+                    .block(Block::bordered().title(" Preview   Up/Dn scroll   esc back ")),
+                rect,
+            );
+        }
+        OverlayMode::Rename(buf) => {
+            frame.render_widget(
+                Paragraph::new(format!(" Title: {buf}"))
+                    .block(Block::bordered().title(" Rename   Enter save   Esc cancel ")),
+                rect,
+            );
+        }
+        OverlayMode::ConfirmDelete => {
+            let name = ov.entries.get(ov.selected)
+                .map(|e| if e.title.trim().is_empty() { "(untitled)".to_string() } else { e.title.clone() })
+                .unwrap_or_default();
+            frame.render_widget(
+                Paragraph::new(format!(" Delete \"{name}\"? y/N"))
+                    .block(Block::bordered().title(" Delete ")),
+                rect,
+            );
+        }
+        OverlayMode::List => {
+            let now = state::unix_now();
+            let mut lines: Vec<Line> = Vec::new();
+            for (i, e) in ov.entries.iter().enumerate() {
+                let marker = if i == ov.selected { ">" } else { " " };
+                let name = if e.title.trim().is_empty() { "(untitled)".to_string() } else { e.title.clone() };
+                let age = if e.updated == 0 { "—".to_string() } else { state::format_age(now.saturating_sub(e.updated)) };
+                let status = match e.status {
+                    state::TabStatus::Live => "live",
+                    state::TabStatus::Closed => "closed",
+                    state::TabStatus::Unknown => "?",
+                };
+                let self_mark = if e.is_self { "*" } else { " " };
+                let style = if i == ov.selected {
+                    Style::default().add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::default()
+                };
+                lines.push(Line::styled(
+                    format!("{marker}{self_mark}{name:<28.28} {age:>7}  {status}"),
+                    style,
+                ));
+            }
+            if lines.is_empty() {
+                lines.push(Line::from("(no notes)"));
+            }
+            frame.render_widget(
+                Paragraph::new(lines)
+                    .block(Block::bordered().title(" All notes   ↑↓ move  enter preview  r rename  d delete  esc ")),
+                rect,
+            );
+        }
     }
-    if lines.is_empty() {
-        lines.push(Line::from("(no notes)"));
-    }
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(Block::bordered().title(" All notes   ↑↓ move  enter preview  r rename  d delete  esc ")),
-        rect,
-    );
 }
 
 fn clen(s: &str) -> usize {
@@ -781,6 +867,40 @@ mod tests {
         a.on_key(key(KeyCode::Esc));
         assert_eq!(a.note.title, "Hi", "Esc discards the title edit");
         assert!(!a.on_key(key(KeyCode::Esc)), "Esc still never quits");
+    }
+
+    #[test]
+    fn overlay_delete_confirm_removes_row() {
+        let mut a = app("body");
+        a.overlay = Some(Overlay {
+            entries: vec![OverlayEntry { file: "x.json".into(), title: "X".into(),
+                updated: 0, status: state::TabStatus::Closed, text: "xx".into(), is_self: false }],
+            selected: 0,
+            mode: OverlayMode::List,
+        });
+        a.on_key(key(KeyCode::Char('d')));
+        assert!(matches!(a.overlay.as_ref().unwrap().mode, OverlayMode::ConfirmDelete));
+        a.on_key(key(KeyCode::Char('n'))); // decline
+        assert_eq!(a.overlay.as_ref().unwrap().entries.len(), 1);
+        a.on_key(key(KeyCode::Char('d')));
+        a.on_key(key(KeyCode::Char('y'))); // confirm — file path doesn't exist, remove_file is best-effort
+        assert!(a.overlay.as_ref().unwrap().entries.is_empty(), "row removed after confirm");
+    }
+
+    #[test]
+    fn overlay_rename_enter_updates_row() {
+        let mut a = app("body");
+        a.overlay = Some(Overlay {
+            entries: vec![OverlayEntry { file: "x.json".into(), title: String::new(),
+                updated: 0, status: state::TabStatus::Closed, text: "xx".into(), is_self: false }],
+            selected: 0,
+            mode: OverlayMode::List,
+        });
+        a.on_key(key(KeyCode::Char('r')));
+        a.on_key(key(KeyCode::Char('Z')));
+        a.on_key(key(KeyCode::Enter));
+        assert_eq!(a.overlay.as_ref().unwrap().entries[0].title, "Z");
+        assert!(matches!(a.overlay.as_ref().unwrap().mode, OverlayMode::List));
     }
 
     #[test]
