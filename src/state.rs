@@ -304,6 +304,18 @@ pub fn is_blank(note: &Note) -> bool {
     note.text.trim().is_empty() && note.title.trim().is_empty()
 }
 
+/// Human age from a "seconds ago" delta: just now / Nm / Nh / Nd / Nw.
+#[allow(dead_code)] // consumed by the notes overlay (later task)
+pub fn format_age(secs_ago: u64) -> String {
+    match secs_ago {
+        0..=59 => "just now".to_string(),
+        60..=3599 => format!("{}m", secs_ago / 60),
+        3600..=86_399 => format!("{}h", secs_ago / 3600),
+        86_400..=604_799 => format!("{}d", secs_ago / 86_400),
+        _ => format!("{}w", secs_ago / 604_800),
+    }
+}
+
 /// Atomic best-effort persist, OR delete the file when the note is blank.
 /// `created` is preserved across saves (set once); `updated` is `now`; an
 /// empty incoming `tab_id` keeps whatever the note already had.
@@ -572,5 +584,18 @@ mod tests {
         persist_at(&path, &Note::default(), "w1:t2", 2);
         assert!(!path.exists(), "blank note deletes its file");
         let _ = std::fs::remove_dir_all(dir.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn format_age_covers_boundaries() {
+        assert_eq!(format_age(0), "just now");
+        assert_eq!(format_age(59), "just now");
+        assert_eq!(format_age(60), "1m");
+        assert_eq!(format_age(3599), "59m");
+        assert_eq!(format_age(3600), "1h");
+        assert_eq!(format_age(86_399), "23h");
+        assert_eq!(format_age(86_400), "1d");
+        assert_eq!(format_age(604_799), "6d");
+        assert_eq!(format_age(604_800), "1w");
     }
 }
