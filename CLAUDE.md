@@ -187,9 +187,11 @@ Learned building this plugin:
   (`tab_id`, `agent`; skip `agent == "usage"`, first non-null per tab wins).
   All three are best-effort: any call/parse/field failure collapses the whole
   index to `None` → every row reads Unknown, overlay works offline, never
-  panics. NOTE: these response field names are the shapes the code ASSUMES;
-  confirm them against a live herdr session (they are the one thing unit tests
-  can't cover) before relying on the context column in the wild.
+  panics. Field names VERIFIED live on herdr 0.7.4: `workspaces[]` carry
+  `workspace_id`+`label`, `tabs[]` carry `tab_id`+`workspace_id`, `panes[]`
+  carry `tab_id` and — only once an agent is reported on the pane — `agent`
+  (a bare shell pane has just `agent_status`, so the code's
+  `else continue` on a missing `agent` is the normal path, not an error).
 
 ## README screenshots (Alex's criteria — follow on every reshoot)
 
