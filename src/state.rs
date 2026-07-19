@@ -251,6 +251,39 @@ pub fn to_json(note: &Note) -> String {
     .to_string()
 }
 
+/// A note with no text and no title carries nothing worth a file.
+pub fn is_blank(note: &Note) -> bool {
+    note.text.trim().is_empty() && note.title.trim().is_empty()
+}
+
+/// Atomic best-effort persist, OR delete the file when the note is blank.
+/// `created` is preserved across saves (set once); `updated` is `now`; an
+/// empty incoming `tab_id` keeps whatever the note already had.
+pub fn persist_at(path: &Path, note: &Note, tab_id: &str, now: u64) {
+    if is_blank(note) {
+        let _ = std::fs::remove_file(path);
+        return;
+    }
+    let mut out = note.clone();
+    if !tab_id.is_empty() {
+        out.tab_id = tab_id.to_string();
+    }
+    out.created = if note.created == 0 { now } else { note.created };
+    out.updated = now;
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let tmp = path.with_extension("json.tmp");
+    let written = std::fs::File::create(&tmp).and_then(|mut f| {
+        use std::io::Write;
+        f.write_all(to_json(&out).as_bytes())?;
+        f.sync_all()
+    });
+    if written.is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+
 /// Atomic best-effort persist: write a temp file, fsync it, then rename over
 /// the real one (std's rename replaces existing files on Windows too). The
 /// fsync BEFORE the rename matters: without it a crash or power loss can make
@@ -258,18 +291,7 @@ pub fn to_json(note: &Note) -> String {
 /// forgiving loader would silently turn into an empty note.
 pub fn save(note: &Note) {
     let Some(path) = state_path() else { return };
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let tmp = path.with_extension("json.tmp");
-    let written = std::fs::File::create(&tmp).and_then(|mut f| {
-        use std::io::Write;
-        f.write_all(to_json(note).as_bytes())?;
-        f.sync_all()
-    });
-    if written.is_ok() {
-        let _ = std::fs::rename(&tmp, &path);
-    }
+    persist_at(&path, note, &tab_env().unwrap_or_default(), unix_now());
 }
 
 #[cfg(test)]
@@ -449,5 +471,37 @@ mod tests {
         assert_eq!(load_in(&empty, Some("w9")), Note::default());
         assert_eq!(load_in(&empty, None), Note::default());
         let _ = std::fs::remove_dir_all(&empty);
+    }
+
+    #[test]
+    fn persist_stamps_timestamps_and_tab_id() {
+        let dir = temp_base("persist").join("herdr").join("notes");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("w1_t2.json");
+        let note = Note { text: "hi".into(), ..Default::default() };
+        persist_at(&path, &note, "w1:t2", 500);
+        let back = read_note(&path);
+        assert_eq!(back.tab_id, "w1:t2");
+        assert_eq!(back.created, 500);
+        assert_eq!(back.updated, 500);
+        // second save preserves created, bumps updated
+        persist_at(&path, &back, "w1:t2", 900);
+        let back2 = read_note(&path);
+        assert_eq!(back2.created, 500);
+        assert_eq!(back2.updated, 900);
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn persist_deletes_file_when_note_is_blank() {
+        let dir = temp_base("blank").join("herdr").join("notes");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("w1_t2.json");
+        persist_at(&path, &Note { text: "x".into(), ..Default::default() }, "w1:t2", 1);
+        assert!(path.exists());
+        // now blank (no text, no title) -> file removed
+        persist_at(&path, &Note::default(), "w1:t2", 2);
+        assert!(!path.exists(), "blank note deletes its file");
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap().parent().unwrap());
     }
 }
