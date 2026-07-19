@@ -174,7 +174,6 @@ pub fn state_path() -> Option<PathBuf> {
 /// Global note file location for THIS process (env-derived base), independent
 /// of any tab id. Deliberately last-writer-wins if two tabs edit it at once —
 /// same single-user assumption as the rest of the cross-session note sharing.
-#[allow(dead_code)]
 pub fn global_path() -> Option<PathBuf> {
     Some(match store_base()? {
         StoreBase::PluginState(dir) => global_dir_path(&dir),
@@ -453,14 +452,6 @@ pub fn set_title(file: &Path, title: &str) {
     note.title = title.trim().to_string();
     let tab_id = note.tab_id.clone();
     persist_at(file, &note, &tab_id, unix_now());
-}
-
-/// Resolves the path, "now", and this process's tab id, then delegates the
-/// atomic write-or-delete to [`persist_at`] (temp file + fsync + rename, or
-/// delete when blank).
-pub fn save(note: &Note) {
-    let Some(path) = state_path() else { return };
-    persist_at(&path, note, &tab_env().unwrap_or_default(), unix_now());
 }
 
 #[cfg(test)]

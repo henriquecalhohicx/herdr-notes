@@ -32,10 +32,21 @@ const EMPTY_HELP: &str = "(empty note)\n\n  e or Enter        start writing\n  E
 struct OverlayEntry {
     file: std::path::PathBuf,
     title: String,
+    /// Owning tab id ("" for the pinned global row) — used by go-to-tab (`g`).
+    #[allow(dead_code)]
+    tab_id: String,
     updated: u64,
     status: state::TabStatus,
     text: String,
     is_self: bool,
+    /// The pinned `★ Global` row: switches the pane's active note on `enter`
+    /// instead of previewing; immune to rename/delete/go-to-tab/filter.
+    is_global: bool,
+    /// Precomputed row context string ("workspace · agent" / "closed" / "?" /
+    /// "global") — see `state::format_context`. Filled in for real in Task 4;
+    /// regular rows are `""` until then.
+    #[allow(dead_code)]
+    context: String,
 }
 
 /// Sub-mode of the open list overlay.
@@ -96,6 +107,15 @@ fn live_tab_ids() -> Option<std::collections::HashSet<String>> {
     Some(set)
 }
 
+/// Which note THIS pane currently shows — its own tab note, or the shared
+/// cross-session global note. Toggled by the overlay's pinned `★ Global` row.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum ActiveNote {
+    #[default]
+    Tab,
+    Global,
+}
+
 pub struct App {
     note: Note,
     /// The note split into lines while editing.
@@ -117,6 +137,8 @@ pub struct App {
     title_input: Option<String>,
     /// Some while the `l` list overlay is open.
     overlay: Option<Overlay>,
+    /// Which note this pane is currently showing.
+    active: ActiveNote,
 }
 
 impl App {
@@ -144,6 +166,7 @@ impl App {
             persist,
             title_input: None,
             overlay: None,
+            active: ActiveNote::default(),
         };
         if app.note.mode == Mode::Edit {
             app.enter_edit();
@@ -153,10 +176,50 @@ impl App {
 
     // ----- persistence & heartbeat -------------------------------------
 
-    fn save(&self) {
-        if self.persist {
-            state::save(&self.note);
+    /// The file THIS pane currently saves/loads from, given `self.active`.
+    /// Pure path resolution (env-derived, no I/O) — safe to call in tests.
+    fn current_path(&self) -> Option<std::path::PathBuf> {
+        match self.active {
+            ActiveNote::Tab => state::state_path(),
+            ActiveNote::Global => state::global_path(),
         }
+    }
+
+    fn save(&self) {
+        if !self.persist {
+            return;
+        }
+        let Some(path) = self.current_path() else { return };
+        let tab_id = match self.active {
+            ActiveNote::Tab => state::tab_env().unwrap_or_default(),
+            ActiveNote::Global => String::new(),
+        };
+        state::persist_at(&path, &self.note, &tab_id, state::unix_now());
+    }
+
+    /// Commit + save the current note, then swap the pane to the other one
+    /// (tab <-> global). Called by the overlay's pinned `★ Global` row.
+    /// The reload is gated on `persist` so unit tests (persist=false) never
+    /// touch the real note files — they can still assert the `active` flip
+    /// and the resolved path via `current_path`.
+    fn toggle_global(&mut self) {
+        self.commit();
+        self.save();
+        self.active = match self.active {
+            ActiveNote::Tab => ActiveNote::Global,
+            ActiveNote::Global => ActiveNote::Tab,
+        };
+        if self.persist {
+            self.note = match self.active {
+                ActiveNote::Tab => state::load(),
+                ActiveNote::Global => state::global_path()
+                    .map(|p| state::read_note(&p))
+                    .unwrap_or_default(),
+            };
+        }
+        self.note.mode = Mode::Preview;
+        self.preview_scroll = 0;
+        self.dirty = false;
     }
 
     /// Copy the edit buffer back into the note.
@@ -291,13 +354,18 @@ impl App {
         let Some(dir) = state::store_dir() else { return };
         let live = live_tab_ids();
         let self_tab = state::tab_env().unwrap_or_default();
-        let entries = state::list_notes(&dir)
+        let global = state::global_path();
+        let mut entries: Vec<OverlayEntry> = state::list_notes(&dir)
             .into_iter()
+            .filter(|s| Some(&s.file) != global.as_ref())
             .map(|s| {
                 let text = state::read_note(&s.file).text;
                 OverlayEntry {
                     status: state::classify_tab(&s.tab_id, live.as_ref()),
                     is_self: !self_tab.is_empty() && s.tab_id == self_tab,
+                    is_global: false,
+                    context: String::new(),
+                    tab_id: s.tab_id,
                     file: s.file,
                     title: s.title,
                     updated: s.updated,
@@ -305,6 +373,25 @@ impl App {
                 }
             })
             .collect();
+        if let Some(path) = global {
+            let note = state::read_note(&path);
+            let label = if self.active == ActiveNote::Global {
+                "◂ Back to this tab's note".to_string()
+            } else {
+                "★ Global note".to_string()
+            };
+            entries.insert(0, OverlayEntry {
+                file: path,
+                title: label,
+                tab_id: String::new(),
+                updated: note.updated,
+                status: state::TabStatus::Unknown,
+                text: note.text,
+                is_self: false,
+                is_global: true,
+                context: "global".to_string(),
+            });
+        }
         self.overlay = Some(Overlay::from_entries(entries));
     }
 
@@ -324,16 +411,25 @@ impl App {
                 KeyCode::Up | KeyCode::Char('k') => ov.selected = ov.selected.saturating_sub(1),
                 KeyCode::Down | KeyCode::Char('j') => ov.selected = (ov.selected + 1).min(last),
                 KeyCode::Enter => {
+                    if ov.selected_entry().is_some_and(|e| e.is_global) {
+                        self.toggle_global();
+                        return false;
+                    }
                     if !ov.visible.is_empty() {
                         ov.mode = OverlayMode::Preview { scroll: 0 };
                     }
                 }
                 KeyCode::Char('r') => {
-                    if let Some(e) = ov.selected_entry() {
+                    if let Some(e) = ov.selected_entry()
+                        && !e.is_global
+                    {
                         ov.mode = OverlayMode::Rename(e.title.clone());
                     }
                 }
-                KeyCode::Char('d') if !ov.visible.is_empty() => {
+                KeyCode::Char('d')
+                    if !ov.visible.is_empty()
+                        && !ov.selected_entry().is_some_and(|e| e.is_global) =>
+                {
                     ov.mode = OverlayMode::ConfirmDelete;
                 }
                 _ => {}
@@ -546,7 +642,13 @@ impl App {
                 format!(" [{mode}]"),
                 Style::default().fg(Color::Cyan),
             ));
-            if !self.note.title.trim().is_empty() {
+            if self.active == ActiveNote::Global {
+                title.push(Span::raw(" —"));
+                title.push(Span::styled(
+                    " ★ Global",
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ));
+            } else if !self.note.title.trim().is_empty() {
                 title.push(Span::raw(" —"));
                 title.push(Span::styled(
                     format!(" {}", self.note.title),
@@ -914,8 +1016,7 @@ mod tests {
     #[test]
     fn overlay_delete_confirm_removes_row() {
         let mut a = app("body");
-        a.overlay = Some(Overlay::from_entries(vec![OverlayEntry { file: "x.json".into(), title: "X".into(),
-            updated: 0, status: state::TabStatus::Closed, text: "xx".into(), is_self: false }]));
+        a.overlay = Some(Overlay::from_entries(vec![entry("X", state::TabStatus::Closed)]));
         a.on_key(key(KeyCode::Char('d')));
         assert!(matches!(a.overlay.as_ref().unwrap().mode, OverlayMode::ConfirmDelete));
         a.on_key(key(KeyCode::Char('n'))); // decline
@@ -928,8 +1029,7 @@ mod tests {
     #[test]
     fn overlay_rename_enter_updates_row() {
         let mut a = app("body");
-        a.overlay = Some(Overlay::from_entries(vec![OverlayEntry { file: "x.json".into(), title: String::new(),
-            updated: 0, status: state::TabStatus::Closed, text: "xx".into(), is_self: false }]));
+        a.overlay = Some(Overlay::from_entries(vec![entry("", state::TabStatus::Closed)]));
         a.on_key(key(KeyCode::Char('r')));
         a.on_key(key(KeyCode::Char('Z')));
         a.on_key(key(KeyCode::Enter));
@@ -941,10 +1041,8 @@ mod tests {
     fn overlay_opens_navigates_and_closes() {
         let mut a = app("body");
         a.overlay = Some(Overlay::from_entries(vec![
-            OverlayEntry { file: "a.json".into(), title: "A".into(), updated: 0,
-                status: state::TabStatus::Live, text: "aa".into(), is_self: true },
-            OverlayEntry { file: "b.json".into(), title: String::new(), updated: 0,
-                status: state::TabStatus::Closed, text: "bb".into(), is_self: false },
+            OverlayEntry { is_self: true, ..entry("A", state::TabStatus::Live) },
+            entry("", state::TabStatus::Closed),
         ]));
         a.on_key(key(KeyCode::Down));
         assert_eq!(a.overlay.as_ref().unwrap().selected, 1);
@@ -959,12 +1057,74 @@ mod tests {
     #[test]
     fn from_entries_seeds_visible_as_identity_and_clamps_selection() {
         let ov = Overlay::from_entries(vec![
-            OverlayEntry { file: "a.json".into(), title: "A".into(), updated: 0,
-                status: state::TabStatus::Live, text: String::new(), is_self: false },
-            OverlayEntry { file: "b.json".into(), title: "B".into(), updated: 0,
-                status: state::TabStatus::Closed, text: String::new(), is_self: false },
+            entry("A", state::TabStatus::Live),
+            entry("B", state::TabStatus::Closed),
         ]);
         assert_eq!(ov.visible, vec![0, 1]);
         assert_eq!(ov.selected_entry().unwrap().title, "A");
+    }
+
+    fn entry_with_tab(title: &str, status: state::TabStatus, tab_id: &str) -> OverlayEntry {
+        OverlayEntry {
+            file: format!("{title}.json").into(),
+            title: title.to_string(),
+            tab_id: tab_id.to_string(),
+            updated: 0,
+            status,
+            text: String::new(),
+            is_self: false,
+            is_global: false,
+            context: String::new(),
+        }
+    }
+
+    fn entry(title: &str, status: state::TabStatus) -> OverlayEntry {
+        entry_with_tab(title, status, "")
+    }
+
+    fn global_row(label: &str) -> OverlayEntry {
+        OverlayEntry {
+            file: "global.json".into(),
+            title: label.to_string(),
+            tab_id: String::new(),
+            updated: 0,
+            status: state::TabStatus::Unknown,
+            text: String::new(),
+            is_self: false,
+            is_global: true,
+            context: "global".into(),
+        }
+    }
+
+    #[test]
+    fn global_row_enter_switches_active_and_closes_overlay() {
+        let mut a = app("tab body");
+        assert_eq!(a.active, ActiveNote::Tab);
+        a.overlay = Some(Overlay::from_entries(vec![global_row("★ Global note")]));
+        a.on_key(key(KeyCode::Enter));
+        assert_eq!(a.active, ActiveNote::Global, "enter on the global row switches active");
+        assert!(a.overlay.is_none(), "switching closes the overlay");
+
+        a.overlay = Some(Overlay::from_entries(vec![global_row("◂ Back to this tab's note")]));
+        a.on_key(key(KeyCode::Enter));
+        assert_eq!(a.active, ActiveNote::Tab, "entering it again switches back");
+    }
+
+    #[test]
+    fn current_path_follows_active() {
+        let mut a = app("body");
+        assert_eq!(a.current_path(), state::state_path(), "Tab -> tab path");
+        a.active = ActiveNote::Global;
+        assert_eq!(a.current_path(), state::global_path(), "Global -> global path");
+    }
+
+    #[test]
+    fn global_row_ignores_rename_and_delete() {
+        let mut a = app("body");
+        a.overlay = Some(Overlay::from_entries(vec![global_row("★ Global note")]));
+        a.on_key(key(KeyCode::Char('r')));
+        assert!(matches!(a.overlay.as_ref().unwrap().mode, OverlayMode::List), "r is a no-op on the global row");
+        a.on_key(key(KeyCode::Char('d')));
+        assert!(matches!(a.overlay.as_ref().unwrap().mode, OverlayMode::List), "d is a no-op on the global row");
     }
 }
