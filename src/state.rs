@@ -211,8 +211,53 @@ fn load_in(base: &Path, tab_id: Option<&str>) -> Note {
     read_note(&path)
 }
 
-fn read_note(path: &Path) -> Note {
+pub(crate) fn read_note(path: &Path) -> Note {
     std::fs::read_to_string(path).map(|json| parse(&json)).unwrap_or_default()
+}
+
+/// The directory holding per-note files for THIS process, or None outside herdr
+/// with no config dir. Mirrors `state_path` but yields the containing dir.
+pub fn store_dir() -> Option<PathBuf> {
+    Some(match store_base()? {
+        StoreBase::PluginState(dir) => dir,
+        StoreBase::Config(base) => base.join("herdr").join("notes"),
+    })
+}
+
+/// One row of the notes list.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct NoteSummary {
+    pub file: PathBuf,
+    pub tab_id: String,
+    pub title: String,
+    pub updated: u64,
+    pub nonempty: bool,
+    pub preview: String,
+}
+
+/// All notes in `dir`, newest `updated` first. Skips non-`.json` files (so the
+/// `.json.tmp` write-temp is ignored). Never panics on a garbled file.
+pub fn list_notes(dir: &Path) -> Vec<NoteSummary> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else { return out };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let note = read_note(&path);
+        let preview: String = note.text.lines().next().unwrap_or("").trim().chars().take(48).collect();
+        out.push(NoteSummary {
+            file: path,
+            tab_id: note.tab_id,
+            title: note.title,
+            updated: note.updated,
+            nonempty: !note.text.trim().is_empty(),
+            preview,
+        });
+    }
+    out.sort_by(|a, b| b.updated.cmp(&a.updated));
+    out
 }
 
 /// Forgiving parse: any missing/garbled field falls back to the default, so a
@@ -490,6 +535,27 @@ mod tests {
         assert_eq!(back2.created, 500);
         assert_eq!(back2.updated, 900);
         let _ = std::fs::remove_dir_all(dir.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn list_notes_summarizes_and_sorts_newest_first() {
+        let dir = temp_base("list").join("notes");
+        std::fs::create_dir_all(&dir).unwrap();
+        persist_at(&dir.join("w1_t1.json"),
+            &Note { text: "first line\nmore".into(), title: "Old".into(), ..Default::default() },
+            "w1:t1", 100);
+        persist_at(&dir.join("w1_t2.json"),
+            &Note { text: "newer".into(), ..Default::default() }, "w1:t2", 300);
+        // a temp file must be ignored
+        std::fs::write(dir.join("w1_t3.json.tmp"), "garbage").unwrap();
+        let notes = list_notes(&dir);
+        assert_eq!(notes.len(), 2, "only .json files");
+        assert_eq!(notes[0].tab_id, "w1:t2", "newest updated first");
+        assert_eq!(notes[0].preview, "newer");
+        assert_eq!(notes[1].title, "Old");
+        assert_eq!(notes[1].preview, "first line");
+        assert!(notes[1].nonempty);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
