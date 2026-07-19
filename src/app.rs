@@ -33,7 +33,6 @@ struct OverlayEntry {
     file: std::path::PathBuf,
     title: String,
     /// Owning tab id ("" for the pinned global row) — used by go-to-tab (`g`).
-    #[allow(dead_code)]
     tab_id: String,
     updated: u64,
     status: state::TabStatus,
@@ -493,6 +492,18 @@ impl App {
                 {
                     ov.mode = OverlayMode::ConfirmDelete;
                 }
+                KeyCode::Char('g') => {
+                    if let Some(e) = ov.selected_entry()
+                        && !e.is_global
+                        && e.status == state::TabStatus::Live
+                        && !e.tab_id.is_empty()
+                    {
+                        if self.persist {
+                            let _ = crate::ipc::call_text("tab.focus", serde_json::json!({ "tab_id": e.tab_id }));
+                        }
+                        return false;
+                    }
+                }
                 KeyCode::Char('/') => ov.mode = OverlayMode::Filter,
                 _ => {}
             },
@@ -950,7 +961,7 @@ fn draw_overlay(frame: &mut Frame, area: Rect, ov: &Overlay) {
                 Paragraph::new(lines).block(
                     Block::bordered()
                         .title(title_top)
-                        .title_bottom(" r rename  d delete  / filter  esc "),
+                        .title_bottom(" r rename  d delete  g goto  / filter  esc "),
                 ),
                 rect,
             );
@@ -1329,5 +1340,26 @@ mod tests {
             let row = format_row(m, s, name, right, w);
             assert!(dwidth(&row) <= w, "row {row:?} = {} cols, want <= {w}", dwidth(&row));
         }
+    }
+
+    #[test]
+    fn g_on_live_row_closes_overlay() {
+        let mut a = app("body");
+        a.overlay = Some(Overlay::from_entries(vec![entry_with_tab("Live Tab", state::TabStatus::Live, "w1:t1")]));
+        a.on_key(key(KeyCode::Char('g')));
+        assert!(a.overlay.is_none(), "g on a live row closes the overlay");
+    }
+
+    #[test]
+    fn g_on_closed_or_global_row_is_a_noop() {
+        let mut a = app("body");
+        a.overlay = Some(Overlay::from_entries(vec![entry_with_tab("Closed Tab", state::TabStatus::Closed, "w1:t2")]));
+        a.on_key(key(KeyCode::Char('g')));
+        assert!(a.overlay.is_some(), "g on a closed row is a no-op, overlay stays open");
+
+        let mut b = app("body");
+        b.overlay = Some(Overlay::from_entries(vec![global_row("★ Global note")]));
+        b.on_key(key(KeyCode::Char('g')));
+        assert!(b.overlay.is_some(), "g on the global row is a no-op, overlay stays open");
     }
 }
