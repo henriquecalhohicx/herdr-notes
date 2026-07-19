@@ -304,6 +304,32 @@ pub fn is_blank(note: &Note) -> bool {
     note.text.trim().is_empty() && note.title.trim().is_empty()
 }
 
+/// Whether the tab that owns a note is still open.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[allow(dead_code)] // consumed by the notes overlay (later task)
+pub enum TabStatus {
+    Live,
+    Closed,
+    Unknown,
+}
+
+/// Classify a note's owner tab against the set of live tab ids. `None` (socket
+/// unreachable) or an empty owner id is Unknown; otherwise Live iff present.
+#[allow(dead_code)] // consumed by the notes overlay (later task)
+pub fn classify_tab(tab_id: &str, live: Option<&std::collections::HashSet<String>>) -> TabStatus {
+    match live {
+        None => TabStatus::Unknown,
+        Some(_) if tab_id.is_empty() => TabStatus::Unknown,
+        Some(set) => {
+            if set.contains(tab_id) {
+                TabStatus::Live
+            } else {
+                TabStatus::Closed
+            }
+        }
+    }
+}
+
 /// Human age from a "seconds ago" delta: just now / Nm / Nh / Nd / Nw.
 #[allow(dead_code)] // consumed by the notes overlay (later task)
 pub fn format_age(secs_ago: u64) -> String {
@@ -584,6 +610,16 @@ mod tests {
         persist_at(&path, &Note::default(), "w1:t2", 2);
         assert!(!path.exists(), "blank note deletes its file");
         let _ = std::fs::remove_dir_all(dir.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn classify_tab_maps_live_closed_unknown() {
+        use std::collections::HashSet;
+        let live: HashSet<String> = ["w1:t1".to_string()].into_iter().collect();
+        assert_eq!(classify_tab("w1:t1", Some(&live)), TabStatus::Live);
+        assert_eq!(classify_tab("w1:t9", Some(&live)), TabStatus::Closed);
+        assert_eq!(classify_tab("", Some(&live)), TabStatus::Unknown, "no owner id");
+        assert_eq!(classify_tab("w1:t1", None), TabStatus::Unknown, "socket unavailable");
     }
 
     #[test]

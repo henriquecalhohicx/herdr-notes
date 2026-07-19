@@ -28,6 +28,23 @@ const HEARTBEAT_EVERY: Duration = Duration::from_secs(5);
 /// Shown in preview when the note is empty; doubles as the quick-start help.
 const EMPTY_HELP: &str = "(empty note)\n\n  e or Enter        start writing\n  Esc               back to preview (saves)\n  Up/Dn PgUp/PgDn   scroll, g/G top/bottom\n  x                 clear the note (asks first)\n  q                 quit\n\nEverything autosaves and survives restarts.";
 
+/// Distinct tab ids of all live panes (one `pane.list` round-trip). None when
+/// the socket is unavailable (running the binary by hand outside herdr).
+#[allow(dead_code)] // used by the overlay in a later task
+fn live_tab_ids() -> Option<std::collections::HashSet<String>> {
+    let resp = crate::ipc::call_text("pane.list", serde_json::json!({})).ok()?;
+    let value: serde_json::Value =
+        serde_json::from_str(resp.trim_start_matches('\u{feff}')).ok()?;
+    let panes = value.get("result")?.get("panes")?.as_array()?;
+    let mut set = std::collections::HashSet::new();
+    for pane in panes {
+        if let Some(tab) = pane.get("tab_id").and_then(|t| t.as_str()) {
+            set.insert(tab.to_string());
+        }
+    }
+    Some(set)
+}
+
 pub struct App {
     note: Note,
     /// The note split into lines while editing.
