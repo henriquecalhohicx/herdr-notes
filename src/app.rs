@@ -321,7 +321,9 @@ impl App {
                 KeyCode::Enter => {
                     let title = buf.trim().to_string();
                     if let Some(e) = ov.entries.get_mut(ov.selected) {
-                        state::set_title(&e.file, &title);
+                        if self.persist {
+                            state::set_title(&e.file, &title);
+                        }
                         e.title = title.clone();
                         if e.is_self {
                             self.note.title = title;
@@ -339,7 +341,9 @@ impl App {
             OverlayMode::ConfirmDelete => {
                 if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
                     if let Some(e) = ov.entries.get(ov.selected) {
-                        let _ = std::fs::remove_file(&e.file);
+                        if self.persist {
+                            let _ = std::fs::remove_file(&e.file);
+                        }
                         if e.is_self {
                             self.note.text.clear();
                             self.note.title.clear();
