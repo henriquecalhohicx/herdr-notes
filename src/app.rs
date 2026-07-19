@@ -517,17 +517,17 @@ impl App {
                 Style::default().add_modifier(Modifier::DIM),
             ));
         } else {
-            if !self.note.title.trim().is_empty() {
-                title.push(Span::styled(
-                    format!(" {}", self.note.title),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ));
-                title.push(Span::raw(" —"));
-            }
             title.push(Span::styled(
                 format!(" [{mode}]"),
                 Style::default().fg(Color::Cyan),
             ));
+            if !self.note.title.trim().is_empty() {
+                title.push(Span::raw(" —"));
+                title.push(Span::styled(
+                    format!(" {}", self.note.title),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ));
+            }
             if let Some(hint) = scroll_hint {
                 title.push(Span::styled(
                     format!("  {hint}"),
@@ -657,8 +657,16 @@ fn draw_overlay(frame: &mut Frame, area: Rect, ov: &Overlay) {
     // exceed the area and underflow the saturating_sub centering math (a
     // panic on `.saturating_sub` never happens, but plain subtraction would).
     let w = area.width.saturating_sub(4).clamp(20, 60).min(area.width);
-    let content_h = u16::try_from(ov.entries.len() + 2).unwrap_or(u16::MAX);
-    let h = area.height.saturating_sub(2).min(content_h).max(3).min(area.height);
+    // Preview wants a tall box to read the note; the list sizes to its rows;
+    // the one-line rename/confirm prompts stay short.
+    let h = match &ov.mode {
+        OverlayMode::Preview { .. } => area.height.saturating_sub(2).max(3).min(area.height),
+        OverlayMode::List => {
+            let content_h = u16::try_from(ov.entries.len() + 2).unwrap_or(u16::MAX);
+            area.height.saturating_sub(2).min(content_h).max(3).min(area.height)
+        }
+        OverlayMode::Rename(_) | OverlayMode::ConfirmDelete => 3.min(area.height).max(1),
+    };
     let rect = Rect {
         x: area.x + area.width.saturating_sub(w) / 2,
         y: area.y + area.height.saturating_sub(h) / 2,
@@ -723,8 +731,11 @@ fn draw_overlay(frame: &mut Frame, area: Rect, ov: &Overlay) {
                 lines.push(Line::from("(no notes)"));
             }
             frame.render_widget(
-                Paragraph::new(lines)
-                    .block(Block::bordered().title(" All notes   ↑↓ move  enter preview  r rename  d delete  esc ")),
+                Paragraph::new(lines).block(
+                    Block::bordered()
+                        .title(" All notes   ↑↓ move  enter preview ")
+                        .title_bottom(" r rename  d delete  esc "),
+                ),
                 rect,
             );
         }
