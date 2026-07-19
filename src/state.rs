@@ -371,7 +371,6 @@ pub fn classify_tab(tab_id: &str, live: Option<&std::collections::HashSet<String
 /// Sort bucket for the overlay: LIVE first, everything else (closed/unknown)
 /// after. Combine with `Reverse(updated)` for "live first, then newest
 /// within each bucket".
-#[allow(dead_code)]
 pub fn sort_rank(status: TabStatus) -> u8 {
     match status {
         TabStatus::Live => 0,

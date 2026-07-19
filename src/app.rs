@@ -44,7 +44,7 @@ struct OverlayEntry {
     is_global: bool,
     /// Precomputed row context string ("workspace · agent" / "closed" / "?" /
     /// "global") — see `state::format_context`. Matched against by the filter
-    /// (`recompute_visible`); not yet rendered in the row itself (Task 6).
+    /// (`recompute_visible`) and rendered in the row's right-hand column.
     context: String,
 }
 
@@ -433,6 +433,7 @@ impl App {
                 }
             })
             .collect();
+        entries.sort_by_key(|e| (state::sort_rank(e.status), std::cmp::Reverse(e.updated)));
         if let Some(path) = global {
             let note = state::read_note(&path);
             let label = if self.active == ActiveNote::Global {
@@ -912,26 +913,28 @@ fn draw_overlay(frame: &mut Frame, area: Rect, ov: &Overlay) {
         OverlayMode::List | OverlayMode::Filter => {
             let now = state::unix_now();
             let mut lines: Vec<Line> = Vec::new();
+            let inner_width = usize::from(rect.width).saturating_sub(2);
             for (i, &idx) in ov.visible.iter().enumerate() {
                 let e = &ov.entries[idx];
                 let marker = if i == ov.selected { ">" } else { " " };
-                let name = if e.title.trim().is_empty() { "(untitled)".to_string() } else { e.title.clone() };
-                let age = if e.updated == 0 { "—".to_string() } else { state::format_age(now.saturating_sub(e.updated)) };
-                let status = match e.status {
-                    state::TabStatus::Live => "live",
-                    state::TabStatus::Closed => "closed",
-                    state::TabStatus::Unknown => "?",
-                };
                 let self_mark = if e.is_self { "*" } else { " " };
-                let style = if i == ov.selected {
-                    Style::default().add_modifier(Modifier::REVERSED)
+                let name = if e.title.trim().is_empty() { "(untitled)" } else { &e.title };
+                let age = if e.updated == 0 { "—".to_string() } else { state::format_age(now.saturating_sub(e.updated)) };
+                let right = format!("{}  {age}", e.context);
+                let text = format_row(marker, self_mark, name, &right, inner_width);
+                let base = if e.is_global {
+                    Color::Cyan
                 } else {
-                    Style::default()
+                    match e.status {
+                        state::TabStatus::Live => Color::Green,
+                        state::TabStatus::Closed | state::TabStatus::Unknown => Color::DarkGray,
+                    }
                 };
-                lines.push(Line::styled(
-                    format!("{marker}{self_mark}{name:<28.28} {age:>7}  {status}"),
-                    style,
-                ));
+                let mut style = Style::default().fg(base);
+                if i == ov.selected {
+                    style = style.add_modifier(Modifier::REVERSED);
+                }
+                lines.push(Line::styled(text, style));
             }
             if lines.is_empty() {
                 lines.push(Line::from("(no notes)"));
@@ -961,6 +964,48 @@ fn clen(s: &str) -> usize {
 
 fn byte_idx(s: &str, char_idx: usize) -> usize {
     s.char_indices().nth(char_idx).map_or(s.len(), |(b, _)| b)
+}
+
+/// Display-column width of a string (unicode-width, not char count — CJK and
+/// emoji are double-width).
+fn dwidth(s: &str) -> usize {
+    s.chars().map(|c| c.width().unwrap_or(0)).sum()
+}
+
+/// Truncates `s` to at most `max` display columns without splitting a wide
+/// char in half.
+fn truncate_w(s: &str, max: usize) -> String {
+    let mut out = String::new();
+    let mut w = 0;
+    for c in s.chars() {
+        let cw = c.width().unwrap_or(0);
+        if w + cw > max {
+            break;
+        }
+        out.push(c);
+        w += cw;
+    }
+    out
+}
+
+/// One overlay row, padded to exactly `inner_width` display columns: a
+/// 1-space margin on each side, `{marker}{self_mark}{name}` on the left (name
+/// truncated to fit), `right` (context + age) pinned to the right edge, the
+/// gap between padded with spaces. Degrades (may slightly exceed
+/// `inner_width`) only in pathologically narrow panes — never panics.
+fn format_row(marker: &str, self_mark: &str, name: &str, right: &str, inner_width: usize) -> String {
+    let budget = inner_width.saturating_sub(2);
+    let right_w = dwidth(right).min(budget);
+    let right = truncate_w(right, right_w);
+    let right_w = dwidth(&right);
+    let gap_min = usize::from(right_w > 0);
+    let prefix_w = dwidth(marker) + dwidth(self_mark);
+    let name_budget = budget.saturating_sub(prefix_w + right_w + gap_min);
+    let name = truncate_w(name, name_budget);
+    let left = format!("{marker}{self_mark}{name}");
+    let left_w = dwidth(&left);
+    let gap = budget.saturating_sub(left_w + right_w).max(gap_min);
+    format!(" {left}{}{right} ", " ".repeat(gap))
 }
 
 #[cfg(test)]
@@ -1255,5 +1300,19 @@ mod tests {
         a.on_key(key(KeyCode::Char('/')));
         a.on_key(key(KeyCode::Char('z'))); // matches nothing
         assert_eq!(a.overlay.as_ref().unwrap().visible, vec![0], "global row stays pinned even with 0 matches");
+    }
+
+    #[test]
+    fn format_row_pads_to_exact_inner_width() {
+        let row = format_row(">", "*", "My Note", "spec-droid · claude  2h", 40);
+        assert_eq!(dwidth(&row), 40);
+        assert!(row.starts_with(" >*My Note"));
+        assert!(row.trim_end().ends_with("2h"));
+    }
+
+    #[test]
+    fn format_row_truncates_wide_char_names_by_display_width() {
+        let row = format_row(" ", " ", "文文文文文文文文文文文文文文文文文文文文", "closed  5d", 30);
+        assert_eq!(dwidth(&row), 30, "CJK double-width chars must not overflow the row");
     }
 }
