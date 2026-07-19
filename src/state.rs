@@ -217,6 +217,7 @@ pub(crate) fn read_note(path: &Path) -> Note {
 
 /// The directory holding per-note files for THIS process, or None outside herdr
 /// with no config dir. Mirrors `state_path` but yields the containing dir.
+#[allow(dead_code)] // consumed by the notes overlay (later task)
 pub fn store_dir() -> Option<PathBuf> {
     Some(match store_base()? {
         StoreBase::PluginState(dir) => dir,
@@ -226,6 +227,7 @@ pub fn store_dir() -> Option<PathBuf> {
 
 /// One row of the notes list.
 #[derive(Clone, PartialEq, Eq, Debug)]
+#[allow(dead_code)] // consumed by the notes overlay (later task)
 pub struct NoteSummary {
     pub file: PathBuf,
     pub tab_id: String,
@@ -237,6 +239,7 @@ pub struct NoteSummary {
 
 /// All notes in `dir`, newest `updated` first. Skips non-`.json` files (so the
 /// `.json.tmp` write-temp is ignored). Never panics on a garbled file.
+#[allow(dead_code)] // consumed by the notes overlay (later task)
 pub fn list_notes(dir: &Path) -> Vec<NoteSummary> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else { return out };
@@ -256,7 +259,7 @@ pub fn list_notes(dir: &Path) -> Vec<NoteSummary> {
             preview,
         });
     }
-    out.sort_by(|a, b| b.updated.cmp(&a.updated));
+    out.sort_by_key(|s| std::cmp::Reverse(s.updated));
     out
 }
 
