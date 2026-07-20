@@ -117,9 +117,22 @@ fn tab_contexts() -> Option<TabIndex> {
     let tabs = fetch_array("tab.list", "tabs")?;
     let workspaces = fetch_array("workspace.list", "workspaces")?;
     let panes = fetch_array("pane.list", "panes")?;
+    Some(build_tab_index(&tabs, &workspaces, &panes))
+}
 
+/// Pure builder over the three already-fetched socket arrays — no I/O, so it
+/// is unit-tested against captured live responses. Field names verified live
+/// on herdr 0.7.4: tabs carry `tab_id`+`workspace_id`, workspaces carry
+/// `workspace_id`+`label`, panes carry `tab_id` and (only once an agent is
+/// reported) `agent`. Any missing/mistyped field on an item just skips that
+/// item — never panics.
+fn build_tab_index(
+    tabs: &[serde_json::Value],
+    workspaces: &[serde_json::Value],
+    panes: &[serde_json::Value],
+) -> TabIndex {
     let mut ws_label: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    for w in &workspaces {
+    for w in workspaces {
         let (Some(id), Some(label)) = (
             w.get("workspace_id").and_then(|v| v.as_str()),
             w.get("label").and_then(|v| v.as_str()),
@@ -130,7 +143,7 @@ fn tab_contexts() -> Option<TabIndex> {
     }
 
     let mut agent_by_tab: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    for p in &panes {
+    for p in panes {
         let Some(tab_id) = p.get("tab_id").and_then(|v| v.as_str()) else { continue };
         let Some(agent) = p.get("agent").and_then(|v| v.as_str()) else { continue };
         if agent == "usage" {
@@ -141,7 +154,7 @@ fn tab_contexts() -> Option<TabIndex> {
 
     let mut live = std::collections::HashSet::new();
     let mut ctx = std::collections::HashMap::new();
-    for t in &tabs {
+    for t in tabs {
         let Some(tab_id) = t.get("tab_id").and_then(|v| v.as_str()) else { continue };
         live.insert(tab_id.to_string());
         let Some(ws_id) = t.get("workspace_id").and_then(|v| v.as_str()) else { continue };
@@ -151,7 +164,7 @@ fn tab_contexts() -> Option<TabIndex> {
             state::RowContext { workspace, agent: agent_by_tab.get(tab_id).cloned() },
         );
     }
-    Some(TabIndex { live, ctx })
+    TabIndex { live, ctx }
 }
 
 /// One `method` round-trip, returning `result.<key>` as a JSON array — `None`
@@ -1409,5 +1422,153 @@ mod tests {
         a.on_key(key(KeyCode::Char('Z')));
         a.on_key(key(KeyCode::Enter));
         assert_eq!(a.note.title, "Global Title", "global buffer title must not be overwritten by a tab-row rename");
+    }
+
+    #[test]
+    fn recompute_visible_clamps_selection_when_filter_narrows_below_it() {
+        let mut ov = Overlay::from_entries(vec![
+            entry("Alpha", state::TabStatus::Closed),
+            entry("Beta", state::TabStatus::Closed),
+            entry("Alfredo", state::TabStatus::Closed),
+        ]);
+        // Select the last row, then apply a filter that drops it out of view.
+        ov.selected = 2;
+        ov.filter = "al".into(); // matches "Alpha" + "Alfredo" (case-insensitive), not "Beta"
+        ov.recompute_visible();
+        assert_eq!(ov.visible, vec![0, 2], "only the two 'al' rows remain");
+        assert_eq!(ov.selected, 1, "selection clamps to the last surviving visible row");
+        assert_eq!(ov.selected_entry().unwrap().title, "Alfredo");
+        // Widen back to everything: selection stays in range, no panic.
+        ov.filter.clear();
+        ov.recompute_visible();
+        assert_eq!(ov.visible, vec![0, 1, 2]);
+        assert_eq!(ov.selected, 1, "clamp never grows the selection back on its own");
+    }
+
+    #[test]
+    fn build_tab_index_maps_live_workspace_and_agent_from_real_shapes() {
+        // Captured verbatim from herdr 0.7.4 socket responses (the fields the
+        // overlay reads): a live tab in workspace "acme-app" with a reported
+        // claude agent, plus a second live tab with no agent (bare shell — the
+        // `agent` key is simply absent), plus a "usage" pane that must be
+        // ignored, plus a workspace whose label must resolve by id.
+        let tabs: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[
+                {"tab_id":"w1:t1","workspace_id":"w1","label":"1","number":1},
+                {"tab_id":"w1:t2","workspace_id":"w1","label":"2","number":2},
+                {"tab_id":"w2:t1","workspace_id":"w2","label":"1"}
+            ]"#,
+        )
+        .unwrap();
+        let workspaces: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[
+                {"workspace_id":"w1","label":"acme-app","number":1},
+                {"workspace_id":"w2","label":"acme-api"}
+            ]"#,
+        )
+        .unwrap();
+        let panes: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[
+                {"pane_id":"w1:p1","tab_id":"w1:t1","agent":"claude","agent_status":"working"},
+                {"pane_id":"w1:p2","tab_id":"w1:t2","agent_status":"unknown"},
+                {"pane_id":"w2:p1","tab_id":"w2:t1","agent":"usage"}
+            ]"#,
+        )
+        .unwrap();
+
+        let idx = build_tab_index(&tabs, &workspaces, &panes);
+
+        // Every tab in tab.list is live.
+        assert!(idx.live.contains("w1:t1"));
+        assert!(idx.live.contains("w1:t2"));
+        assert!(idx.live.contains("w2:t1"));
+        assert_eq!(idx.live.len(), 3);
+
+        // Live tab with a reported agent -> "workspace · agent".
+        let c1 = idx.ctx.get("w1:t1").unwrap();
+        assert_eq!(c1.workspace, "acme-app");
+        assert_eq!(c1.agent.as_deref(), Some("claude"));
+        assert_eq!(state::format_context(state::TabStatus::Live, Some(c1)), "acme-app · claude");
+
+        // Bare-shell tab (no `agent` field) -> workspace only, agent None.
+        let c2 = idx.ctx.get("w1:t2").unwrap();
+        assert_eq!(c2.workspace, "acme-app");
+        assert_eq!(c2.agent, None);
+        assert_eq!(state::format_context(state::TabStatus::Live, Some(c2)), "acme-app");
+
+        // The "usage" pane's agent is ignored: w2:t1 resolves its workspace but
+        // carries no agent.
+        let c3 = idx.ctx.get("w2:t1").unwrap();
+        assert_eq!(c3.workspace, "acme-api");
+        assert_eq!(c3.agent, None, "the usage agent must not populate context");
+    }
+
+    #[test]
+    fn build_tab_index_never_panics_on_malformed_items() {
+        // Missing fields, wrong types, empty arrays — every bad item is skipped,
+        // never a panic (the socket-best-effort contract).
+        let tabs: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[{"tab_id":123},{"workspace_id":"w1"},{"tab_id":"w1:t1","workspace_id":"wX"}]"#,
+        )
+        .unwrap();
+        let workspaces: Vec<serde_json::Value> =
+            serde_json::from_str(r#"[{"workspace_id":"w1"},{"label":"orphan"}]"#).unwrap();
+        let idx = build_tab_index(&tabs, &workspaces, &[]);
+        // "w1:t1" is live (valid tab_id) but its workspace "wX" has no label,
+        // so it gets no context entry — still no panic.
+        assert!(idx.live.contains("w1:t1"));
+        assert!(idx.ctx.is_empty(), "no resolvable workspace label -> no context, not a crash");
+    }
+
+    #[test]
+    fn toggle_global_round_trips_tab_and_global_notes_on_disk() {
+        // The only test that drives real persistence: point the env-derived
+        // store at a temp dir so toggle_global's save()/load() hit throwaway
+        // files, never the real APPDATA. Serialized because it mutates
+        // process-global env; no other test reads these vars.
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let dir = std::env::temp_dir().join(format!("notes-toggle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let prev_state = std::env::var_os("HERDR_PLUGIN_STATE_DIR");
+        let prev_tab = std::env::var_os("HERDR_TAB_ID");
+        // SAFETY: single-threaded within this serialized test; restored below.
+        unsafe {
+            std::env::set_var("HERDR_PLUGIN_STATE_DIR", &dir);
+            std::env::remove_var("HERDR_TAB_ID"); // no tab id -> shared note.json
+        }
+
+        // persist=true: exercise the real save/load path.
+        let mut a = App::with_note(Note { text: "TAB BODY".into(), ..Default::default() }, true);
+        assert_eq!(a.active, ActiveNote::Tab);
+
+        // Tab -> Global: tab note is saved, the (empty) global note loads.
+        a.toggle_global();
+        assert_eq!(a.active, ActiveNote::Global);
+        assert_eq!(a.note.text, "", "empty global note on first switch");
+        a.note.text = "GLOBAL BODY".into();
+
+        // Global -> Tab: global note is saved, the tab note reloads intact.
+        a.toggle_global();
+        assert_eq!(a.active, ActiveNote::Tab);
+        assert_eq!(a.note.text, "TAB BODY", "tab note survived the round-trip");
+
+        // Both files exist as SEPARATE documents with the right contents.
+        assert_eq!(state::read_note(&dir.join("note.json")).text, "TAB BODY");
+        assert_eq!(state::read_note(&dir.join("global.json")).text, "GLOBAL BODY");
+
+        // Restore env and clean up.
+        unsafe {
+            match prev_state {
+                Some(v) => std::env::set_var("HERDR_PLUGIN_STATE_DIR", v),
+                None => std::env::remove_var("HERDR_PLUGIN_STATE_DIR"),
+            }
+            if let Some(v) = prev_tab {
+                std::env::set_var("HERDR_TAB_ID", v);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
