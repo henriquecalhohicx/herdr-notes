@@ -65,12 +65,21 @@ struct Overlay {
     selected: usize,
     mode: OverlayMode,
     filter: String,
+    /// Row offset of the list viewport, kept so the selected row stays on
+    /// screen when the list is longer than the box (updated each draw).
+    list_scroll: usize,
 }
 
 impl Overlay {
     fn from_entries(entries: Vec<OverlayEntry>) -> Self {
-        let mut ov =
-            Overlay { entries, visible: Vec::new(), selected: 0, mode: OverlayMode::List, filter: String::new() };
+        let mut ov = Overlay {
+            entries,
+            visible: Vec::new(),
+            selected: 0,
+            mode: OverlayMode::List,
+            filter: String::new(),
+            list_scroll: 0,
+        };
         ov.recompute_visible();
         ov
     }
@@ -438,7 +447,6 @@ impl App {
             .into_iter()
             .filter(|s| Some(&s.file) != global.as_ref())
             .map(|s| {
-                let text = state::read_note(&s.file).text;
                 let status = state::classify_tab(&s.tab_id, live);
                 let context = state::format_context(status, index.as_ref().and_then(|i| i.ctx.get(&s.tab_id)));
                 OverlayEntry {
@@ -450,7 +458,7 @@ impl App {
                     file: s.file,
                     title: s.title,
                     updated: s.updated,
-                    text,
+                    text: s.text, // carried by list_notes — no second read
                 }
             })
             .collect();
@@ -788,7 +796,7 @@ impl App {
         if self.confirm_clear {
             draw_confirm(frame, area);
         }
-        if let Some(ov) = &self.overlay {
+        if let Some(ov) = &mut self.overlay {
             draw_overlay(frame, area, ov);
         }
     }
@@ -890,7 +898,7 @@ fn draw_confirm(frame: &mut Frame, area: Rect) {
     );
 }
 
-fn draw_overlay(frame: &mut Frame, area: Rect, ov: &Overlay) {
+fn draw_overlay(frame: &mut Frame, area: Rect, ov: &mut Overlay) {
     // Centering below relies on w <= area.width and h <= area.height — on a
     // very narrow/short pane the clamp(20, 60) / .max(3) floors can otherwise
     // exceed the area and underflow the saturating_sub centering math (a
@@ -912,6 +920,22 @@ fn draw_overlay(frame: &mut Frame, area: Rect, ov: &Overlay) {
         width: w,
         height: h,
     };
+
+    // Pre-render clamps that mutate `ov` (kept out of the read-only render
+    // match below, which borrows `ov` immutably). `inner_rows` is the text
+    // height inside the box's top/bottom borders.
+    let inner_rows = usize::from(rect.height).saturating_sub(2);
+    if matches!(ov.mode, OverlayMode::List | OverlayMode::Filter) {
+        ov.list_scroll = list_window(ov.list_scroll, ov.selected, ov.visible.len(), inner_rows);
+    } else if matches!(ov.mode, OverlayMode::Preview { .. }) {
+        let text_w = usize::from(rect.width).saturating_sub(2).max(1);
+        let total = ov.selected_entry().map_or(0, |e| render_markdown(&e.text, text_w).len());
+        let max = total.saturating_sub(inner_rows);
+        if let OverlayMode::Preview { scroll } = &mut ov.mode {
+            *scroll = (*scroll).min(max);
+        }
+    }
+
     frame.render_widget(Clear, rect);
     match &ov.mode {
         OverlayMode::Preview { scroll } => {
@@ -947,7 +971,10 @@ fn draw_overlay(frame: &mut Frame, area: Rect, ov: &Overlay) {
             let now = state::unix_now();
             let mut lines: Vec<Line> = Vec::new();
             let inner_width = usize::from(rect.width).saturating_sub(2);
-            for (i, &idx) in ov.visible.iter().enumerate() {
+            // Only the viewport window is rendered; `list_scroll` was set above
+            // to keep `selected` on screen. `i` stays the visible-index so the
+            // selection marker/style lines up.
+            for (i, &idx) in ov.visible.iter().enumerate().skip(ov.list_scroll).take(inner_rows) {
                 let e = &ov.entries[idx];
                 let marker = if i == ov.selected { ">" } else { " " };
                 let self_mark = if e.is_self { "*" } else { " " };
@@ -969,7 +996,10 @@ fn draw_overlay(frame: &mut Frame, area: Rect, ov: &Overlay) {
                 }
                 lines.push(Line::styled(text, style));
             }
-            if lines.is_empty() {
+            // Gate on the actual row set, not `lines` — a box too short to hold
+            // any windowed row (inner_rows == 0) leaves `lines` empty without
+            // the list being empty, and must not claim "(no notes)".
+            if ov.visible.is_empty() {
                 lines.push(Line::from("(no notes)"));
             }
             let title_top = if matches!(ov.mode, OverlayMode::Filter) {
@@ -993,6 +1023,24 @@ fn draw_overlay(frame: &mut Frame, area: Rect, ov: &Overlay) {
 
 fn clen(s: &str) -> usize {
     s.chars().count()
+}
+
+/// New viewport offset for a list of `len` rows showing `rows` at once: keeps
+/// `selected` visible while moving the window as little as possible from
+/// `prev`. Returns 0 when everything fits (`len <= rows`) or `rows == 0`.
+/// Never scrolls past the end (no trailing blank rows below the last item).
+fn list_window(prev: usize, selected: usize, len: usize, rows: usize) -> usize {
+    if rows == 0 || len <= rows {
+        return 0;
+    }
+    let max_off = len - rows;
+    let mut off = prev.min(max_off);
+    if selected < off {
+        off = selected;
+    } else if selected >= off + rows {
+        off = selected + 1 - rows;
+    }
+    off.min(max_off)
 }
 
 fn byte_idx(s: &str, char_idx: usize) -> usize {
@@ -1570,5 +1618,23 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_window_keeps_selection_visible_and_never_overshoots() {
+        // Everything fits -> no scroll.
+        assert_eq!(list_window(0, 4, 5, 5), 0);
+        assert_eq!(list_window(0, 0, 3, 10), 0);
+        assert_eq!(list_window(9, 2, 4, 4), 0, "len <= rows resets to 0 even from a stale prev");
+        // rows == 0 (degenerate) -> 0, no panic.
+        assert_eq!(list_window(3, 3, 10, 0), 0);
+        // Selection below the window scrolls it down just enough to show it.
+        assert_eq!(list_window(0, 7, 20, 5), 3, "selected 7 becomes the last of a 5-row window (3..8)");
+        // Selection above the window scrolls up to it.
+        assert_eq!(list_window(10, 4, 20, 5), 4, "selected jumps to the top of the window");
+        // Selection already inside the window: offset unchanged.
+        assert_eq!(list_window(3, 5, 20, 5), 3, "selected 5 is within 3..8, window doesn't move");
+        // Never scrolls past the end: max offset is len - rows.
+        assert_eq!(list_window(100, 19, 20, 5), 15, "clamped to len - rows, no trailing blanks");
     }
 }
