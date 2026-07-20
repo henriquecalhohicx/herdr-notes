@@ -244,15 +244,16 @@ pub fn store_dir() -> Option<PathBuf> {
     })
 }
 
-/// One row of the notes list.
+/// One row of the notes list. Carries the note's full `text` so the overlay
+/// doesn't re-read every file a second time when it opens (`list_notes`
+/// already parsed each one).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct NoteSummary {
     pub file: PathBuf,
     pub tab_id: String,
     pub title: String,
     pub updated: u64,
-    pub nonempty: bool,
-    pub preview: String,
+    pub text: String,
 }
 
 /// All notes in `dir`, newest `updated` first. Skips non-`.json` files (so the
@@ -266,14 +267,12 @@ pub fn list_notes(dir: &Path) -> Vec<NoteSummary> {
             continue;
         }
         let note = read_note(&path);
-        let preview: String = note.text.lines().next().unwrap_or("").trim().chars().take(48).collect();
         out.push(NoteSummary {
             file: path,
             tab_id: note.tab_id,
             title: note.title,
             updated: note.updated,
-            nonempty: !note.text.trim().is_empty(),
-            preview,
+            text: note.text,
         });
     }
     out.sort_by_key(|s| std::cmp::Reverse(s.updated));
@@ -661,10 +660,9 @@ mod tests {
         let notes = list_notes(&dir);
         assert_eq!(notes.len(), 2, "only .json files");
         assert_eq!(notes[0].tab_id, "w1:t2", "newest updated first");
-        assert_eq!(notes[0].preview, "newer");
+        assert_eq!(notes[0].text, "newer");
         assert_eq!(notes[1].title, "Old");
-        assert_eq!(notes[1].preview, "first line");
-        assert!(notes[1].nonempty);
+        assert_eq!(notes[1].text, "first line\nmore", "full text carried, not just a preview");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
