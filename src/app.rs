@@ -32,41 +32,144 @@ const EMPTY_HELP: &str = "(empty note)\n\n  e or Enter        start writing\n  E
 struct OverlayEntry {
     file: std::path::PathBuf,
     title: String,
+    /// Owning tab id ("" for the pinned global row) — used by go-to-tab (`g`).
+    tab_id: String,
     updated: u64,
     status: state::TabStatus,
     text: String,
     is_self: bool,
+    /// The pinned `★ Global` row: switches the pane's active note on `enter`
+    /// instead of previewing; immune to rename/delete/go-to-tab/filter.
+    is_global: bool,
+    /// Precomputed row context string ("workspace · agent" / "closed" / "?" /
+    /// "global") — see `state::format_context`. Matched against by the filter
+    /// (`recompute_visible`) and rendered in the row's right-hand column.
+    context: String,
 }
 
 /// Sub-mode of the open list overlay.
 enum OverlayMode {
     List,
+    Filter,
     Preview { scroll: usize },
     Rename(String),
     ConfirmDelete,
 }
 
 /// The list overlay: all notes on disk, browsable/manageable over the note.
+/// `selected` indexes into `visible`, not `entries` directly, so the filter
+/// can narrow which rows are shown without disturbing `entries`.
 struct Overlay {
     entries: Vec<OverlayEntry>,
+    visible: Vec<usize>,
     selected: usize,
     mode: OverlayMode,
+    filter: String,
 }
 
-/// Distinct tab ids of all live panes (one `pane.list` round-trip). None when
-/// the socket is unavailable (running the binary by hand outside herdr).
-fn live_tab_ids() -> Option<std::collections::HashSet<String>> {
-    let resp = crate::ipc::call_text("pane.list", serde_json::json!({})).ok()?;
-    let value: serde_json::Value =
-        serde_json::from_str(resp.trim_start_matches('\u{feff}')).ok()?;
-    let panes = value.get("result")?.get("panes")?.as_array()?;
-    let mut set = std::collections::HashSet::new();
-    for pane in panes {
-        if let Some(tab) = pane.get("tab_id").and_then(|t| t.as_str()) {
-            set.insert(tab.to_string());
-        }
+impl Overlay {
+    fn from_entries(entries: Vec<OverlayEntry>) -> Self {
+        let mut ov =
+            Overlay { entries, visible: Vec::new(), selected: 0, mode: OverlayMode::List, filter: String::new() };
+        ov.recompute_visible();
+        ov
     }
-    Some(set)
+
+    /// Recomputes which entries are shown for the current filter (empty =
+    /// all). The pinned global row (if present) is always first and always
+    /// visible — a fixed anchor, not a searchable note. Clamps `selected`.
+    fn recompute_visible(&mut self) {
+        let global_idx = self.entries.iter().position(|e| e.is_global);
+        let rows: Vec<state::FilterRow> = self
+            .entries
+            .iter()
+            .map(|e| state::FilterRow { title: &e.title, context: &e.context })
+            .collect();
+        let mut visible = state::filter_rows(&rows, &self.filter);
+        if let Some(gi) = global_idx {
+            visible.retain(|&i| i != gi);
+            visible.insert(0, gi);
+        }
+        self.visible = visible;
+        self.selected = self.selected.min(self.visible.len().saturating_sub(1));
+    }
+
+    fn selected_entry(&self) -> Option<&OverlayEntry> {
+        self.visible.get(self.selected).map(|&i| &self.entries[i])
+    }
+
+    fn selected_entry_mut(&mut self) -> Option<(usize, &mut OverlayEntry)> {
+        let idx = *self.visible.get(self.selected)?;
+        Some((idx, &mut self.entries[idx]))
+    }
+}
+
+/// Live tabs plus their session context (workspace + agent), built from one
+/// `tab.list` + `workspace.list` + `pane.list` round-trip when the overlay
+/// opens. `None` when any call/parse fails (socket unreachable, or running
+/// outside herdr) — every row then falls back to Unknown.
+struct TabIndex {
+    live: std::collections::HashSet<String>,
+    ctx: std::collections::HashMap<String, state::RowContext>,
+}
+
+fn tab_contexts() -> Option<TabIndex> {
+    let tabs = fetch_array("tab.list", "tabs")?;
+    let workspaces = fetch_array("workspace.list", "workspaces")?;
+    let panes = fetch_array("pane.list", "panes")?;
+
+    let mut ws_label: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for w in &workspaces {
+        let (Some(id), Some(label)) = (
+            w.get("workspace_id").and_then(|v| v.as_str()),
+            w.get("label").and_then(|v| v.as_str()),
+        ) else {
+            continue;
+        };
+        ws_label.insert(id.to_string(), label.to_string());
+    }
+
+    let mut agent_by_tab: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for p in &panes {
+        let Some(tab_id) = p.get("tab_id").and_then(|v| v.as_str()) else { continue };
+        let Some(agent) = p.get("agent").and_then(|v| v.as_str()) else { continue };
+        if agent == "usage" {
+            continue;
+        }
+        agent_by_tab.entry(tab_id.to_string()).or_insert_with(|| agent.to_string());
+    }
+
+    let mut live = std::collections::HashSet::new();
+    let mut ctx = std::collections::HashMap::new();
+    for t in &tabs {
+        let Some(tab_id) = t.get("tab_id").and_then(|v| v.as_str()) else { continue };
+        live.insert(tab_id.to_string());
+        let Some(ws_id) = t.get("workspace_id").and_then(|v| v.as_str()) else { continue };
+        let Some(workspace) = ws_label.get(ws_id).cloned() else { continue };
+        ctx.insert(
+            tab_id.to_string(),
+            state::RowContext { workspace, agent: agent_by_tab.get(tab_id).cloned() },
+        );
+    }
+    Some(TabIndex { live, ctx })
+}
+
+/// One `method` round-trip, returning `result.<key>` as a JSON array — `None`
+/// on any socket/parse failure (best-effort, never panics; the overlay just
+/// shows Unknown context for every row when this fails).
+fn fetch_array(method: &str, key: &str) -> Option<Vec<serde_json::Value>> {
+    let resp = crate::ipc::call_text(method, serde_json::json!({})).ok()?;
+    let value: serde_json::Value = serde_json::from_str(resp.trim_start_matches('\u{feff}')).ok()?;
+    value.get("result")?.get(key)?.as_array().cloned()
+}
+
+/// Which note THIS pane currently shows — its own tab note, or the shared
+/// cross-session global note. Toggled by the overlay's pinned `★ Global` row.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum ActiveNote {
+    #[default]
+    Tab,
+    Global,
 }
 
 pub struct App {
@@ -90,6 +193,8 @@ pub struct App {
     title_input: Option<String>,
     /// Some while the `l` list overlay is open.
     overlay: Option<Overlay>,
+    /// Which note this pane is currently showing.
+    active: ActiveNote,
 }
 
 impl App {
@@ -117,6 +222,7 @@ impl App {
             persist,
             title_input: None,
             overlay: None,
+            active: ActiveNote::default(),
         };
         if app.note.mode == Mode::Edit {
             app.enter_edit();
@@ -126,10 +232,59 @@ impl App {
 
     // ----- persistence & heartbeat -------------------------------------
 
-    fn save(&self) {
-        if self.persist {
-            state::save(&self.note);
+    /// The file THIS pane currently saves/loads from, given `self.active`.
+    /// Pure path resolution (env-derived, no I/O) — safe to call in tests.
+    fn current_path(&self) -> Option<std::path::PathBuf> {
+        match self.active {
+            ActiveNote::Tab => state::state_path(),
+            ActiveNote::Global => state::global_path(),
         }
+    }
+
+    /// True when `self.note` is the pane's own tab note (not the shared
+    /// global note) — so an `is_self` overlay row corresponds to the buffer
+    /// currently in memory. Guards the self-mutation on delete/rename: acting
+    /// on your own tab-note row while viewing the global note must NOT touch
+    /// the global buffer (that path silently deleted global.json).
+    fn showing_tab_note(&self) -> bool {
+        self.active == ActiveNote::Tab
+    }
+
+    fn save(&self) {
+        if !self.persist {
+            return;
+        }
+        let Some(path) = self.current_path() else { return };
+        let tab_id = match self.active {
+            ActiveNote::Tab => state::tab_env().unwrap_or_default(),
+            ActiveNote::Global => String::new(),
+        };
+        state::persist_at(&path, &self.note, &tab_id, state::unix_now());
+    }
+
+    /// Commit + save the current note, then swap the pane to the other one
+    /// (tab <-> global). Called by the overlay's pinned `★ Global` row.
+    /// The reload is gated on `persist` so unit tests (persist=false) never
+    /// touch the real note files — they can still assert the `active` flip
+    /// and the resolved path via `current_path`.
+    fn toggle_global(&mut self) {
+        self.commit();
+        self.save();
+        self.active = match self.active {
+            ActiveNote::Tab => ActiveNote::Global,
+            ActiveNote::Global => ActiveNote::Tab,
+        };
+        if self.persist {
+            self.note = match self.active {
+                ActiveNote::Tab => state::load(),
+                ActiveNote::Global => state::global_path()
+                    .map(|p| state::read_note(&p))
+                    .unwrap_or_default(),
+            };
+        }
+        self.note.mode = Mode::Preview;
+        self.preview_scroll = 0;
+        self.dirty = false;
     }
 
     /// Copy the edit buffer back into the note.
@@ -262,15 +417,23 @@ impl App {
 
     fn open_overlay(&mut self) {
         let Some(dir) = state::store_dir() else { return };
-        let live = live_tab_ids();
+        let index = tab_contexts();
+        let live = index.as_ref().map(|i| &i.live);
         let self_tab = state::tab_env().unwrap_or_default();
-        let entries = state::list_notes(&dir)
+        let global = state::global_path();
+        let mut entries: Vec<OverlayEntry> = state::list_notes(&dir)
             .into_iter()
+            .filter(|s| Some(&s.file) != global.as_ref())
             .map(|s| {
                 let text = state::read_note(&s.file).text;
+                let status = state::classify_tab(&s.tab_id, live);
+                let context = state::format_context(status, index.as_ref().and_then(|i| i.ctx.get(&s.tab_id)));
                 OverlayEntry {
-                    status: state::classify_tab(&s.tab_id, live.as_ref()),
+                    status,
                     is_self: !self_tab.is_empty() && s.tab_id == self_tab,
+                    is_global: false,
+                    context,
+                    tab_id: s.tab_id,
                     file: s.file,
                     title: s.title,
                     updated: s.updated,
@@ -278,7 +441,27 @@ impl App {
                 }
             })
             .collect();
-        self.overlay = Some(Overlay { entries, selected: 0, mode: OverlayMode::List });
+        entries.sort_by_key(|e| (state::sort_rank(e.status), std::cmp::Reverse(e.updated)));
+        if let Some(path) = global {
+            let note = state::read_note(&path);
+            let label = if self.active == ActiveNote::Global {
+                "◂ Back to this tab's note".to_string()
+            } else {
+                "★ Global note".to_string()
+            };
+            entries.insert(0, OverlayEntry {
+                file: path,
+                title: label,
+                tab_id: String::new(),
+                updated: note.updated,
+                status: state::TabStatus::Unknown,
+                text: note.text,
+                is_self: false,
+                is_global: true,
+                context: "global".to_string(),
+            });
+        }
+        self.overlay = Some(Overlay::from_entries(entries));
     }
 
     fn on_key_overlay(&mut self, key: KeyEvent) {
@@ -290,24 +473,63 @@ impl App {
 
     /// Returns false when the overlay should close.
     fn handle_overlay(&mut self, ov: &mut Overlay, key: KeyEvent) -> bool {
-        let last = ov.entries.len().saturating_sub(1);
+        let last = ov.visible.len().saturating_sub(1);
         match &mut ov.mode {
             OverlayMode::List => match key.code {
                 KeyCode::Esc | KeyCode::Char('l') => return false,
                 KeyCode::Up | KeyCode::Char('k') => ov.selected = ov.selected.saturating_sub(1),
                 KeyCode::Down | KeyCode::Char('j') => ov.selected = (ov.selected + 1).min(last),
                 KeyCode::Enter => {
-                    if !ov.entries.is_empty() {
+                    if ov.selected_entry().is_some_and(|e| e.is_global) {
+                        self.toggle_global();
+                        return false;
+                    }
+                    if !ov.visible.is_empty() {
                         ov.mode = OverlayMode::Preview { scroll: 0 };
                     }
                 }
                 KeyCode::Char('r') => {
-                    if let Some(e) = ov.entries.get(ov.selected) {
+                    if let Some(e) = ov.selected_entry()
+                        && !e.is_global
+                    {
                         ov.mode = OverlayMode::Rename(e.title.clone());
                     }
                 }
-                KeyCode::Char('d') if !ov.entries.is_empty() => {
+                KeyCode::Char('d')
+                    if !ov.visible.is_empty()
+                        && !ov.selected_entry().is_some_and(|e| e.is_global) =>
+                {
                     ov.mode = OverlayMode::ConfirmDelete;
+                }
+                KeyCode::Char('g') => {
+                    if let Some(e) = ov.selected_entry()
+                        && !e.is_global
+                        && e.status == state::TabStatus::Live
+                        && !e.tab_id.is_empty()
+                    {
+                        if self.persist {
+                            let _ = crate::ipc::call_text("tab.focus", serde_json::json!({ "tab_id": e.tab_id }));
+                        }
+                        return false;
+                    }
+                }
+                KeyCode::Char('/') => ov.mode = OverlayMode::Filter,
+                _ => {}
+            },
+            OverlayMode::Filter => match key.code {
+                KeyCode::Enter => ov.mode = OverlayMode::List,
+                KeyCode::Esc => {
+                    ov.filter.clear();
+                    ov.recompute_visible();
+                    ov.mode = OverlayMode::List;
+                }
+                KeyCode::Backspace => {
+                    ov.filter.pop();
+                    ov.recompute_visible();
+                }
+                KeyCode::Char(c) => {
+                    ov.filter.push(c);
+                    ov.recompute_visible();
                 }
                 _ => {}
             },
@@ -320,13 +542,13 @@ impl App {
             OverlayMode::Rename(buf) => match key.code {
                 KeyCode::Enter => {
                     let title = buf.trim().to_string();
-                    if let Some(e) = ov.entries.get_mut(ov.selected) {
+                    if let Some((_, e)) = ov.selected_entry_mut() {
                         if self.persist {
                             state::set_title(&e.file, &title);
                         }
                         e.title = title.clone();
                         e.updated = state::unix_now();
-                        if e.is_self {
+                        if e.is_self && self.showing_tab_note() {
                             self.note.title = title;
                         }
                     }
@@ -341,19 +563,17 @@ impl App {
             },
             OverlayMode::ConfirmDelete => {
                 if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
-                    if let Some(e) = ov.entries.get(ov.selected) {
+                    if let Some((idx, e)) = ov.selected_entry_mut() {
                         if self.persist {
                             let _ = std::fs::remove_file(&e.file);
                         }
-                        if e.is_self {
+                        if e.is_self && self.showing_tab_note() {
                             self.note.text.clear();
                             self.note.title.clear();
                         }
+                        ov.entries.remove(idx);
                     }
-                    if ov.selected <= last && !ov.entries.is_empty() {
-                        ov.entries.remove(ov.selected);
-                    }
-                    ov.selected = ov.selected.min(ov.entries.len().saturating_sub(1));
+                    ov.recompute_visible();
                 }
                 ov.mode = OverlayMode::List;
             }
@@ -521,7 +741,13 @@ impl App {
                 format!(" [{mode}]"),
                 Style::default().fg(Color::Cyan),
             ));
-            if !self.note.title.trim().is_empty() {
+            if self.active == ActiveNote::Global {
+                title.push(Span::raw(" —"));
+                title.push(Span::styled(
+                    " ★ Global",
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ));
+            } else if !self.note.title.trim().is_empty() {
                 title.push(Span::raw(" —"));
                 title.push(Span::styled(
                     format!(" {}", self.note.title),
@@ -661,8 +887,8 @@ fn draw_overlay(frame: &mut Frame, area: Rect, ov: &Overlay) {
     // the one-line rename/confirm prompts stay short.
     let h = match &ov.mode {
         OverlayMode::Preview { .. } => area.height.saturating_sub(2).max(3).min(area.height),
-        OverlayMode::List => {
-            let content_h = u16::try_from(ov.entries.len() + 2).unwrap_or(u16::MAX);
+        OverlayMode::List | OverlayMode::Filter => {
+            let content_h = u16::try_from(ov.visible.len() + 2).unwrap_or(u16::MAX);
             area.height.saturating_sub(2).min(content_h).max(3).min(area.height)
         }
         OverlayMode::Rename(_) | OverlayMode::ConfirmDelete => 3.min(area.height).max(1),
@@ -676,7 +902,7 @@ fn draw_overlay(frame: &mut Frame, area: Rect, ov: &Overlay) {
     frame.render_widget(Clear, rect);
     match &ov.mode {
         OverlayMode::Preview { scroll } => {
-            let text = ov.entries.get(ov.selected).map(|e| e.text.as_str()).unwrap_or("");
+            let text = ov.selected_entry().map(|e| e.text.as_str()).unwrap_or("");
             let text_w = usize::from(rect.width).saturating_sub(2).max(1);
             let rendered = render_markdown(text, text_w);
             let s = u16::try_from(*scroll).unwrap_or(u16::MAX);
@@ -695,7 +921,7 @@ fn draw_overlay(frame: &mut Frame, area: Rect, ov: &Overlay) {
             );
         }
         OverlayMode::ConfirmDelete => {
-            let name = ov.entries.get(ov.selected)
+            let name = ov.selected_entry()
                 .map(|e| if e.title.trim().is_empty() { "(untitled)".to_string() } else { e.title.clone() })
                 .unwrap_or_default();
             frame.render_widget(
@@ -704,37 +930,47 @@ fn draw_overlay(frame: &mut Frame, area: Rect, ov: &Overlay) {
                 rect,
             );
         }
-        OverlayMode::List => {
+        OverlayMode::List | OverlayMode::Filter => {
             let now = state::unix_now();
             let mut lines: Vec<Line> = Vec::new();
-            for (i, e) in ov.entries.iter().enumerate() {
+            let inner_width = usize::from(rect.width).saturating_sub(2);
+            for (i, &idx) in ov.visible.iter().enumerate() {
+                let e = &ov.entries[idx];
                 let marker = if i == ov.selected { ">" } else { " " };
-                let name = if e.title.trim().is_empty() { "(untitled)".to_string() } else { e.title.clone() };
-                let age = if e.updated == 0 { "—".to_string() } else { state::format_age(now.saturating_sub(e.updated)) };
-                let status = match e.status {
-                    state::TabStatus::Live => "live",
-                    state::TabStatus::Closed => "closed",
-                    state::TabStatus::Unknown => "?",
-                };
                 let self_mark = if e.is_self { "*" } else { " " };
-                let style = if i == ov.selected {
-                    Style::default().add_modifier(Modifier::REVERSED)
+                let name = if e.title.trim().is_empty() { "(untitled)" } else { &e.title };
+                let age = if e.updated == 0 { "—".to_string() } else { state::format_age(now.saturating_sub(e.updated)) };
+                let right = format!("{}  {age}", e.context);
+                let text = format_row(marker, self_mark, name, &right, inner_width);
+                let base = if e.is_global {
+                    Color::Cyan
                 } else {
-                    Style::default()
+                    match e.status {
+                        state::TabStatus::Live => Color::Green,
+                        state::TabStatus::Closed | state::TabStatus::Unknown => Color::DarkGray,
+                    }
                 };
-                lines.push(Line::styled(
-                    format!("{marker}{self_mark}{name:<28.28} {age:>7}  {status}"),
-                    style,
-                ));
+                let mut style = Style::default().fg(base);
+                if i == ov.selected {
+                    style = style.add_modifier(Modifier::REVERSED);
+                }
+                lines.push(Line::styled(text, style));
             }
             if lines.is_empty() {
                 lines.push(Line::from("(no notes)"));
             }
+            let title_top = if matches!(ov.mode, OverlayMode::Filter) {
+                format!(" All notes   filter: {}_ ", ov.filter)
+            } else if ov.filter.is_empty() {
+                " All notes   ↑↓ move  enter preview ".to_string()
+            } else {
+                format!(" All notes   filter: {} ", ov.filter)
+            };
             frame.render_widget(
                 Paragraph::new(lines).block(
                     Block::bordered()
-                        .title(" All notes   ↑↓ move  enter preview ")
-                        .title_bottom(" r rename  d delete  esc "),
+                        .title(title_top)
+                        .title_bottom(" r rename  d delete  g goto  / filter  esc "),
                 ),
                 rect,
             );
@@ -748,6 +984,51 @@ fn clen(s: &str) -> usize {
 
 fn byte_idx(s: &str, char_idx: usize) -> usize {
     s.char_indices().nth(char_idx).map_or(s.len(), |(b, _)| b)
+}
+
+/// Display-column width of a string (unicode-width, not char count — CJK and
+/// emoji are double-width).
+fn dwidth(s: &str) -> usize {
+    s.chars().map(|c| c.width().unwrap_or(0)).sum()
+}
+
+/// Truncates `s` to at most `max` display columns without splitting a wide
+/// char in half.
+fn truncate_w(s: &str, max: usize) -> String {
+    let mut out = String::new();
+    let mut w = 0;
+    for c in s.chars() {
+        let cw = c.width().unwrap_or(0);
+        if w + cw > max {
+            break;
+        }
+        out.push(c);
+        w += cw;
+    }
+    out
+}
+
+/// One overlay row, padded to exactly `inner_width` display columns: a
+/// 1-space margin on each side, `{marker}{self_mark}{name}` on the left (name
+/// truncated to fit), `right` (context + age) pinned to the right edge, the
+/// gap between padded with spaces. Fits exactly within `inner_width` for any
+/// input wide enough to hold the margins plus the `marker`+`self_mark`
+/// prefix; can only exceed `inner_width` when `inner_width` is too small to
+/// hold even that (a handful of columns) — never panics.
+fn format_row(marker: &str, self_mark: &str, name: &str, right: &str, inner_width: usize) -> String {
+    let budget = inner_width.saturating_sub(2);
+    let prefix_w = dwidth(marker) + dwidth(self_mark);
+    let gap_min = usize::from(dwidth(right) > 0);
+    // Reserve room for the prefix + minimum gap before the right segment gets
+    // any width, so left + gap + right can never exceed the budget.
+    let right = truncate_w(right, budget.saturating_sub(prefix_w + gap_min));
+    let right_w = dwidth(&right);
+    let name_budget = budget.saturating_sub(prefix_w + right_w + gap_min);
+    let name = truncate_w(name, name_budget);
+    let left = format!("{marker}{self_mark}{name}");
+    let left_w = dwidth(&left);
+    let gap = budget.saturating_sub(left_w + right_w);
+    format!(" {left}{}{right} ", " ".repeat(gap))
 }
 
 #[cfg(test)]
@@ -888,12 +1169,9 @@ mod tests {
     #[test]
     fn overlay_delete_confirm_removes_row() {
         let mut a = app("body");
-        a.overlay = Some(Overlay {
-            entries: vec![OverlayEntry { file: "x.json".into(), title: "X".into(),
-                updated: 0, status: state::TabStatus::Closed, text: "xx".into(), is_self: false }],
-            selected: 0,
-            mode: OverlayMode::List,
-        });
+        a.overlay = Some(Overlay::from_entries(vec![
+            OverlayEntry { is_self: true, ..entry("X", state::TabStatus::Closed) },
+        ]));
         a.on_key(key(KeyCode::Char('d')));
         assert!(matches!(a.overlay.as_ref().unwrap().mode, OverlayMode::ConfirmDelete));
         a.on_key(key(KeyCode::Char('n'))); // decline
@@ -901,37 +1179,35 @@ mod tests {
         a.on_key(key(KeyCode::Char('d')));
         a.on_key(key(KeyCode::Char('y'))); // confirm — file path doesn't exist, remove_file is best-effort
         assert!(a.overlay.as_ref().unwrap().entries.is_empty(), "row removed after confirm");
+        // Normal case (active == Tab, the default): deleting your own tab-note
+        // row still clears the in-memory buffer, same as before the guard.
+        assert_eq!(a.note.text, "", "own tab-note row delete still clears the buffer on the tab-note path");
+        assert_eq!(a.note.title, "", "own tab-note row delete still clears the title on the tab-note path");
     }
 
     #[test]
     fn overlay_rename_enter_updates_row() {
         let mut a = app("body");
-        a.overlay = Some(Overlay {
-            entries: vec![OverlayEntry { file: "x.json".into(), title: String::new(),
-                updated: 0, status: state::TabStatus::Closed, text: "xx".into(), is_self: false }],
-            selected: 0,
-            mode: OverlayMode::List,
-        });
+        a.overlay = Some(Overlay::from_entries(vec![
+            OverlayEntry { is_self: true, ..entry("", state::TabStatus::Closed) },
+        ]));
         a.on_key(key(KeyCode::Char('r')));
         a.on_key(key(KeyCode::Char('Z')));
         a.on_key(key(KeyCode::Enter));
         assert_eq!(a.overlay.as_ref().unwrap().entries[0].title, "Z");
         assert!(matches!(a.overlay.as_ref().unwrap().mode, OverlayMode::List));
+        // Normal case (active == Tab, the default): renaming your own
+        // tab-note row still updates the in-memory buffer, same as before.
+        assert_eq!(a.note.title, "Z", "own tab-note row rename still updates the buffer on the tab-note path");
     }
 
     #[test]
     fn overlay_opens_navigates_and_closes() {
         let mut a = app("body");
-        a.overlay = Some(Overlay {
-            entries: vec![
-                OverlayEntry { file: "a.json".into(), title: "A".into(), updated: 0,
-                    status: state::TabStatus::Live, text: "aa".into(), is_self: true },
-                OverlayEntry { file: "b.json".into(), title: String::new(), updated: 0,
-                    status: state::TabStatus::Closed, text: "bb".into(), is_self: false },
-            ],
-            selected: 0,
-            mode: OverlayMode::List,
-        });
+        a.overlay = Some(Overlay::from_entries(vec![
+            OverlayEntry { is_self: true, ..entry("A", state::TabStatus::Live) },
+            entry("", state::TabStatus::Closed),
+        ]));
         a.on_key(key(KeyCode::Down));
         assert_eq!(a.overlay.as_ref().unwrap().selected, 1);
         a.on_key(key(KeyCode::Down)); // clamps at last
@@ -940,5 +1216,198 @@ mod tests {
         assert_eq!(a.overlay.as_ref().unwrap().selected, 0);
         assert!(!a.on_key(key(KeyCode::Esc)), "Esc closes overlay, never quits");
         assert!(a.overlay.is_none());
+    }
+
+    #[test]
+    fn from_entries_seeds_visible_as_identity_and_clamps_selection() {
+        let ov = Overlay::from_entries(vec![
+            entry("A", state::TabStatus::Live),
+            entry("B", state::TabStatus::Closed),
+        ]);
+        assert_eq!(ov.visible, vec![0, 1]);
+        assert_eq!(ov.selected_entry().unwrap().title, "A");
+    }
+
+    fn entry_with_tab(title: &str, status: state::TabStatus, tab_id: &str) -> OverlayEntry {
+        OverlayEntry {
+            file: format!("{title}.json").into(),
+            title: title.to_string(),
+            tab_id: tab_id.to_string(),
+            updated: 0,
+            status,
+            text: String::new(),
+            is_self: false,
+            is_global: false,
+            context: String::new(),
+        }
+    }
+
+    fn entry(title: &str, status: state::TabStatus) -> OverlayEntry {
+        entry_with_tab(title, status, "")
+    }
+
+    fn global_row(label: &str) -> OverlayEntry {
+        OverlayEntry {
+            file: "global.json".into(),
+            title: label.to_string(),
+            tab_id: String::new(),
+            updated: 0,
+            status: state::TabStatus::Unknown,
+            text: String::new(),
+            is_self: false,
+            is_global: true,
+            context: "global".into(),
+        }
+    }
+
+    #[test]
+    fn global_row_enter_switches_active_and_closes_overlay() {
+        let mut a = app("tab body");
+        assert_eq!(a.active, ActiveNote::Tab);
+        a.overlay = Some(Overlay::from_entries(vec![global_row("★ Global note")]));
+        a.on_key(key(KeyCode::Enter));
+        assert_eq!(a.active, ActiveNote::Global, "enter on the global row switches active");
+        assert!(a.overlay.is_none(), "switching closes the overlay");
+
+        a.overlay = Some(Overlay::from_entries(vec![global_row("◂ Back to this tab's note")]));
+        a.on_key(key(KeyCode::Enter));
+        assert_eq!(a.active, ActiveNote::Tab, "entering it again switches back");
+    }
+
+    #[test]
+    fn current_path_follows_active() {
+        let mut a = app("body");
+        assert_eq!(a.current_path(), state::state_path(), "Tab -> tab path");
+        a.active = ActiveNote::Global;
+        assert_eq!(a.current_path(), state::global_path(), "Global -> global path");
+    }
+
+    #[test]
+    fn global_row_ignores_rename_and_delete() {
+        let mut a = app("body");
+        a.overlay = Some(Overlay::from_entries(vec![global_row("★ Global note")]));
+        a.on_key(key(KeyCode::Char('r')));
+        assert!(matches!(a.overlay.as_ref().unwrap().mode, OverlayMode::List), "r is a no-op on the global row");
+        a.on_key(key(KeyCode::Char('d')));
+        assert!(matches!(a.overlay.as_ref().unwrap().mode, OverlayMode::List), "d is a no-op on the global row");
+    }
+
+    #[test]
+    fn filter_narrows_rows_live_as_you_type() {
+        let mut a = app("body");
+        a.overlay = Some(Overlay::from_entries(vec![
+            entry("Release Notes", state::TabStatus::Closed),
+            entry("Scratch", state::TabStatus::Closed),
+        ]));
+        a.on_key(key(KeyCode::Char('/')));
+        assert!(matches!(a.overlay.as_ref().unwrap().mode, OverlayMode::Filter));
+        a.on_key(key(KeyCode::Char('r')));
+        a.on_key(key(KeyCode::Char('e')));
+        assert_eq!(a.overlay.as_ref().unwrap().visible, vec![0], "narrows to the matching row live");
+        a.on_key(key(KeyCode::Enter));
+        assert!(matches!(a.overlay.as_ref().unwrap().mode, OverlayMode::List), "Enter commits, returns to List");
+        assert_eq!(a.overlay.as_ref().unwrap().visible, vec![0], "filter stays applied");
+    }
+
+    #[test]
+    fn filter_esc_clears_and_restores_all_rows() {
+        let mut a = app("body");
+        a.overlay = Some(Overlay::from_entries(vec![
+            entry("Release Notes", state::TabStatus::Closed),
+            entry("Scratch", state::TabStatus::Closed),
+        ]));
+        a.on_key(key(KeyCode::Char('/')));
+        a.on_key(key(KeyCode::Char('z')));
+        assert!(a.overlay.as_ref().unwrap().visible.is_empty(), "no row matches 'z'");
+        a.on_key(key(KeyCode::Esc));
+        assert!(matches!(a.overlay.as_ref().unwrap().mode, OverlayMode::List));
+        assert_eq!(a.overlay.as_ref().unwrap().visible, vec![0, 1], "Esc clears the filter");
+    }
+
+    #[test]
+    fn filter_never_hides_the_pinned_global_row() {
+        let mut a = app("body");
+        a.overlay = Some(Overlay::from_entries(vec![
+            global_row("★ Global note"),
+            entry("Release Notes", state::TabStatus::Closed),
+        ]));
+        a.on_key(key(KeyCode::Char('/')));
+        a.on_key(key(KeyCode::Char('z'))); // matches nothing
+        assert_eq!(a.overlay.as_ref().unwrap().visible, vec![0], "global row stays pinned even with 0 matches");
+    }
+
+    #[test]
+    fn format_row_pads_to_exact_inner_width() {
+        let row = format_row(">", "*", "My Note", "spec-droid · claude  2h", 40);
+        assert_eq!(dwidth(&row), 40);
+        assert!(row.starts_with(" >*My Note"));
+        assert!(row.trim_end().ends_with("2h"));
+    }
+
+    #[test]
+    fn format_row_truncates_wide_char_names_by_display_width() {
+        let row = format_row(" ", " ", "文文文文文文文文文文文文文文文文文文文文", "closed  5d", 30);
+        assert_eq!(dwidth(&row), 30, "CJK double-width chars must not overflow the row");
+    }
+
+    #[test]
+    fn format_row_never_exceeds_width_when_right_fills_budget() {
+        for (m, s, name, right, w) in [
+            (">", "*", "Note", "workspace-name - claude  2h", 20usize),
+            (">", "*", "X", "abcdefgh", 10),
+            (" ", " ", "anything", "spec-droid · claude  5d", 24),
+        ] {
+            let row = format_row(m, s, name, right, w);
+            assert!(dwidth(&row) <= w, "row {row:?} = {} cols, want <= {w}", dwidth(&row));
+        }
+    }
+
+    #[test]
+    fn g_on_live_row_closes_overlay() {
+        let mut a = app("body");
+        a.overlay = Some(Overlay::from_entries(vec![entry_with_tab("Live Tab", state::TabStatus::Live, "w1:t1")]));
+        a.on_key(key(KeyCode::Char('g')));
+        assert!(a.overlay.is_none(), "g on a live row closes the overlay");
+    }
+
+    #[test]
+    fn g_on_closed_or_global_row_is_a_noop() {
+        let mut a = app("body");
+        a.overlay = Some(Overlay::from_entries(vec![entry_with_tab("Closed Tab", state::TabStatus::Closed, "w1:t2")]));
+        a.on_key(key(KeyCode::Char('g')));
+        assert!(a.overlay.is_some(), "g on a closed row is a no-op, overlay stays open");
+
+        let mut b = app("body");
+        b.overlay = Some(Overlay::from_entries(vec![global_row("★ Global note")]));
+        b.on_key(key(KeyCode::Char('g')));
+        assert!(b.overlay.is_some(), "g on the global row is a no-op, overlay stays open");
+    }
+
+    #[test]
+    fn deleting_own_tab_row_while_on_global_does_not_touch_global_buffer() {
+        let mut a = app("GLOBAL BODY");
+        a.active = ActiveNote::Global; // pane is showing the global note
+        a.note.title = "Global Title".into();
+        let mut e = entry_with_tab("Mine", state::TabStatus::Live, "w1:t1");
+        e.is_self = true; // the row IS this pane's own tab note (by file identity)
+        a.overlay = Some(Overlay::from_entries(vec![e]));
+        a.on_key(key(KeyCode::Char('d')));
+        a.on_key(key(KeyCode::Char('y'))); // confirm delete
+        assert_eq!(a.note.text, "GLOBAL BODY", "global buffer text must survive deleting a tab-note row");
+        assert_eq!(a.note.title, "Global Title", "global buffer title must survive");
+    }
+
+    #[test]
+    fn renaming_own_tab_row_while_on_global_does_not_touch_global_buffer() {
+        let mut a = app("GLOBAL BODY");
+        a.active = ActiveNote::Global;
+        a.note.title = "Global Title".into();
+        let mut e = entry_with_tab("Mine", state::TabStatus::Live, "w1:t1");
+        e.is_self = true;
+        a.overlay = Some(Overlay::from_entries(vec![e]));
+        a.on_key(key(KeyCode::Char('r')));
+        a.on_key(key(KeyCode::Char('Z')));
+        a.on_key(key(KeyCode::Enter));
+        assert_eq!(a.note.title, "Global Title", "global buffer title must not be overwritten by a tab-row rename");
     }
 }

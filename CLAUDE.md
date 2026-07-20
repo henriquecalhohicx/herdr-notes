@@ -19,8 +19,22 @@ findings doc (and the reference implementation, `herdr-sidebar`) lives in
   shows the title), and a notes-list overlay (`l` in preview: navigate with
   Up/Down or j/k, `enter` opens a read-only scrollable preview of the
   selected note, `r` renames it, `d` deletes it with a y/N confirm, `esc`/`l`
-  closes the overlay; each row shows the title (or "(untitled)"), age, and
-  live/closed/`?` status)
+  closes the overlay). v2 turned the overlay into a cross-session dashboard:
+  each row shows session context (`workspace · agent` for live tabs, else a
+  dim `closed`/`?`) instead of a status word, colored (green live / gray
+  closed / cyan global) and sorted live-first-then-newest; `/` filters rows by
+  title/context (case-insensitive, live; Enter keeps, Esc clears); `g` on a
+  live row focuses that tab (`tab.focus`) and closes the overlay; a pinned
+  `★ Global` top row toggles the pane between its tab note and a shared
+  cross-session global note (`ActiveNote::Tab|Global`; save/load routes to
+  `state::global_path()` → `global.json` when Global; header reads
+  `[mode] — ★ Global`; the global row is immune to `r`/`d`/`g` and stays
+  pinned+visible through any filter). Row layout fills the box inner width
+  with balanced 1-space margins, truncating by unicode display width
+  (`format_row`/`dwidth`/`truncate_w`). NOTE: `is_self` self-mutation on
+  delete/rename is gated on `showing_tab_note()` — acting on your own
+  tab-note row while viewing the global note must NOT touch the global buffer
+  (that path silently deleted `global.json`; see Gotchas)
 - `src/markdown.rs` — hand-rolled renderer (headings, lists, checkboxes, quotes,
   code, bold/italic, hr) + display-width wrapping
 - `src/state.rs` — `{text, mode, title, tab_id, created, updated}` JSON (v2 —
@@ -159,6 +173,25 @@ Learned building this plugin:
   not char count — CJK/emoji are double-width and get clipped otherwise.
 - Empty (no text, no title) notes are deleted on save, so toggling Notes into
   a tab and closing without typing leaves no file.
+- v2 gave the pane two possible buffers (`App.note` is the tab note OR the
+  shared global note, per `App.active`). The overlay's `is_self` flag is FILE
+  identity only — it does NOT track which buffer is showing. So any self-clear
+  on an `is_self` row (delete clears text+title, rename sets title) MUST also
+  gate on `showing_tab_note()`; otherwise deleting/renaming your own tab-note
+  row while viewing the global note clobbered the global buffer, and the next
+  autosave (blank-note delete rule) silently removed `global.json`. Caught by
+  the whole-branch review, not per-task review — a two-document buffer added
+  later has to audit every pre-existing single-document assumption.
+- v2 overlay session-context uses `tab.list` (GLOBAL — all tabs: `tab_id`,
+  `workspace_id`), `workspace.list` (`workspace_id`, `label`), `pane.list`
+  (`tab_id`, `agent`; skip `agent == "usage"`, first non-null per tab wins).
+  All three are best-effort: any call/parse/field failure collapses the whole
+  index to `None` → every row reads Unknown, overlay works offline, never
+  panics. Field names VERIFIED live on herdr 0.7.4: `workspaces[]` carry
+  `workspace_id`+`label`, `tabs[]` carry `tab_id`+`workspace_id`, `panes[]`
+  carry `tab_id` and — only once an agent is reported on the pane — `agent`
+  (a bare shell pane has just `agent_status`, so the code's
+  `else continue` on a missing `agent` is the normal path, not an error).
 
 ## README screenshots (Alex's criteria — follow on every reshoot)
 
