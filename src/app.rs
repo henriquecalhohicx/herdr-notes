@@ -818,7 +818,7 @@ impl App {
         let lines = render_markdown(&self.note.text, text_w);
         let total = lines.len();
         let max = total.saturating_sub(usize::from(area.height));
-        self.preview_scroll = self.preview_scroll.min(max);
+        self.preview_scroll = clamp_scroll(self.preview_scroll, total, usize::from(area.height));
         let scroll = u16::try_from(self.preview_scroll).unwrap_or(u16::MAX);
         frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), area);
         draw_scrollbar(frame, area, max, self.preview_scroll);
@@ -930,9 +930,8 @@ fn draw_overlay(frame: &mut Frame, area: Rect, ov: &mut Overlay) {
     } else if matches!(ov.mode, OverlayMode::Preview { .. }) {
         let text_w = usize::from(rect.width).saturating_sub(2).max(1);
         let total = ov.selected_entry().map_or(0, |e| render_markdown(&e.text, text_w).len());
-        let max = total.saturating_sub(inner_rows);
         if let OverlayMode::Preview { scroll } = &mut ov.mode {
-            *scroll = (*scroll).min(max);
+            *scroll = clamp_scroll(*scroll, total, inner_rows);
         }
     }
 
@@ -1025,6 +1024,14 @@ fn clen(s: &str) -> usize {
     s.chars().count()
 }
 
+/// Clamp a scroll offset so it can't run past the last screenful: the deepest
+/// useful offset is `total - viewport` (0 when everything fits). Shared by the
+/// main-note preview and the overlay's per-note preview so neither can scroll
+/// into blank space below the content.
+fn clamp_scroll(scroll: usize, total: usize, viewport: usize) -> usize {
+    scroll.min(total.saturating_sub(viewport))
+}
+
 /// New viewport offset for a list of `len` rows showing `rows` at once: keeps
 /// `selected` visible while moving the window as little as possible from
 /// `prev`. Returns 0 when everything fits (`len <= rows`) or `rows == 0`.
@@ -1096,8 +1103,31 @@ fn format_row(marker: &str, self_mark: &str, name: &str, right: &str, inner_widt
 mod tests {
     use super::*;
 
+    /// Serializes the env-mutating tests (they set process-global HERDR_* vars).
+    /// No non-env test reads these, so this only guards env tests against each
+    /// other.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// Renders `app` once into a fixed-size TestBackend and returns the screen
+    /// as text (row-major, newline per row) for substring assertions.
+    fn rendered(app: &mut App, w: u16, h: u16) -> String {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let buf = term.backend().buffer();
+        let mut out = String::new();
+        for y in 0..h {
+            for x in 0..w {
+                if let Some(cell) = buf.cell((x, y)) {
+                    out.push_str(cell.symbol());
+                }
+            }
+            out.push('\n');
+        }
+        out
     }
 
     fn app(text: &str) -> App {
@@ -1574,7 +1604,6 @@ mod tests {
         // store at a temp dir so toggle_global's save()/load() hit throwaway
         // files, never the real APPDATA. Serialized because it mutates
         // process-global env; no other test reads these vars.
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let dir = std::env::temp_dir().join(format!("notes-toggle-{}", std::process::id()));
@@ -1636,5 +1665,94 @@ mod tests {
         assert_eq!(list_window(3, 5, 20, 5), 3, "selected 5 is within 3..8, window doesn't move");
         // Never scrolls past the end: max offset is len - rows.
         assert_eq!(list_window(100, 19, 20, 5), 15, "clamped to len - rows, no trailing blanks");
+    }
+
+    #[test]
+    fn clamp_scroll_caps_at_last_screenful() {
+        assert_eq!(clamp_scroll(0, 10, 5), 0);
+        assert_eq!(clamp_scroll(3, 10, 5), 3, "within range: unchanged");
+        assert_eq!(clamp_scroll(99, 10, 5), 5, "capped at total - viewport");
+        assert_eq!(clamp_scroll(99, 4, 10), 0, "content fits in the viewport -> top");
+        assert_eq!(clamp_scroll(2, 0, 0), 0, "degenerate empty content, no panic");
+    }
+
+    #[test]
+    fn empty_overlay_renders_no_notes_but_a_short_box_never_lies() {
+        // Genuinely empty list -> "(no notes)".
+        let mut a = app("body");
+        a.overlay = Some(Overlay::from_entries(vec![]));
+        assert!(
+            rendered(&mut a, 40, 12).contains("(no notes)"),
+            "an empty list must say so"
+        );
+
+        // Non-empty list in a box too short to fit any windowed row
+        // (inner_rows == 0 at height 2) must NOT falsely claim "(no notes)".
+        let mut b = app("body");
+        b.overlay = Some(Overlay::from_entries(vec![entry("Real Note", state::TabStatus::Closed)]));
+        assert!(
+            !rendered(&mut b, 40, 2).contains("(no notes)"),
+            "a real note list must never render (no notes), even when the box is too short to show rows"
+        );
+    }
+
+    #[test]
+    fn open_overlay_builds_pinned_global_first_with_text_and_no_second_read() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("notes-openov-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Seed the plugin-state dir directly with three note files + the global.
+        state::persist_at(&dir.join("w1_t1.json"),
+            &Note { text: "alpha body".into(), title: "Alpha".into(), ..Default::default() }, "w1:t1", 100);
+        state::persist_at(&dir.join("w1_t2.json"),
+            &Note { text: "beta body".into(), title: "Beta".into(), ..Default::default() }, "w1:t2", 300);
+        state::persist_at(&dir.join("global.json"),
+            &Note { text: "the shared master note".into(), ..Default::default() }, "", 200);
+
+        let prev_state = std::env::var_os("HERDR_PLUGIN_STATE_DIR");
+        let prev_tab = std::env::var_os("HERDR_TAB_ID");
+        let prev_sock = std::env::var_os("HERDR_SOCKET_PATH");
+        // SAFETY: serialized by ENV_LOCK; restored below. Point the socket at a
+        // bogus path so tab_contexts() can't reach a live herdr (the default
+        // fallback would otherwise hit the user's real session) -> None ->
+        // every row is Unknown, deterministically offline.
+        unsafe {
+            std::env::set_var("HERDR_PLUGIN_STATE_DIR", &dir);
+            std::env::remove_var("HERDR_TAB_ID");
+            std::env::set_var("HERDR_SOCKET_PATH", dir.join("no-such.sock"));
+        }
+
+        let mut a = App::with_note(Note::default(), false);
+        a.open_overlay();
+        let ov = a.overlay.as_ref().expect("overlay opened");
+
+        // Global note is the pinned first row, and the ONLY global row.
+        assert!(ov.entries[0].is_global, "global row pinned first");
+        assert_eq!(ov.entries.iter().filter(|e| e.is_global).count(), 1);
+        // It carries the global file's text (read once) and is excluded from
+        // the plain note rows.
+        assert_eq!(ov.entries[0].text, "the shared master note");
+        let regular: Vec<_> = ov.entries.iter().filter(|e| !e.is_global).collect();
+        assert_eq!(regular.len(), 2, "two tab notes, global not double-counted");
+        assert!(regular.iter().all(|e| !e.text.is_empty()),
+            "each row already carries its text (single read, no re-read in open_overlay)");
+        // Offline (no socket): every regular row is Unknown context.
+        assert!(regular.iter().all(|e| e.status == state::TabStatus::Unknown));
+
+        unsafe {
+            match prev_state {
+                Some(v) => std::env::set_var("HERDR_PLUGIN_STATE_DIR", v),
+                None => std::env::remove_var("HERDR_PLUGIN_STATE_DIR"),
+            }
+            if let Some(v) = prev_tab {
+                std::env::set_var("HERDR_TAB_ID", v);
+            }
+            match prev_sock {
+                Some(v) => std::env::set_var("HERDR_SOCKET_PATH", v),
+                None => std::env::remove_var("HERDR_SOCKET_PATH"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
