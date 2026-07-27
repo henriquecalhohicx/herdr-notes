@@ -191,11 +191,6 @@ fn build_tab_index(
 /// What the prompt block needs to know about a pane. Built from one
 /// `pane.list` call; every field is optional at the source, so a missing one
 /// degrades rather than dropping the pane.
-// Task 3 gives `pane_index`/`build_pane_index`/`meaningful_title`/
-// `pane_label` a production caller, but `cwd` and `tab_id` stay unread even
-// then — Task 5's `maybe_autotitle` is the first to read them. Task 5
-// removes this allow.
-#[allow(dead_code)]
 struct PaneInfo {
     /// "" when herdr has not reported an agent on this pane yet — a bare
     /// shell pane carries only `agent_status`.
@@ -276,6 +271,26 @@ fn pane_label(pane_id: &str, agent: &str, index: Option<&PaneIndex>) -> String {
     }
 }
 
+/// The title chain: the agent pane's terminal title when meaningful, then the
+/// git branch, then the oldest surviving captured prompt. `None` when nothing
+/// has resolved yet — the caller retries on the next heartbeat.
+fn pick_title(
+    agent_pane: Option<&PaneInfo>,
+    branch: Option<&str>,
+    oldest_prompt: Option<&str>,
+) -> Option<String> {
+    if let Some(p) = agent_pane
+        && let Some(t) = p.title.as_deref().and_then(|t| meaningful_title(t, &p.agent))
+    {
+        return Some(t);
+    }
+    // A detached HEAD names nothing.
+    if let Some(b) = branch.map(str::trim).filter(|b| !b.is_empty() && *b != "HEAD") {
+        return Some(b.to_string());
+    }
+    oldest_prompt.map(str::trim).filter(|p| !p.is_empty()).map(|p| p.to_string())
+}
+
 /// One `method` round-trip, returning `result.<key>` as a JSON array — `None`
 /// on any socket/parse failure (best-effort, never panics; the overlay just
 /// shows Unknown context for every row when this fails).
@@ -319,6 +334,10 @@ pub struct App {
     /// Heading per group, index-aligned with `prompts`. Resolved from one
     /// `pane.list` call at refresh time so the draw path stays I/O-free.
     prompt_labels: Vec<String>,
+    /// Cwds where `git rev-parse` has already been tried and failed. Without
+    /// this, a tab that is not a repo would spawn git on every heartbeat for
+    /// the life of the pane.
+    git_tried: std::collections::HashSet<String>,
     confirm_clear: bool,
     dirty: bool,
     last_edit: Instant,
@@ -364,6 +383,7 @@ impl App {
             follow_box: false,
             prompts: Vec::new(),
             prompt_labels: Vec::new(),
+            git_tried: std::collections::HashSet::new(),
             confirm_clear: false,
             dirty: false,
             last_edit: Instant::now(),
@@ -491,6 +511,7 @@ impl App {
         self.last_beat = Instant::now();
         self.report_tokens();
         self.refresh_prompts();
+        self.maybe_autotitle();
     }
 
     fn report_tokens(&self) {
@@ -539,6 +560,72 @@ impl App {
                 pane_label(&g.pane, agent, index.as_ref())
             })
             .collect();
+    }
+
+    /// The oldest captured prompt still on disk, across every group. The ring
+    /// evicts, so this is the oldest SURVIVING prompt, not necessarily the
+    /// first one ever sent.
+    fn oldest_prompt_text(&self) -> Option<String> {
+        self.prompts
+            .iter()
+            .flat_map(|g| g.prompts.iter())
+            .min_by_key(|p| p.ts)
+            .map(|p| p.text.clone())
+    }
+
+    /// `git rev-parse --abbrev-ref HEAD` in `cwd`, at most once per cwd for
+    /// the life of this process. On Windows the child is spawned with
+    /// CREATE_NO_WINDOW so a console never flashes over the TUI.
+    fn git_branch(&mut self, cwd: &str) -> Option<String> {
+        if !self.git_tried.insert(cwd.to_string()) {
+            return None;
+        }
+        let mut cmd = std::process::Command::new("git");
+        cmd.args(["rev-parse", "--abbrev-ref", "HEAD"]).current_dir(cwd);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        let out = cmd.output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let branch = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!branch.is_empty()).then_some(branch)
+    }
+
+    /// Derive a title for an untitled, auto-titled note. Runs on the
+    /// heartbeat; stops for good once a title is set, because `title` is then
+    /// non-empty. `title_auto` stays true — it records that the title was
+    /// derived, not that one is still pending.
+    fn maybe_autotitle(&mut self) {
+        if !self.persist || !self.showing_tab_note() {
+            return;
+        }
+        if !self.note.title_auto || !self.note.title.trim().is_empty() {
+            return;
+        }
+        let Some(tab) = state::tab_env() else { return };
+        let index = pane_index();
+        let agent_pane = index.as_ref().and_then(|i| {
+            i.values().find(|p| p.tab_id == tab && !p.agent.trim().is_empty())
+        });
+        let cwd = agent_pane.and_then(|p| p.cwd.clone());
+        // Cloned so the immutable borrow of `index` ends before `git_branch`
+        // takes `&mut self`.
+        let agent_pane = agent_pane.map(|p| PaneInfo {
+            agent: p.agent.clone(),
+            tab_id: p.tab_id.clone(),
+            title: p.title.clone(),
+            cwd: p.cwd.clone(),
+        });
+        let branch = cwd.and_then(|c| self.git_branch(&c));
+        let oldest = self.oldest_prompt_text();
+        if let Some(title) = pick_title(agent_pane.as_ref(), branch.as_deref(), oldest.as_deref()) {
+            self.note.title = title;
+            self.touch();
+        }
     }
 
     /// `prompts` zipped with their resolved headings, for the renderer. A
@@ -2157,6 +2244,111 @@ mod tests {
         a.on_key(key(KeyCode::Esc));
         assert_eq!(a.note.title, "Mine");
         assert!(!a.note.title_auto);
+    }
+
+    fn info(agent: &str, title: Option<&str>, cwd: Option<&str>) -> PaneInfo {
+        PaneInfo {
+            agent: agent.into(),
+            tab_id: "wD:t2".into(),
+            title: title.map(|s| s.to_string()),
+            cwd: cwd.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn pick_title_prefers_a_meaningful_terminal_title() {
+        let p = info("claude", Some("HM-54271 Importer"), Some("C:\\repo"));
+        assert_eq!(
+            pick_title(Some(&p), Some("some-branch"), Some("a prompt")).as_deref(),
+            Some("HM-54271 Importer")
+        );
+    }
+
+    #[test]
+    fn pick_title_falls_through_to_the_branch_then_the_prompt() {
+        // Generic title -> branch wins.
+        let generic = info("claude", Some("Claude Code"), Some("C:\\repo"));
+        assert_eq!(
+            pick_title(Some(&generic), Some("20260727-team-solutions"), Some("a prompt")).as_deref(),
+            Some("20260727-team-solutions")
+        );
+        // No branch either -> the prompt.
+        assert_eq!(pick_title(Some(&generic), None, Some("a prompt")).as_deref(), Some("a prompt"));
+        // Nothing at all.
+        assert_eq!(pick_title(Some(&generic), None, None), None);
+        // No agent pane in the tab: branch and prompt still work.
+        assert_eq!(pick_title(None, Some("br"), Some("a prompt")).as_deref(), Some("br"));
+        assert_eq!(pick_title(None, None, Some("a prompt")).as_deref(), Some("a prompt"));
+        assert_eq!(pick_title(None, None, None), None);
+    }
+
+    #[test]
+    fn pick_title_rejects_a_detached_head_and_blank_sources() {
+        let generic = info("claude", Some("Claude Code"), Some("C:\\repo"));
+        assert_eq!(
+            pick_title(Some(&generic), Some("HEAD"), Some("a prompt")).as_deref(),
+            Some("a prompt"),
+            "a detached HEAD is not a name"
+        );
+        assert_eq!(pick_title(Some(&generic), Some("   "), Some("a prompt")).as_deref(), Some("a prompt"));
+        assert_eq!(pick_title(Some(&generic), Some("br"), Some("   ")).as_deref(), Some("br"));
+    }
+
+    #[test]
+    fn autotitle_only_runs_while_the_note_is_untitled_and_auto() {
+        let mut a = app("body");
+        a.note.title = "Mine".into();
+        a.note.title_auto = false;
+        a.maybe_autotitle();
+        assert_eq!(a.note.title, "Mine", "a manual title is never touched");
+
+        let mut b = app("body");
+        b.note.title = "Derived".into();
+        b.note.title_auto = true;
+        b.maybe_autotitle();
+        assert_eq!(b.note.title, "Derived", "an already-derived title is set once, not re-derived");
+    }
+
+    #[test]
+    fn autotitle_uses_the_oldest_surviving_prompt() {
+        // The ring holds RING, so the genuinely-first prompt is gone after
+        // enough submissions — the oldest SURVIVING one is what source 3 gives.
+        let mut a = app("body");
+        a.prompts = vec![crate::prompts::PromptGroup {
+            pane: "w1:p5".into(),
+            prompts: vec![
+                crate::prompts::Prompt { ts: 30, pane: "w1:p5".into(), agent: "claude".into(), text: "newest".into() },
+                crate::prompts::Prompt { ts: 10, pane: "w1:p5".into(), agent: "claude".into(), text: "oldest".into() },
+            ],
+        }];
+        assert_eq!(a.oldest_prompt_text().as_deref(), Some("oldest"));
+    }
+
+    #[test]
+    fn oldest_prompt_text_spans_every_group() {
+        let mut a = app("body");
+        a.prompts = vec![
+            crate::prompts::PromptGroup {
+                pane: "w1:p5".into(),
+                prompts: vec![crate::prompts::Prompt { ts: 30, pane: "w1:p5".into(), agent: "claude".into(), text: "p5".into() }],
+            },
+            crate::prompts::PromptGroup {
+                pane: "w1:p6".into(),
+                prompts: vec![crate::prompts::Prompt { ts: 5, pane: "w1:p6".into(), agent: "claude".into(), text: "p6".into() }],
+            },
+        ];
+        assert_eq!(a.oldest_prompt_text().as_deref(), Some("p6"), "oldest across all groups");
+    }
+
+    #[test]
+    fn the_git_branch_is_attempted_at_most_once_per_cwd() {
+        // An unresolvable tab would otherwise spawn git every 5s forever.
+        let mut a = app("body");
+        let cwd = "C:\\definitely\\not\\a\\repo\\anywhere";
+        assert_eq!(a.git_branch(cwd), None);
+        assert!(a.git_tried.contains(cwd), "the failure is remembered");
+        assert_eq!(a.git_branch(cwd), None, "second call is a no-op");
+        assert_eq!(a.git_tried.len(), 1);
     }
 
     #[test]
