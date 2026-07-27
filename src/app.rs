@@ -213,10 +213,6 @@ const GENERIC_TITLES: [&str; 4] = ["claude code", "claude", "codex", "codex cli"
 
 /// One `pane.list` round-trip. `None` on any call or parse failure — every
 /// caller falls back, so the block works offline.
-// No production caller until Task 3's `refresh_prompts` calls this
-// directly (mirrors `tab_contexts`, which gets its caller the same way).
-// Task 3 removes this allow.
-#[allow(dead_code)]
 fn pane_index() -> Option<PaneIndex> {
     Some(build_pane_index(&fetch_array("pane.list", "panes")?))
 }
@@ -224,9 +220,6 @@ fn pane_index() -> Option<PaneIndex> {
 /// Pure builder over an already-fetched `panes` array — no I/O, so it is
 /// unit-tested against captured live responses. An item with no `pane_id` is
 /// the only thing skipped; everything else degrades to a default.
-// Exercised only by tests until Task 3's `refresh_prompts` calls
-// `pane_index`, which calls this. Task 3 removes this allow.
-#[allow(dead_code)]
 fn build_pane_index(panes: &[serde_json::Value]) -> PaneIndex {
     let mut out = PaneIndex::new();
     for p in panes {
@@ -250,9 +243,6 @@ fn build_pane_index(panes: &[serde_json::Value]) -> PaneIndex {
 /// A terminal title worth showing: trimmed, non-empty, not the tool naming
 /// itself (`Claude Code` on an idle pane), and not a filesystem path (a bare
 /// shell pane reports its `powershell.exe` path). `None` when it says nothing.
-// Exercised only by tests until Task 3's `pane_label` calls this
-// internally. Task 3 removes this allow.
-#[allow(dead_code)]
 fn meaningful_title(title: &str, agent: &str) -> Option<String> {
     let t = title.trim();
     if t.is_empty() {
@@ -272,9 +262,6 @@ fn meaningful_title(title: &str, agent: &str) -> Option<String> {
 /// otherwise `{agent} {pane-suffix}` (`claude p8`) built from data the stored
 /// prompt always carries — so a closed pane or an unreachable socket still
 /// names its group.
-// Exercised only by tests until Task 3's `refresh_prompts` calls this
-// directly. Task 3 removes this allow.
-#[allow(dead_code)]
 fn pane_label(pane_id: &str, agent: &str, index: Option<&PaneIndex>) -> String {
     if let Some(info) = index.and_then(|i| i.get(pane_id))
         && let Some(title) = info.title.as_deref().and_then(|t| meaningful_title(t, &info.agent))
@@ -324,11 +311,14 @@ pub struct App {
     /// — draw clears it once applied — so a cursor merely existing does not
     /// fight manual scrolling (`Up`/`Dn`/`g`/`G`/PgUp/PgDn) on every frame.
     follow_box: bool,
-    /// The tab's captured prompts, newest first — merged from every agent
-    /// pane's file by `prompts::load_for_tab`, refreshed on the heartbeat
-    /// rather than per draw (a directory scan every 500ms frame is waste).
-    /// Rendered above the note, never part of the edit buffer.
+    /// The tab's captured prompts, grouped per agent pane and newest group
+    /// first, each with the heading resolved at refresh time. Refreshed on the
+    /// heartbeat rather than per draw. Rendered above the note, never part of
+    /// the edit buffer.
     prompts: Vec<crate::prompts::PromptGroup>,
+    /// Heading per group, index-aligned with `prompts`. Resolved from one
+    /// `pane.list` call at refresh time so the draw path stays I/O-free.
+    prompt_labels: Vec<String>,
     confirm_clear: bool,
     dirty: bool,
     last_edit: Instant,
@@ -373,6 +363,7 @@ impl App {
             box_cursor: None,
             follow_box: false,
             prompts: Vec::new(),
+            prompt_labels: Vec::new(),
             confirm_clear: false,
             dirty: false,
             last_edit: Instant::now(),
@@ -526,12 +517,42 @@ impl App {
     /// today — but an asymmetric clear is a trap for the next change.
     fn refresh_prompts(&mut self) {
         self.prompts.clear();
+        self.prompt_labels.clear();
         if !self.persist || !self.showing_tab_note() {
             return;
         }
         let Some(dir) = state::store_dir() else { return };
         let Some(key) = state::tab_env().as_deref().and_then(state::id_key) else { return };
         self.prompts = crate::prompts::load_for_tab(&dir, &key);
+        if self.prompts.is_empty() {
+            return;
+        }
+        // One socket round-trip per refresh, and only when there is something
+        // to label. `None` (socket unreachable) falls every group back to
+        // `{agent} {pane-suffix}`.
+        let index = pane_index();
+        self.prompt_labels = self
+            .prompts
+            .iter()
+            .map(|g| {
+                let agent = g.prompts.first().map(|p| p.agent.as_str()).unwrap_or("");
+                pane_label(&g.pane, agent, index.as_ref())
+            })
+            .collect();
+    }
+
+    /// `prompts` zipped with their resolved headings, for the renderer. A
+    /// group whose label is missing (labels cleared, prompts not) falls back
+    /// to the raw pane id rather than dropping the group.
+    fn labelled_prompts(&self) -> Vec<(String, Vec<crate::prompts::Prompt>)> {
+        self.prompts
+            .iter()
+            .enumerate()
+            .map(|(i, g)| {
+                let label = self.prompt_labels.get(i).cloned().unwrap_or_else(|| g.pane.clone());
+                (label, g.prompts.clone())
+            })
+            .collect()
     }
 
     // ----- keys --------------------------------------------------------
@@ -1123,21 +1144,11 @@ impl App {
         // without going through it, so the render site re-checks
         // `showing_tab_note()` itself rather than trusting that invariant to
         // still hold by the time we draw.
-        // TASK 1 TEMPORARY FLATTEN (Task 3 replaces this with real grouping):
-        // `prompt_block` still renders a flat `&[Prompt]`, so the per-pane
-        // groups are flattened back into one list. The OLD `load_for_tab`
-        // capped the MERGED list at RING; grouping caps per pane instead, so
-        // a multi-pane tab would otherwise hand `prompt_block` far more than
-        // RING rows (no truncation downstream — it renders everything it is
-        // given). Re-sort with the old merge's exact comparator and re-cap
-        // at RING here so this interim commit renders byte-identical to the
-        // pre-grouping binary; Task 3 replaces this whole flatten (sort,
-        // cap, and all) with real per-agent grouping.
-        let mut flat: Vec<crate::prompts::Prompt> =
-            self.prompts.iter().flat_map(|g| g.prompts.iter()).cloned().collect();
-        flat.sort_by(|a, b| b.ts.cmp(&a.ts).then_with(|| a.pane.cmp(&b.pane)).then_with(|| a.text.cmp(&b.text)));
-        flat.truncate(crate::prompts::RING);
-        let block = if self.showing_tab_note() { prompt_block(&flat, text_w) } else { Vec::new() };
+        let block = if self.showing_tab_note() {
+            prompt_block(&self.labelled_prompts(), text_w)
+        } else {
+            Vec::new()
+        };
         if self.note.text.trim().is_empty() {
             // The block is at most RING + 2 rows, so nothing scrolls here and
             // both the zeroed scroll and the `None` hint stay correct.
@@ -1509,24 +1520,33 @@ fn fit_right(context: &str, progress: &str, age: &str, budget: usize) -> String 
     .unwrap_or_default()
 }
 
-/// The dim `Last Prompts` block rendered above the note: a heading, up to
-/// `RING` numbered entries truncated to the pane width, and a rule. Returns
-/// no rows at all when there is nothing to show, so the note keeps the space.
-fn prompt_block(prompts: &[crate::prompts::Prompt], width: usize) -> Vec<Line<'static>> {
-    if prompts.is_empty() {
-        return Vec::new();
-    }
+/// The dim per-agent prompt block rendered above the note: one heading per
+/// group, its prompts numbered from 1, a blank line between groups, and a
+/// rule at the end. Empty groups and an empty list render nothing at all, so
+/// the note keeps the space. There is deliberately no single "Last Prompts"
+/// heading — the agent's own label is the more informative one, and two
+/// heading levels in a five-row block is noise.
+fn prompt_block(
+    groups: &[(String, Vec<crate::prompts::Prompt>)],
+    width: usize,
+) -> Vec<Line<'static>> {
     let dim = Style::default().add_modifier(Modifier::DIM);
-    let mut out = vec![Line::from(Span::styled(
-        "Last Prompts",
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
-    ))];
-    for (i, p) in prompts.iter().enumerate() {
-        // The number and its separator cost 3 columns.
-        let body = truncate_w(&p.text, width.saturating_sub(3));
-        out.push(Line::from(Span::styled(format!("{}. {body}", i + 1), dim)));
+    let head = Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM);
+    let mut out: Vec<Line<'static>> = Vec::new();
+    for (label, prompts) in groups.iter().filter(|(_, p)| !p.is_empty()) {
+        if !out.is_empty() {
+            out.push(Line::raw(""));
+        }
+        out.push(Line::from(Span::styled(truncate_w(label, width), head)));
+        for (i, p) in prompts.iter().enumerate() {
+            // The number and its separator cost 3 columns.
+            let body = truncate_w(&p.text, width.saturating_sub(3));
+            out.push(Line::from(Span::styled(format!("{}. {body}", i + 1), dim)));
+        }
     }
-    out.push(Line::from(Span::styled("─".repeat(width), dim)));
+    if !out.is_empty() {
+        out.push(Line::from(Span::styled("─".repeat(width), dim)));
+    }
     out
 }
 
@@ -1591,12 +1611,18 @@ mod tests {
         crate::prompts::Prompt { ts, pane: "w1:p5".into(), agent: "claude".into(), text: text.into() }
     }
 
-    /// TASK 1 TEMPORARY: wraps a fixture's flat prompt list into the single
-    /// pane group `App.prompts` now holds, so these pre-grouping fixtures
-    /// keep compiling. `prompt()` always stamps pane "w1:p5", so one group
-    /// is enough. Task 3 replaces this with real multi-pane fixtures.
-    fn group(prompts: Vec<crate::prompts::Prompt>) -> crate::prompts::PromptGroup {
-        crate::prompts::PromptGroup { pane: "w1:p5".into(), prompts }
+    fn group(label: &str, texts: &[&str]) -> (String, Vec<crate::prompts::Prompt>) {
+        let prompts = texts
+            .iter()
+            .enumerate()
+            .map(|(i, t)| crate::prompts::Prompt {
+                ts: (100 - i) as u64,
+                pane: "w1:p5".into(),
+                agent: "claude".into(),
+                text: (*t).into(),
+            })
+            .collect();
+        (label.to_string(), prompts)
     }
 
     /// The env var `state::config_base()` reads. Tests that drive real
@@ -1639,9 +1665,11 @@ mod tests {
     #[test]
     fn preview_renders_the_prompt_block_above_the_note() {
         let mut a = app("## Status\nmid-refactor");
-        a.prompts = vec![group(vec![prompt(2, "add the rate limiter"), prompt(1, "why is auth flaky")])];
+        a.prompts = vec![crate::prompts::PromptGroup {
+            pane: "w1:p5".into(),
+            prompts: vec![prompt(2, "add the rate limiter"), prompt(1, "why is auth flaky")],
+        }];
         let screen = rendered(&mut a, 60, 14);
-        assert!(screen.contains("Last Prompts"), "{screen}");
         assert!(screen.contains("add the rate limiter"), "{screen}");
         let block_at = screen.find("add the rate limiter").unwrap();
         let note_at = screen.find("mid-refactor").unwrap();
@@ -1650,21 +1678,26 @@ mod tests {
 
     #[test]
     fn the_prompt_block_is_absent_without_prompts() {
+        // No groups -> no heading, no rows, and no trailing rule (the only
+        // marker `prompt_block` ever emits with no prompts to number); this
+        // fixture's note text has no markdown hr of its own to confuse it.
         let mut a = app("## Status\nmid-refactor");
-        assert!(!rendered(&mut a, 60, 14).contains("Last Prompts"));
+        assert!(!rendered(&mut a, 60, 14).contains('─'));
     }
 
     #[test]
     fn the_prompt_block_never_shows_on_the_global_note_or_in_edit_mode() {
         let mut a = app("## Status\nmid-refactor");
-        a.prompts = vec![group(vec![prompt(1, "add the rate limiter")])];
+        a.prompts =
+            vec![crate::prompts::PromptGroup { pane: "w1:p5".into(), prompts: vec![prompt(1, "add the rate limiter")] }];
         a.active = ActiveNote::Global;
-        assert!(!rendered(&mut a, 60, 14).contains("Last Prompts"), "global is not a tab");
+        assert!(!rendered(&mut a, 60, 14).contains("add the rate limiter"), "global is not a tab");
 
         let mut b = app("## Status\nmid-refactor");
-        b.prompts = vec![group(vec![prompt(1, "add the rate limiter")])];
+        b.prompts =
+            vec![crate::prompts::PromptGroup { pane: "w1:p5".into(), prompts: vec![prompt(1, "add the rate limiter")] }];
         b.on_key(key(KeyCode::Char('e')));
-        assert!(!rendered(&mut b, 60, 14).contains("Last Prompts"), "the edit buffer is yours alone");
+        assert!(!rendered(&mut b, 60, 14).contains("add the rate limiter"), "the edit buffer is yours alone");
     }
 
     #[test]
@@ -1675,9 +1708,9 @@ mod tests {
         // nothing but the help forever and capture looks broken.
         let mut a = app("");
         a.note.title = "Auth refactor".into();
-        a.prompts = vec![group(vec![prompt(1, "why is auth flaky")])];
+        a.prompts =
+            vec![crate::prompts::PromptGroup { pane: "w1:p5".into(), prompts: vec![prompt(1, "why is auth flaky")] }];
         let screen = rendered(&mut a, 60, 24);
-        assert!(screen.contains("Last Prompts"), "{screen}");
         assert!(screen.contains("why is auth flaky"), "{screen}");
         assert!(screen.contains("(empty note"), "the quick-start help must survive: {screen}");
         let block_at = screen.find("why is auth flaky").unwrap();
@@ -1687,10 +1720,11 @@ mod tests {
         // The showing_tab_note() gate applies on this path exactly as it does
         // on the rendered-note one.
         let mut b = app("");
-        b.prompts = vec![group(vec![prompt(1, "why is auth flaky")])];
+        b.prompts =
+            vec![crate::prompts::PromptGroup { pane: "w1:p5".into(), prompts: vec![prompt(1, "why is auth flaky")] }];
         b.active = ActiveNote::Global;
         assert!(
-            !rendered(&mut b, 60, 24).contains("Last Prompts"),
+            !rendered(&mut b, 60, 24).contains("why is auth flaky"),
             "the global note is not a tab, empty or not"
         );
     }
@@ -1704,7 +1738,10 @@ mod tests {
         // below is what actually exercises the map's two real consumers (the
         // REVERSED highlight and the follow-scroll arithmetic).
         let mut a = app("[ ] first\n[ ] second");
-        a.prompts = vec![group(vec![prompt(2, "add the rate limiter"), prompt(1, "why is auth flaky")])];
+        a.prompts = vec![crate::prompts::PromptGroup {
+            pane: "w1:p5".into(),
+            prompts: vec![prompt(2, "add the rate limiter"), prompt(1, "why is auth flaky")],
+        }];
         let _ = rendered(&mut a, 60, 14);
         a.on_key(key(KeyCode::Char('j')));
         assert_eq!(a.box_cursor, Some(0));
@@ -1720,20 +1757,59 @@ mod tests {
     }
 
     #[test]
-    fn prompt_block_truncates_by_display_columns() {
-        // Through `rendered()` this cannot fail — the TestBackend buffer is
-        // exactly w cells wide and Paragraph clips at the edge, so even an
-        // untruncated block would look fine. Call the builder directly, and
-        // use double-width chars: storage truncates by CHAR count, so a
-        // 120-char CJK prompt is ~240 columns and only this render-side
-        // truncation keeps it inside the pane.
-        let wide = prompt(1, &"文".repeat(80));
+    fn prompt_block_heads_each_group_with_its_label() {
+        let groups = vec![
+            group("HM-54271 Importer", &["add the rate limiter", "why is auth flaky"]),
+            group("claude pB", &["run the migration"]),
+        ];
+        let rows: Vec<String> = prompt_block(&groups, 60).iter().map(line_text).collect();
+        let joined = rows.join("\n");
+        assert!(joined.contains("HM-54271 Importer"), "{joined}");
+        assert!(joined.contains("claude pB"), "{joined}");
+        assert!(joined.contains("1. add the rate limiter"), "{joined}");
+        assert!(joined.contains("2. why is auth flaky"), "numbering restarts per group: {joined}");
+        assert!(
+            rows.iter().position(|r| r.contains("HM-54271")).unwrap()
+                < rows.iter().position(|r| r.contains("claude pB")).unwrap(),
+            "group order is preserved: {joined}"
+        );
+        assert!(!joined.contains("Last Prompts"), "the single heading is gone: {joined}");
+    }
+
+    #[test]
+    fn prompt_block_is_empty_without_groups() {
+        assert!(prompt_block(&[], 60).is_empty());
+        assert!(prompt_block(&[("solo".into(), vec![])], 60).is_empty(), "a group with no prompts renders nothing");
+    }
+
+    #[test]
+    fn prompt_block_truncates_labels_and_bodies_by_display_columns() {
+        // Storage truncates by CHAR count, so a 120-char CJK prompt is ~240
+        // columns; only this render-side truncation keeps it in the pane. The
+        // heading is user-supplied too and gets the same treatment.
+        let groups = vec![group(&"文".repeat(80), &[&"文".repeat(80)])];
         for width in [12usize, 30, 60] {
-            for line in prompt_block(std::slice::from_ref(&wide), width) {
+            for line in prompt_block(&groups, width) {
                 let text = line_text(&line);
                 assert!(dwidth(&text) <= width, "row {text:?} is {} cols, want <= {width}", dwidth(&text));
             }
         }
+    }
+
+    #[test]
+    fn preview_renders_grouped_prompts_above_the_note() {
+        let mut a = app("## Status\nmid-refactor");
+        a.prompts = vec![crate::prompts::PromptGroup {
+            pane: "w1:p5".into(),
+            prompts: vec![crate::prompts::Prompt {
+                ts: 2, pane: "w1:p5".into(), agent: "claude".into(), text: "add the rate limiter".into(),
+            }],
+        }];
+        let screen = rendered(&mut a, 60, 14);
+        assert!(screen.contains("add the rate limiter"), "{screen}");
+        let block_at = screen.find("add the rate limiter").unwrap();
+        let note_at = screen.find("mid-refactor").unwrap();
+        assert!(block_at < note_at, "the block sits above the note: {screen}");
     }
 
     #[test]
@@ -1742,10 +1818,11 @@ mod tests {
         // NOT evidence that `prompt_block` truncates: `rendered()`'s
         // TestBackend buffer is exactly `w` cells wide and `Paragraph` clips
         // at the edge, so this would pass even with no truncation at all.
-        // `prompt_block_truncates_by_display_columns` above is what actually
-        // proves the truncation.
+        // `prompt_block_truncates_labels_and_bodies_by_display_columns` above
+        // is what actually proves the truncation.
         let mut a = app("## Status\nmid-refactor");
-        a.prompts = vec![group(vec![prompt(1, &"z".repeat(200))])];
+        a.prompts =
+            vec![crate::prompts::PromptGroup { pane: "w1:p5".into(), prompts: vec![prompt(1, &"z".repeat(200))] }];
         let screen = rendered(&mut a, 30, 14);
         for line in screen.lines() {
             assert!(dwidth(line.trim_end()) <= 30, "row overflows the pane: {line:?}");
@@ -1767,7 +1844,10 @@ mod tests {
         let _ = rendered(&mut bare, 60, 14);
 
         let mut with_block = app(&text);
-        with_block.prompts = vec![group(vec![prompt(2, "add the rate limiter"), prompt(1, "why is auth flaky")])];
+        with_block.prompts = vec![crate::prompts::PromptGroup {
+            pane: "w1:p5".into(),
+            prompts: vec![prompt(2, "add the rate limiter"), prompt(1, "why is auth flaky")],
+        }];
         for _ in 0..40 {
             with_block.on_key(key(KeyCode::Char('j')));
         }
@@ -1776,56 +1856,13 @@ mod tests {
         // Matches draw_preview's own `text_w` derivation: area.width - 1 for
         // the scrollbar column, with the 60-wide `rendered()` call above.
         let text_w = usize::from(60u16).saturating_sub(1).max(1);
-        // TASK 1 TEMPORARY FLATTEN: mirrors draw_preview's own flatten-sort-cap
-        // above, so this test computes the same rows draw_preview actually
-        // renders.
-        let mut flat: Vec<crate::prompts::Prompt> =
-            with_block.prompts.iter().flat_map(|g| g.prompts.iter()).cloned().collect();
-        flat.sort_by(|a, b| b.ts.cmp(&a.ts).then_with(|| a.pane.cmp(&b.pane)).then_with(|| a.text.cmp(&b.text)));
-        flat.truncate(crate::prompts::RING);
-        let block_rows = prompt_block(&flat, text_w).len();
+        let block_rows = prompt_block(&with_block.labelled_prompts(), text_w).len();
         assert!(block_rows > 0, "the fixture must actually produce a block");
         assert_eq!(
             with_block.preview_scroll,
             bare.preview_scroll + block_rows,
             "the follow must offset by exactly the block's height"
         );
-    }
-
-    #[test]
-    fn the_interim_flatten_still_caps_the_block_at_ring() {
-        // TASK 1 TEMPORARY: guards the stopgap. Grouping caps per pane, so
-        // without a re-cap here a two-pane tab would render six rows where
-        // the pre-grouping binary rendered three. Task 3 deletes this test
-        // along with the flatten.
-        let mut a = app("## Status\nmid-refactor");
-        let mk = |pane: &str, base: u64| crate::prompts::PromptGroup {
-            pane: pane.into(),
-            prompts: (0..3)
-                .map(|i| crate::prompts::Prompt {
-                    ts: base + i,
-                    pane: pane.into(),
-                    agent: "claude".into(),
-                    text: format!("{pane}-{i}"),
-                })
-                .collect(),
-        };
-        a.prompts = vec![mk("w1:p5", 100), mk("w1:p6", 200)];
-        let screen = rendered(&mut a, 60, 20);
-        // Block rows are the only lines of the form "N. <text>" (`prompt_block`
-        // formats each entry as `"{}. {body}"`); the note body itself has no
-        // ordered-list markup in this fixture, so the leading-digit-then-dot
-        // shape uniquely identifies a block row and does not accidentally
-        // count "## Status" or "mid-refactor".
-        let rows = screen
-            .lines()
-            .filter(|l| {
-                let t = l.trim_start();
-                let digits: String = t.chars().take_while(|c| c.is_ascii_digit()).collect();
-                !digits.is_empty() && t[digits.len()..].starts_with(". ")
-            })
-            .count();
-        assert_eq!(rows, crate::prompts::RING, "the interim block must still cap at RING: {screen}");
     }
 
     #[test]
