@@ -291,6 +291,22 @@ fn pick_title(
     oldest_prompt.map(str::trim).filter(|p| !p.is_empty()).map(|p| p.to_string())
 }
 
+/// The agent pane `maybe_autotitle` reads from for this tab: the pane with
+/// the LOWEST pane id among panes on the tab that have reported a non-empty
+/// agent. `PaneIndex` is a `HashMap`, so iterating `.values().find(...)`
+/// picks whichever pane the hash happens to visit first — arbitrary, and
+/// varying per process, on exactly the tab shape this feature targets (a 2x2
+/// agent grid). Sorting by pane id makes the same tab state always yield the
+/// same pane, and so the same title/cwd.
+fn pick_agent_pane<'a>(index: &'a PaneIndex, tab: &str) -> Option<&'a PaneInfo> {
+    index
+        .iter()
+        .filter(|(_, p)| p.tab_id == tab && !p.agent.trim().is_empty())
+        .map(|(id, p)| (id.as_str(), p))
+        .min_by_key(|(id, _)| *id)
+        .map(|(_, p)| p)
+}
+
 /// One `method` round-trip, returning `result.<key>` as a JSON array — `None`
 /// on any socket/parse failure (best-effort, never panics; the overlay just
 /// shows Unknown context for every row when this fails).
@@ -576,6 +592,14 @@ impl App {
     /// `git rev-parse --abbrev-ref HEAD` in `cwd`, at most once per cwd for
     /// the life of this process. On Windows the child is spawned with
     /// CREATE_NO_WINDOW so a console never flashes over the TUI.
+    ///
+    /// A successful call records the cwd as tried too — including a detached
+    /// HEAD, which comes back as `Some("HEAD")` here and is only rejected
+    /// later, by `pick_title`. So a pane whose cwd is on a detached HEAD the
+    /// first time this runs gets the branch source permanently disabled for
+    /// the rest of the pane's life, even if a real branch is checked out
+    /// afterwards. That is the intended shape of "at most once per cwd", not
+    /// an oversight.
     fn git_branch(&mut self, cwd: &str) -> Option<String> {
         if !self.git_tried.insert(cwd.to_string()) {
             return None;
@@ -608,9 +632,7 @@ impl App {
         }
         let Some(tab) = state::tab_env() else { return };
         let index = pane_index();
-        let agent_pane = index.as_ref().and_then(|i| {
-            i.values().find(|p| p.tab_id == tab && !p.agent.trim().is_empty())
-        });
+        let agent_pane = index.as_ref().and_then(|i| pick_agent_pane(i, &tab));
         let cwd = agent_pane.and_then(|p| p.cwd.clone());
         // Cloned so the immutable borrow of `index` ends before `git_branch`
         // takes `&mut self`.
@@ -620,7 +642,16 @@ impl App {
             title: p.title.clone(),
             cwd: p.cwd.clone(),
         });
-        let branch = cwd.and_then(|c| self.git_branch(&c));
+        // Source 1 first, without spawning anything: when the agent pane's
+        // terminal title already resolves, `pick_title` never falls through
+        // to the branch, so a `git` subprocess would be spawned and its
+        // result thrown away every time this is the winning source (the
+        // common case). Only compute the branch — and only then bear its
+        // process-spawn cost — once source 1 has actually missed.
+        let source1 = agent_pane
+            .as_ref()
+            .and_then(|p| p.title.as_deref().and_then(|t| meaningful_title(t, &p.agent)));
+        let branch = if source1.is_none() { cwd.and_then(|c| self.git_branch(&c)) } else { None };
         let oldest = self.oldest_prompt_text();
         if let Some(title) = pick_title(agent_pane.as_ref(), branch.as_deref(), oldest.as_deref()) {
             self.note.title = title;
@@ -2295,18 +2326,161 @@ mod tests {
     }
 
     #[test]
-    fn autotitle_only_runs_while_the_note_is_untitled_and_auto() {
-        let mut a = app("body");
-        a.note.title = "Mine".into();
-        a.note.title_auto = false;
-        a.maybe_autotitle();
-        assert_eq!(a.note.title, "Mine", "a manual title is never touched");
+    fn maybe_autotitle_derives_from_the_oldest_prompt_and_is_gated_by_title_state_and_active_note() {
+        // The `app()` helper builds with `persist = false`, so
+        // `maybe_autotitle`'s FIRST guard (`if !self.persist`) returns before
+        // `title_auto`/`title` are ever read — a test built on it would pass
+        // whether or not the rest of the function does anything at all.
+        // Real coverage needs a real `persist = true` App, following
+        // `prompts_load_at_construction_and_on_every_global_toggle`'s harness
+        // exactly: a temp store dir, `HERDR_*` env under `ENV_LOCK`, and a
+        // dead socket so `pane_index()` returns `None` — with sources 1 and 2
+        // (terminal title, git branch) unavailable, a captured prompt is the
+        // only reachable source, which is exactly what this exercises.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("notes-autotitle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config-base");
+        std::fs::create_dir_all(&cfg).unwrap();
 
-        let mut b = app("body");
-        b.note.title = "Derived".into();
-        b.note.title_auto = true;
-        b.maybe_autotitle();
-        assert_eq!(b.note.title, "Derived", "an already-derived title is set once, not re-derived");
+        state::persist_at(&dir.join("w1_t1.json"), &Note::default(), "w1:t1", 100);
+        state::persist_at(
+            &dir.join("global.json"),
+            &Note { text: "GLOBAL BODY".into(), ..Default::default() },
+            "",
+            100,
+        );
+        let key = state::id_key("w1:t1").unwrap();
+        let pane_key = state::id_key("w1:p5").unwrap();
+        crate::prompts::append_at(
+            &crate::prompts::prompts_file(&dir, &key, &pane_key),
+            crate::prompts::Prompt {
+                ts: 7,
+                pane: "w1:p5".into(),
+                agent: "claude".into(),
+                text: "why is auth flaky".into(),
+            },
+        );
+
+        let sock = dir.join("no-such.sock");
+        let prev = swap_env(&[
+            ("HERDR_PLUGIN_STATE_DIR", Some(dir.as_os_str())),
+            ("HERDR_TAB_ID", Some(std::ffi::OsStr::new("w1:t1"))),
+            ("HERDR_PANE_ID", None),
+            ("HERDR_SOCKET_PATH", Some(sock.as_os_str())),
+            (CONFIG_BASE_VAR, Some(cfg.as_os_str())),
+        ]);
+
+        let mut a = App::new();
+        assert!(a.note.title.trim().is_empty(), "fixture loads untitled");
+        assert!(a.note.title_auto, "fixture loads auto");
+        assert!(!a.dirty, "construction alone must not dirty the note");
+
+        // Case 1: untitled + auto + a prompt on disk -> derived from it.
+        a.maybe_autotitle();
+        assert_eq!(a.note.title, "why is auth flaky");
+        assert!(a.note.title_auto, "title_auto stays true — it records derivation, not pending-ness");
+        assert!(a.dirty, "a derived title must autosave, same as any other edit");
+
+        // Case 2: a title that is already set (derived or typed) is never
+        // re-derived, even though the prompt is still sitting right there.
+        a.dirty = false;
+        a.maybe_autotitle();
+        assert_eq!(a.note.title, "why is auth flaky", "an already-titled note is untouched");
+        assert!(!a.dirty, "no mutation means no new dirty flag");
+
+        // Case 3: `title_auto = false` (a manually typed title) is untouched
+        // even with an empty title — the FIRST guard catches it before the
+        // prompt is ever looked at.
+        a.note.title.clear();
+        a.note.title_auto = false;
+        a.dirty = false;
+        a.maybe_autotitle();
+        assert!(a.note.title.trim().is_empty(), "a manual (title_auto=false) note is never auto-titled");
+        assert!(!a.dirty);
+
+        // Case 4: the pane showing the GLOBAL note is untouched even when
+        // untitled and auto — the global note is not a tab, so it must never
+        // pick up a tab's prompt.
+        a.note.title_auto = true;
+        a.active = ActiveNote::Global;
+        a.dirty = false;
+        a.maybe_autotitle();
+        assert!(a.note.title.trim().is_empty(), "the global note is never auto-titled from tab sources");
+        assert!(!a.dirty);
+
+        restore_env(prev);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pick_agent_pane_is_deterministic_by_lowest_pane_id() {
+        // `PaneIndex` is a `HashMap`, so before this fix, picking a tab's
+        // agent pane via `.values().find(...)` visited panes in whatever
+        // order the hash happened to put them in — arbitrary, and different
+        // per process, on exactly the tab shape this feature targets (two or
+        // more agent panes in one tab). Demonstrated empirically below rather
+        // than asserted on faith: rebuilding the SAME entries many times and
+        // taking the naive first match disagrees with the lowest-pane-id
+        // choice across enough trials, in this very run — so a test pinned to
+        // one title would have failed against the old code intermittently,
+        // not passed by luck of a single build.
+        let build = || {
+            let mut idx = PaneIndex::new();
+            idx.insert("w1:p9".into(), PaneInfo {
+                agent: "claude".into(),
+                tab_id: "w1:t1".into(),
+                title: Some("Zeta".into()),
+                cwd: Some("C:\\zeta".into()),
+            });
+            idx.insert("w1:p2".into(), PaneInfo {
+                agent: "codex".into(),
+                tab_id: "w1:t1".into(),
+                title: Some("Alpha".into()),
+                cwd: Some("C:\\alpha".into()),
+            });
+            idx.insert("w1:p5".into(), PaneInfo {
+                agent: "claude".into(),
+                tab_id: "w1:t1".into(),
+                title: Some("Mid".into()),
+                cwd: Some("C:\\mid".into()),
+            });
+            // A pane on a DIFFERENT tab, and a bare shell pane (no agent yet)
+            // on the SAME tab: neither may ever be picked.
+            idx.insert("w1:p1".into(), PaneInfo {
+                agent: "claude".into(),
+                tab_id: "w1:t9".into(),
+                title: Some("Other tab".into()),
+                cwd: None,
+            });
+            idx.insert("w1:p0".into(), PaneInfo {
+                agent: String::new(),
+                tab_id: "w1:t1".into(),
+                title: Some("Shell".into()),
+                cwd: None,
+            });
+            idx
+        };
+
+        let mut naive_titles = std::collections::HashSet::new();
+        for _ in 0..300 {
+            let idx = build();
+            let naive = idx.values().find(|p| p.tab_id == "w1:t1" && !p.agent.trim().is_empty());
+            naive_titles.insert(naive.and_then(|p| p.title.clone()));
+        }
+        assert!(
+            naive_titles.len() > 1,
+            "sanity check: the naive `.values().find` selection must actually vary across \
+             HashMap instances for this to be a real regression test rather than a coincidence \
+             — got {naive_titles:?}"
+        );
+
+        for _ in 0..300 {
+            let idx = build();
+            let picked = pick_agent_pane(&idx, "w1:t1").expect("a candidate exists");
+            assert_eq!(picked.title.as_deref(), Some("Alpha"), "lowest pane id (w1:p2) wins, every trial");
+        }
     }
 
     #[test]
