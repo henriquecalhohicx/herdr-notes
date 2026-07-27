@@ -617,19 +617,23 @@ impl App {
         // Lazy seed: a tab you merely toggled Notes into and never edited
         // still writes no file. `dirty` so the seed survives to the next
         // autosave; `is_blank` deletes it again if it stays untouched.
-        if self.note.text.trim().is_empty() {
+        let seeded = self.note.text.trim().is_empty();
+        if seeded {
             self.note.text = template::DEFAULT.to_string();
             self.dirty = true;
             self.last_edit = Instant::now();
         }
         self.lines = self.note.text.split('\n').map(String::from).collect();
-        // Land on the status placeholder — the first thing worth writing.
-        self.row = self
-            .lines
-            .iter()
-            .position(|l| l.starts_with('<'))
-            .unwrap_or(0)
-            .min(self.lines.len().saturating_sub(1));
+        self.row = if seeded {
+            // Land on the status placeholder — the first thing worth writing.
+            self.lines
+                .iter()
+                .position(|l| l.starts_with('<'))
+                .unwrap_or(0)
+                .min(self.lines.len().saturating_sub(1))
+        } else {
+            0
+        };
         self.col = 0;
         self.edit_scroll = 0;
         self.note.mode = Mode::Edit;
@@ -1199,6 +1203,16 @@ mod tests {
         let mut a = app("already written");
         a.on_key(key(KeyCode::Char('e')));
         assert_eq!(a.note.text, "already written");
+    }
+
+    #[test]
+    fn entering_edit_on_existing_text_does_not_chase_angle_brackets() {
+        // The placeholder hunt belongs to the seed path only — a real note
+        // that happens to contain a `<` line must still open at row 0.
+        let mut a = app("first line\n<html>\nthird");
+        a.on_key(key(KeyCode::Char('e')));
+        assert_eq!(a.row, 0);
+        assert_eq!(a.col, 0);
     }
 
     #[test]
