@@ -145,9 +145,13 @@ pwsh scripts/install-prompt-hook.ps1
 ```
 
 It's idempotent — re-run it any time (after a rebuild, say) and it replaces
-just this plugin's entry, leaving every other hook untouched. It backs up
-`~/.claude/settings.json` first (`~/.claude/settings.json.herdr-notes.bak`).
-Pass `-Remove` to uninstall.
+just this plugin's entry, leaving every other hook untouched. The first run
+backs `~/.claude/settings.json` up to `~/.claude/settings.json.herdr-notes.bak`;
+later runs KEEP that original backup rather than overwriting it, so it always
+holds your pre-install settings. Pass `-Remove` to uninstall.
+
+Windows PowerShell 5.1 works too (`powershell scripts\install-prompt-hook.ps1`)
+— the script writes UTF-8 without a BOM on both editions.
 
 The installer only ever touches its own hook entry: if you've merged the
 herdr-notes command into an existing `UserPromptSubmit` entry alongside some

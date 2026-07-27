@@ -18,9 +18,17 @@ if (-not (Test-Path $settingsPath)) {
     Write-Error "No Claude Code settings at $settingsPath."
 }
 
+# Keep the FIRST backup, never overwrite it. The README invites re-running
+# this script, and -Force here would make the second run's "backup" a copy of
+# the already-modified file - throwing away the only pristine pre-install copy.
 $backup = "$settingsPath.herdr-notes.bak"
-Copy-Item $settingsPath $backup -Force
-Write-Host "Backed up to $backup"
+if (Test-Path $backup) {
+    Write-Host "Keeping the existing pre-install backup at $backup"
+}
+else {
+    Copy-Item $settingsPath $backup
+    Write-Host "Backed up to $backup"
+}
 
 $settings = Get-Content $settingsPath -Raw -Encoding UTF8 | ConvertFrom-Json
 if (-not $settings.hooks) {
@@ -56,12 +64,21 @@ if (-not $Remove) {
 $settings.hooks | Add-Member -NotePropertyName UserPromptSubmit -NotePropertyValue @($existing) -Force
 
 # Atomic write: a temp sibling in the SAME directory (so the rename is a
-# rename, not a cross-volume copy), flushed via Set-Content, then moved over
-# the real target. The user's live settings file is never observed
-# half-written, and the temp file never lingers past a failed run.
+# rename, not a cross-volume copy), then moved over the real target. The
+# user's live settings file is never observed half-written, and the temp file
+# never lingers past a failed run.
+#
+# UTF-8 with NO BOM, written explicitly: `Set-Content -Encoding UTF8` means
+# utf8-no-BOM in pwsh 7 but BOM-prefixed UTF-8 in Windows PowerShell 5.1
+# (verified on this machine: 5.1 emits EF BB BF, pwsh 7 emits none). herdr
+# panes run 5.1, so `powershell scripts\install-prompt-hook.ps1` is a natural
+# way to run this - and a BOM on ~/.claude/settings.json risks every global
+# setting the user has silently failing to load. Do not go back to relying on
+# the parameter's edition-dependent meaning.
 $tmp = "$settingsPath.herdr-notes.tmp"
 try {
-    $settings | ConvertTo-Json -Depth 20 | Set-Content $tmp -Encoding UTF8
+    $json = $settings | ConvertTo-Json -Depth 20
+    [System.IO.File]::WriteAllText($tmp, $json, (New-Object System.Text.UTF8Encoding($false)))
     Move-Item -Path $tmp -Destination $settingsPath -Force
 }
 finally {

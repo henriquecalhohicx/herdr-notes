@@ -250,6 +250,14 @@ impl App {
         let mut app = Self::with_note(state::load(), true);
         app.pane_id = std::env::var("HERDR_PANE_ID").ok().filter(|id| !id.is_empty());
         app.report_tokens();
+        // Populate the prompt block NOW rather than leaving it blank until the
+        // first heartbeat 5s from now: "come back after an hour and the pane
+        // already tells you where you were" is the whole feature, and five
+        // seconds of blank block reads as capture being broken. Here rather
+        // than in `with_note` so the persist=false unit tests never touch the
+        // real store dir (`refresh_prompts` early-returns on !persist anyway —
+        // this is belt and braces).
+        app.refresh_prompts();
         app
     }
 
@@ -343,9 +351,7 @@ impl App {
         if self.persist {
             self.note = match self.active {
                 ActiveNote::Tab => state::load(),
-                ActiveNote::Global => state::global_path()
-                    .map(|p| state::read_note(&p))
-                    .unwrap_or_default(),
+                ActiveNote::Global => state::load_global(),
             };
         }
         self.note.mode = Mode::Preview;
@@ -355,6 +361,10 @@ impl App {
         self.preview_scroll = 0;
         self.clear_box_cursor();
         self.dirty = false;
+        // The prompt block belongs to the TAB note only, so it has to be
+        // dropped going out and rebuilt coming back — immediately, not on the
+        // next 5s heartbeat.
+        self.refresh_prompts();
     }
 
     /// Copy the edit buffer back into the note.
@@ -409,9 +419,13 @@ impl App {
     /// Re-read the tab's prompt files. Only the tab note has prompts — the
     /// global note is not a tab. Gated on `persist` so unit tests never touch
     /// the real store dir.
+    /// Clears FIRST, so every exit from this function leaves a consistent
+    /// block. The two `let … else` arms below are process-env-derived and so
+    /// constant for the pane's lifetime, meaning no stale value is reachable
+    /// today — but an asymmetric clear is a trap for the next change.
     fn refresh_prompts(&mut self) {
+        self.prompts.clear();
         if !self.persist || !self.showing_tab_note() {
-            self.prompts.clear();
             return;
         }
         let Some(dir) = state::store_dir() else { return };
@@ -996,26 +1010,35 @@ impl App {
     /// Renders the preview body; returns a "top-line/total" scroll hint when
     /// the content overflows the pane.
     fn draw_preview(&mut self, frame: &mut Frame, area: Rect) -> Option<String> {
+        // The rightmost column is reserved for the overflow scrollbar so text
+        // never sits underneath it.
+        let text_w = usize::from(area.width).saturating_sub(1).max(1);
+        // Built BEFORE the empty-note branch: a note with a title but no body
+        // is not blank, so its file persists, so capture's note-file gate keeps
+        // passing and prompts keep accumulating for it. Rendering only the help
+        // there would hide them forever and read as capture being broken.
+        // `refresh_prompts` already clears `self.prompts` off the tab note in
+        // the running app, but a unit test can set `active`/`prompts` directly
+        // without going through it, so the render site re-checks
+        // `showing_tab_note()` itself rather than trusting that invariant to
+        // still hold by the time we draw.
+        let block = if self.showing_tab_note() { prompt_block(&self.prompts, text_w) } else { Vec::new() };
         if self.note.text.trim().is_empty() {
+            // The block is at most RING + 2 rows, so nothing scrolls here and
+            // both the zeroed scroll and the `None` hint stay correct.
             self.preview_scroll = 0;
+            let mut lines = block;
+            lines.extend(empty_help().lines().map(|l| Line::from(l.to_string())));
             frame.render_widget(
-                Paragraph::new(empty_help()).style(Style::default().add_modifier(Modifier::DIM)),
+                Paragraph::new(lines).style(Style::default().add_modifier(Modifier::DIM)),
                 area,
             );
             return None;
         }
-        // The rightmost column is reserved for the overflow scrollbar so text
-        // never sits underneath it.
-        let text_w = usize::from(area.width).saturating_sub(1).max(1);
         let (mut lines, mut map) = render_markdown_mapped(&self.note.text, text_w);
         // The block's rows map to NO source line, so the checkbox cursor can
         // never land on one and the highlight/scroll-follow keep pointing at
-        // real note lines. Edit mode never reaches here. `refresh_prompts`
-        // clears `self.prompts` off the tab note in the running app, but a
-        // unit test can set `active`/`prompts` directly without going through
-        // it, so the render site re-checks `showing_tab_note()` itself rather
-        // than trusting that invariant to always hold by the time we draw.
-        let block = if self.showing_tab_note() { prompt_block(&self.prompts, text_w) } else { Vec::new() };
+        // real note lines. Edit mode never reaches here.
         if !block.is_empty() {
             let n = block.len();
             let mut merged = block;
@@ -1453,6 +1476,43 @@ mod tests {
         crate::prompts::Prompt { ts, pane: "w1:p5".into(), agent: "claude".into(), text: text.into() }
     }
 
+    /// The env var `state::config_base()` reads. Tests that drive real
+    /// persistence must redirect the MIGRATION SOURCE as well as the store
+    /// dir: the tab note and (since the global note got the same one-time
+    /// migration) `global.json` are MOVED out of the config layout on first
+    /// load, so leaving this pointed at the real profile would relocate the
+    /// developer's own notes into a temp dir.
+    const CONFIG_BASE_VAR: &str = if cfg!(windows) { "APPDATA" } else { "XDG_CONFIG_HOME" };
+
+    /// Set process env vars, returning their previous values for `restore_env`.
+    /// Callers MUST hold `ENV_LOCK` — these are process-global.
+    fn swap_env(vars: &[(&str, Option<&std::ffi::OsStr>)]) -> Vec<(String, Option<std::ffi::OsString>)> {
+        let mut prev = Vec::new();
+        for (k, v) in vars {
+            prev.push(((*k).to_string(), std::env::var_os(k)));
+            // SAFETY: serialized by ENV_LOCK; every caller restores below.
+            unsafe {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        prev
+    }
+
+    fn restore_env(prev: Vec<(String, Option<std::ffi::OsString>)>) {
+        for (k, v) in prev {
+            // SAFETY: serialized by ENV_LOCK.
+            unsafe {
+                match v {
+                    Some(val) => std::env::set_var(&k, val),
+                    None => std::env::remove_var(&k),
+                }
+            }
+        }
+    }
+
     #[test]
     fn preview_renders_the_prompt_block_above_the_note() {
         let mut a = app("## Status\nmid-refactor");
@@ -1482,6 +1542,34 @@ mod tests {
         b.prompts = vec![prompt(1, "add the rate limiter")];
         b.on_key(key(KeyCode::Char('e')));
         assert!(!rendered(&mut b, 60, 14).contains("Last Prompts"), "the edit buffer is yours alone");
+    }
+
+    #[test]
+    fn the_prompt_block_shows_above_the_empty_note_help() {
+        // A titled, body-less note is NOT blank, so its file persists, so
+        // capture's note-file gate passes and prompts keep accumulating for it.
+        // The empty-note branch has to render the block too, or the pane shows
+        // nothing but the help forever and capture looks broken.
+        let mut a = app("");
+        a.note.title = "Auth refactor".into();
+        a.prompts = vec![prompt(1, "why is auth flaky")];
+        let screen = rendered(&mut a, 60, 24);
+        assert!(screen.contains("Last Prompts"), "{screen}");
+        assert!(screen.contains("why is auth flaky"), "{screen}");
+        assert!(screen.contains("(empty note"), "the quick-start help must survive: {screen}");
+        let block_at = screen.find("why is auth flaky").unwrap();
+        let help_at = screen.find("(empty note").unwrap();
+        assert!(block_at < help_at, "the block sits above the help: {screen}");
+
+        // The showing_tab_note() gate applies on this path exactly as it does
+        // on the rendered-note one.
+        let mut b = app("");
+        b.prompts = vec![prompt(1, "why is auth flaky")];
+        b.active = ActiveNote::Global;
+        assert!(
+            !rendered(&mut b, 60, 24).contains("Last Prompts"),
+            "the global note is not a tab, empty or not"
+        );
     }
 
     #[test]
@@ -2144,6 +2232,76 @@ mod tests {
     }
 
     #[test]
+    fn prompts_load_at_construction_and_on_every_global_toggle() {
+        // The block used to be populated ONLY by the 5s-throttled heartbeat,
+        // so it was blank for up to five seconds after the pane opened and
+        // again after coming back from the global note — which reads exactly
+        // like capture is broken.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("notes-promptrefresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config-base");
+        std::fs::create_dir_all(&cfg).unwrap();
+        // A tab note, a global note (so the toggle finds one in place), and one
+        // captured prompt belonging to this tab.
+        state::persist_at(
+            &dir.join("w1_t1.json"),
+            &Note { text: "TAB BODY".into(), ..Default::default() },
+            "w1:t1",
+            100,
+        );
+        state::persist_at(
+            &dir.join("global.json"),
+            &Note { text: "GLOBAL BODY".into(), ..Default::default() },
+            "",
+            100,
+        );
+        let key = state::id_key("w1:t1").unwrap();
+        let pane_key = state::id_key("w1:p5").unwrap();
+        crate::prompts::append_at(
+            &crate::prompts::prompts_file(&dir, &key, &pane_key),
+            crate::prompts::Prompt {
+                ts: 7,
+                pane: "w1:p5".into(),
+                agent: "claude".into(),
+                text: "why is auth flaky".into(),
+            },
+        );
+
+        let sock = dir.join("no-such.sock");
+        let prev = swap_env(&[
+            ("HERDR_PLUGIN_STATE_DIR", Some(dir.as_os_str())),
+            ("HERDR_TAB_ID", Some(std::ffi::OsStr::new("w1:t1"))),
+            ("HERDR_PANE_ID", None),
+            ("HERDR_SOCKET_PATH", Some(sock.as_os_str())),
+            (CONFIG_BASE_VAR, Some(cfg.as_os_str())),
+        ]);
+
+        // Construction — not the first heartbeat — populates the block.
+        let mut a = App::new();
+        assert_eq!(a.note.text, "TAB BODY");
+        assert_eq!(
+            a.prompts.iter().map(|p| p.text.as_str()).collect::<Vec<_>>(),
+            vec!["why is auth flaky"],
+            "the prompt block must be populated at construction, not up to 5s later"
+        );
+
+        // Tab -> Global: the global note is not a tab and carries no prompts.
+        a.toggle_global();
+        assert_eq!(a.active, ActiveNote::Global);
+        assert!(a.prompts.is_empty(), "the global note carries no prompts");
+
+        // Global -> Tab: the block is back at once, again without a heartbeat.
+        a.toggle_global();
+        assert_eq!(a.active, ActiveNote::Tab);
+        assert_eq!(a.prompts.len(), 1, "returning to the tab note refreshes the block immediately");
+
+        restore_env(prev);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn toggle_global_round_trips_tab_and_global_notes_on_disk() {
         // The only test that drives real persistence: point the env-derived
         // store at a temp dir so toggle_global's save()/load() hit throwaway
@@ -2154,13 +2312,17 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("notes-toggle-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let prev_state = std::env::var_os("HERDR_PLUGIN_STATE_DIR");
-        let prev_tab = std::env::var_os("HERDR_TAB_ID");
-        // SAFETY: single-threaded within this serialized test; restored below.
-        unsafe {
-            std::env::set_var("HERDR_PLUGIN_STATE_DIR", &dir);
-            std::env::remove_var("HERDR_TAB_ID"); // no tab id -> shared note.json
-        }
+        // The config base is redirected too: `state::load_global` migrates a
+        // config-layout `global.json` into the state dir on first load, and
+        // pointing that at the real profile would MOVE the developer's own
+        // global note into this temp dir.
+        let cfg = dir.join("config-base");
+        std::fs::create_dir_all(&cfg).unwrap();
+        let prev = swap_env(&[
+            ("HERDR_PLUGIN_STATE_DIR", Some(dir.as_os_str())),
+            ("HERDR_TAB_ID", None), // no tab id -> shared note.json
+            (CONFIG_BASE_VAR, Some(cfg.as_os_str())),
+        ]);
 
         // persist=true: exercise the real save/load path.
         let mut a = App::with_note(Note { text: "TAB BODY".into(), ..Default::default() }, true);
@@ -2181,16 +2343,7 @@ mod tests {
         assert_eq!(state::read_note(&dir.join("note.json")).text, "TAB BODY");
         assert_eq!(state::read_note(&dir.join("global.json")).text, "GLOBAL BODY");
 
-        // Restore env and clean up.
-        unsafe {
-            match prev_state {
-                Some(v) => std::env::set_var("HERDR_PLUGIN_STATE_DIR", v),
-                None => std::env::remove_var("HERDR_PLUGIN_STATE_DIR"),
-            }
-            if let Some(v) = prev_tab {
-                std::env::set_var("HERDR_TAB_ID", v);
-            }
-        }
+        restore_env(prev);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

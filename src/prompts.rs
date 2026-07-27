@@ -165,8 +165,12 @@ pub fn capture(dir: Option<&Path>, env: &CaptureEnv, stdin: &str, now: u64) -> b
         return false;
     };
     // No note for this tab means the user has not opened Notes here; writing
-    // would leave a file behind for a tab that never wanted one.
-    if !dir.join(format!("{tab_key}.json")).exists() {
+    // would leave a file behind for a tab that never wanted one. The path
+    // comes from `state::note_file_in` rather than being spelled again here:
+    // this runs in a SECOND process, and a note layout that grew a suffix or a
+    // subdirectory would otherwise stop capture silently, with no diagnostic
+    // anywhere (the hook prints nothing by design).
+    if !crate::state::note_file_in(dir, &tab_key).exists() {
         return false;
     }
     let Some(text) = payload_prompt(stdin) else {

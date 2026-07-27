@@ -141,8 +141,15 @@ pub(crate) fn tab_env() -> Option<String> {
 /// alongside plain alphanumerics; [`note_key`] sanitizes it to `_`. Everything
 /// else — dots, spaces, `-`, `_`, anything path-traversal-shaped — falls back
 /// to the legacy path instead.
+///
+/// At most ONE `:`: a malformed `a::b` would otherwise sanitize to a key
+/// containing `__`, which is exactly the separator `prompts::load_for_tab`
+/// leans on to keep one tab's prompt files out of another's. Unreachable with
+/// real herdr ids — this makes the invariant watertight instead of argued.
 fn is_filename_safe(id: &str) -> bool {
-    !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == ':')
+    !id.is_empty()
+        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == ':')
+        && id.matches(':').count() <= 1
 }
 
 /// Pre-per-tab single-note file; also the fallback when no (safe)
@@ -191,9 +198,18 @@ fn state_path_in(base: &Path, tab_id: Option<&str>) -> PathBuf {
 /// the shared `<dir>/note.json` for missing/unsafe tab ids.
 fn state_dir_path(dir: &Path, tab_id: Option<&str>) -> PathBuf {
     match note_key(tab_id) {
-        Some(key) => dir.join(format!("{key}.json")),
+        Some(key) => note_file_in(dir, &key),
         None => dir.join("note.json"),
     }
+}
+
+/// The note file a keyed note gets inside a store dir. The ONE place that
+/// layout is spelled: `prompts::capture`'s "does this tab have a note?" gate
+/// runs in a second process and must not re-derive it, or a future change to
+/// the note filename would silently stop capture with no diagnostic anywhere
+/// (the hook is 100% silent by design). Same reason `id_key` is shared.
+pub(crate) fn note_file_in(dir: &Path, key: &str) -> PathBuf {
+    dir.join(format!("{key}.json"))
 }
 
 /// Fixed filename for the cross-session global note — not tab-keyed, shared
@@ -223,6 +239,43 @@ pub fn global_path() -> Option<PathBuf> {
         StoreBase::PluginState(dir) => global_dir_path(&dir),
         StoreBase::Config(base) => global_path_in(&base),
     })
+}
+
+/// The cross-session global note for THIS process, with the same one-time
+/// migration `load()` gives the tab note. Without it, a user who previously
+/// resolved the config layout (`HERDR_ENV=1` with no `HERDR_PLUGIN_STATE_DIR`
+/// — the binary or `open-notes.ps1` run by hand in a pane) reads the one
+/// explicitly cross-session document back EMPTY after the store dir gained
+/// its middle tier, and the next keystroke writes a fresh `global.json` beside
+/// it while the old one orphans.
+pub fn load_global() -> Note {
+    match store_base() {
+        Some(StoreBase::PluginState(dir)) => load_global_state_dir(&dir, config_base().as_deref()),
+        Some(StoreBase::Config(base)) => read_note(&global_path_in(&base)),
+        None => Note::default(),
+    }
+}
+
+/// Load the global note from the plugin state dir, migrating from the
+/// config-dir layout the first time: if it is missing there, MOVE the
+/// config-dir one into place. A failed rename falls back to reading the source
+/// without moving it; when both exist the state-dir one wins and the config
+/// file is untouched. Same shape as `load_state_dir`, which does this for the
+/// tab note — there is no second pattern here on purpose.
+fn load_global_state_dir(dir: &Path, config: Option<&Path>) -> Note {
+    let path = global_dir_path(dir);
+    if !path.exists()
+        && let Some(base) = config
+    {
+        let src = global_path_in(base);
+        if src.exists() {
+            let moved = std::fs::create_dir_all(dir).is_ok() && std::fs::rename(&src, &path).is_ok();
+            if !moved {
+                return read_note(&src);
+            }
+        }
+    }
+    read_note(&path)
 }
 
 pub fn load() -> Note {
@@ -786,6 +839,66 @@ mod tests {
         // Nothing anywhere is still just an empty note.
         assert_eq!(load_state_dir(&dir, Some(&base), Some("w9")), Note::default());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn global_note_migrates_from_the_config_layout_once() {
+        // The global note is the one document that is explicitly
+        // cross-session, so it needs the same one-time move into the plugin
+        // state dir that the tab note gets — otherwise a user who previously
+        // resolved the config layout reads it back EMPTY after the upgrade.
+        let base = temp_base("global-migrate");
+        let dir = base.join("plugin-state");
+        let cfg = global_path_in(&base);
+        std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+        write_note(&cfg, "shared note");
+
+        assert_eq!(load_global_state_dir(&dir, Some(&base)).text, "shared note");
+        assert!(!cfg.exists(), "moved, not copied");
+        assert!(global_dir_path(&dir).exists());
+        // Second load reads the migrated file; nothing left to migrate.
+        assert_eq!(load_global_state_dir(&dir, Some(&base)).text, "shared note");
+
+        // A state-dir global already in place wins; a lingering config one is
+        // left untouched rather than clobbering it.
+        write_note(&cfg, "stale");
+        assert_eq!(load_global_state_dir(&dir, Some(&base)).text, "shared note");
+        assert!(cfg.exists(), "config file untouched when both exist");
+
+        // Nothing anywhere is still just an empty note, and no config base at
+        // all (outside herdr, no APPDATA) must not panic.
+        let empty = temp_base("global-empty");
+        assert_eq!(load_global_state_dir(&empty.join("plugin-state"), Some(&empty)), Note::default());
+        assert_eq!(load_global_state_dir(&empty.join("plugin-state"), None), Note::default());
+
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&empty);
+    }
+
+    #[test]
+    fn note_file_in_is_the_only_spelling_of_a_store_dir_note() {
+        // `prompts::capture`'s gate 4 checks for this tab's note file in a
+        // SECOND process; it must not re-derive the filename itself, or a
+        // future layout change silently stops capture with no diagnostic.
+        let dir = Path::new("store");
+        let key = id_key("w6:t1").unwrap();
+        assert_eq!(note_file_in(dir, &key), dir.join(format!("{key}.json")));
+        assert_eq!(state_dir_path(dir, Some("w6:t1")), note_file_in(dir, &key));
+    }
+
+    #[test]
+    fn a_second_colon_is_not_filename_safe() {
+        // Real herdr ids are `<workspace>:<n>` — exactly one separator. A
+        // malformed `a::b` would otherwise sanitize to a key containing `__`,
+        // the very separator `prompts::load_for_tab` relies on to keep one
+        // tab's prompt files out of another's.
+        assert_eq!(id_key("a::b"), None);
+        assert_eq!(id_key(":::"), None);
+        assert_eq!(note_key(Some("a::b")), None);
+        assert_eq!(state_path_in(Path::new("base"), Some("a::b")), legacy_path_in(Path::new("base")));
+        // The single-separator form and a bare id still key normally.
+        assert!(id_key("w6:t1").is_some());
+        assert!(id_key("w6").is_some());
     }
 
     #[test]
