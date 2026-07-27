@@ -10,6 +10,7 @@ mod ipc;
 mod launch;
 mod markdown;
 mod state;
+mod template;
 
 use std::io::Read;
 use std::time::Duration;

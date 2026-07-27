@@ -338,9 +338,13 @@ pub fn to_json(note: &Note) -> String {
     .to_string()
 }
 
-/// A note with no text and no title carries nothing worth a file.
+/// A note with no title and no text carries nothing worth a file — and
+/// neither does one that is still the untouched seed template, or every tab
+/// where someone pressed `e` once would leave an orphan file forever (tab ids
+/// are never reused, so nothing reclaims them).
 pub fn is_blank(note: &Note) -> bool {
-    note.text.trim().is_empty() && note.title.trim().is_empty()
+    note.title.trim().is_empty()
+        && (note.text.trim().is_empty() || note.text == crate::template::DEFAULT)
 }
 
 /// Whether the tab that owns a note is still open.
@@ -677,6 +681,17 @@ mod tests {
         persist_at(&path, &Note::default(), "w1:t2", 2);
         assert!(!path.exists(), "blank note deletes its file");
         let _ = std::fs::remove_dir_all(dir.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn pristine_template_counts_as_blank() {
+        let mut n = Note { text: crate::template::DEFAULT.to_string(), ..Note::default() };
+        assert!(is_blank(&n), "seeded but untouched = nothing worth a file");
+        n.text.push_str("shipped the thing");
+        assert!(!is_blank(&n), "one edited char makes it a real note");
+        n.text = crate::template::DEFAULT.to_string();
+        n.title = "HM-54271".into();
+        assert!(!is_blank(&n), "a title alone makes it a real note");
     }
 
     #[test]

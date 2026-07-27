@@ -19,14 +19,25 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::markdown::render_markdown;
 use crate::state::{self, METADATA_SOURCE, Mode, Note, PANE_LABEL};
+use crate::template;
 
 /// Debounce for the edit-mode autosave.
 const AUTOSAVE_AFTER: Duration = Duration::from_secs(2);
 /// Identity re-stamp interval (launcher stale threshold is 20s).
 const HEARTBEAT_EVERY: Duration = Duration::from_secs(5);
 
-/// Shown in preview when the note is empty; doubles as the quick-start help.
-const EMPTY_HELP: &str = "(empty note)\n\n  e or Enter        start writing\n  Esc               back to preview (saves)\n  Up/Dn PgUp/PgDn   scroll, g/G top/bottom\n  x                 clear the note (asks first)\n  q                 quit\n\nEverything autosaves and survives restarts.";
+/// Shown in preview when the note is empty: the skeleton `e` would seed,
+/// plus the quick-start help. Built from `template::DEFAULT` so the preview
+/// cannot advertise a template different from the one that gets written.
+fn empty_help() -> String {
+    format!(
+        "(empty note — press e to start with this template)\n\n{}\n\
+         \n  e or Enter  start writing\
+         \n  l           all notes\
+         \n  q           quit\n\nEverything autosaves and survives restarts.",
+        template::DEFAULT
+    )
+}
 
 /// One row in the list overlay.
 struct OverlayEntry {
@@ -603,8 +614,22 @@ impl App {
     }
 
     fn enter_edit(&mut self) {
+        // Lazy seed: a tab you merely toggled Notes into and never edited
+        // still writes no file. `dirty` so the seed survives to the next
+        // autosave; `is_blank` deletes it again if it stays untouched.
+        if self.note.text.trim().is_empty() {
+            self.note.text = template::DEFAULT.to_string();
+            self.dirty = true;
+            self.last_edit = Instant::now();
+        }
         self.lines = self.note.text.split('\n').map(String::from).collect();
-        self.row = 0;
+        // Land on the status placeholder — the first thing worth writing.
+        self.row = self
+            .lines
+            .iter()
+            .position(|l| l.starts_with('<'))
+            .unwrap_or(0)
+            .min(self.lines.len().saturating_sub(1));
         self.col = 0;
         self.edit_scroll = 0;
         self.note.mode = Mode::Edit;
@@ -807,7 +832,7 @@ impl App {
         if self.note.text.trim().is_empty() {
             self.preview_scroll = 0;
             frame.render_widget(
-                Paragraph::new(EMPTY_HELP).style(Style::default().add_modifier(Modifier::DIM)),
+                Paragraph::new(empty_help()).style(Style::default().add_modifier(Modifier::DIM)),
                 area,
             );
             return None;
@@ -1160,6 +1185,31 @@ mod tests {
     }
 
     #[test]
+    fn first_edit_seeds_the_template() {
+        let mut a = app("");
+        a.on_key(key(KeyCode::Char('e')));
+        assert_eq!(a.note.text, crate::template::DEFAULT);
+        assert_eq!(a.lines[a.row], "<one line: where this stands>", "cursor on the status line");
+        assert_eq!(a.col, 0);
+        assert!(a.dirty, "the seed must reach disk on the next flush");
+    }
+
+    #[test]
+    fn edit_does_not_seed_over_existing_text() {
+        let mut a = app("already written");
+        a.on_key(key(KeyCode::Char('e')));
+        assert_eq!(a.note.text, "already written");
+    }
+
+    #[test]
+    fn empty_preview_shows_the_template_skeleton() {
+        let mut a = app("");
+        let screen = rendered(&mut a, 60, 24);
+        assert!(screen.contains("## Status"), "{screen}");
+        assert!(screen.contains("## Next"), "{screen}");
+    }
+
+    #[test]
     fn esc_never_quits_and_q_quits_only_in_preview() {
         let mut a = app("x");
         assert!(!a.on_key(key(KeyCode::Esc)), "Esc in preview must not quit");
@@ -1216,7 +1266,11 @@ mod tests {
         // Plain Ctrl+char stays a shortcut, never inserts.
         a.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
         a.on_key(key(KeyCode::Esc));
-        assert_eq!(a.note.text, "@");
+        // Entering edit on an empty note seeds the template and lands the
+        // cursor at col 0 of the status placeholder line, so the inserted
+        // char lands right before it.
+        let expected = crate::template::DEFAULT.replacen("<one", "@<one", 1);
+        assert_eq!(a.note.text, expected);
     }
 
     #[test]
@@ -1228,7 +1282,10 @@ mod tests {
         a.last_edit = Instant::now() - AUTOSAVE_AFTER;
         a.maybe_flush();
         assert!(!a.dirty);
-        assert_eq!(a.note.text, "z", "flush committed the edit buffer");
+        // Entering edit on an empty note seeds the template first, so the
+        // typed char lands at col 0 of the status placeholder line.
+        let expected = crate::template::DEFAULT.replacen("<one", "z<one", 1);
+        assert_eq!(a.note.text, expected, "flush committed the edit buffer");
     }
 
     #[test]
