@@ -72,6 +72,30 @@ findings doc (and the reference implementation, `herdr-sidebar`) lives in
   (one source line can wrap to several rows, which all map back to it);
   `render_markdown` is now a thin wrapper over the mapped form with its
   signature unchanged
+- `src/prompts.rs` — prompt capture storage for the `--capture-prompt` hook
+  mode (a `UserPromptSubmit` hook piping its JSON payload into the binary; see
+  Gotchas). One file PER PANE, not per tab —
+  `<tab-key>__<pane-key>.prompts.json` in the same store dir as note files,
+  keys from `state::id_key` so both layouts agree on what an id spells on
+  disk — because a tab can hold several agent panes and a shared per-tab file
+  would mean concurrent read-modify-write from independent hook processes. A
+  ring of the last `RING` (3) prompts per pane file; each prompt is condensed
+  to its first line, trimmed, cut to `MAX_CHARS` (120) with a trailing
+  ellipsis, so nothing sits on disk that isn't also shown. `load_for_tab`
+  merges every pane file belonging to a tab, newest `ts` first (ties broken by
+  pane then text, since `read_dir` order isn't guaranteed across platforms),
+  capped at `RING`. `capture` is a gate chain — the `HERDR_NOTES_NO_CAPTURE`
+  off switch, running inside herdr, filename-safe tab AND pane ids, an
+  existing note file for this tab (no note, no capture — a tab that never
+  opened Notes gets no prompt file either), a usable `prompt` field in the
+  hook's stdin payload — every rejection silent and total, because the caller
+  runs inside a `UserPromptSubmit` hook. `App.prompts` (`app.rs`) re-reads via
+  `load_for_tab` on the 5s heartbeat and renders a dim "Last Prompts" block
+  above the note in preview, gated on `showing_tab_note()` (the global note is
+  not a tab and carries no prompts); the block is blank for up to 5s after the
+  pane opens and after switching back from the global note, because the
+  refresh only runs on that throttled heartbeat — a known rough edge, not a
+  capture failure
 - `src/template.rs` — the Status/Next/Notes skeleton, one const. Every
   section ships EMPTY — no placeholder prose: edit mode has no line-kill,
   word-delete or selection, so a placeholder would cost `End` plus one
@@ -89,7 +113,17 @@ findings doc (and the reference implementation, `herdr-sidebar`) lives in
   `%LOCALAPPDATA%\herdr\plugins\herdr-notes\` — the docs-mandated home for
   durable plugin state; actions get the env var and the launchers pass it
   into the pane via `pane split --env`, the unix `[[panes]]` entry gets it
-  natively). Without it (binary run by hand): config-dir fallback
+  natively). `store_base` has a THIRD tier between that and the config-dir
+  fallback: `HERDR_ENV == "1"` with no explicit `HERDR_PLUGIN_STATE_DIR` also
+  resolves the conventional plugin state dir (same path as above), rather than
+  falling through to the config layout. This exists for the `--capture-prompt`
+  hook — verified live, a Claude Code agent pane inside herdr inherits
+  `HERDR_ENV`/`HERDR_TAB_ID`/`HERDR_PANE_ID` but NOT the plugin-scoped
+  `HERDR_PLUGIN_STATE_DIR` (that var is injected only into the Notes pane
+  itself). Without this tier the hook process and the Notes pane would
+  resolve two different directories for the same tab and silently disagree
+  about where a captured prompt lives. Without it (binary run by hand):
+  config-dir fallback
   `%APPDATA%\herdr\notes\<tab-key>.json` (unix:
   `$XDG_CONFIG_HOME|~/.config/herdr/notes/`); the state dir migrates
   fallback-layout files in on first load. Keyed by the
@@ -286,6 +320,19 @@ Learned building this plugin:
   startup. Seeding there — rather than only on the interactive `e` — would
   give a titled, bodyless note a body nobody typed and autosave it 2s later.
   Seed on the interactive path only.
+- `UserPromptSubmit` hooks must exit 0 and print nothing: a non-zero exit
+  blocks the user's prompt from being sent, and Claude Code injects whatever
+  the hook writes to stdout into that prompt as context. `--capture-prompt`
+  therefore always returns `Ok(())` regardless of whether `capture_from_env`
+  actually wrote an entry, and never prints — a genuine capture failure must
+  fail exactly as silently as an intentional gate rejection.
+- `list_notes` filters on extension `json`, and `<tab-key>__<pane-key>.prompts.json`
+  also ends in `.json` — without an explicit skip for that suffix, every
+  prompt file becomes a junk row in the notes overlay.
+- Prompt storage is one file PER PANE, not per tab: a tab can hold several
+  agent panes, and a shared per-tab file would mean concurrent
+  read-modify-write from independent hook processes (each `UserPromptSubmit`
+  fires as its own short-lived process with no coordination between panes).
 
 ## README screenshots (Alex's criteria — follow on every reshoot)
 

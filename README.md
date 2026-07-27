@@ -129,6 +129,54 @@ across tabs — title (or "(untitled)"), age, and whether its tab is still
 open (`live`/`closed`/`?`) — with read-only preview, rename, and delete
 built in.
 
+## Prompt capture
+
+Notes can show the last few prompts you typed into a Claude Code pane sharing
+the tab, so you don't lose track of what you asked for while you're jotting
+things down beside it. A `UserPromptSubmit` hook writes each prompt (first
+line, truncated) to a small per-pane file; the pane merges every agent pane's
+file for the tab and renders a dim "Last Prompts" block above the note in
+preview.
+
+Install the hook into your global Claude Code settings:
+
+```
+pwsh scripts/install-prompt-hook.ps1
+```
+
+It's idempotent — re-run it any time (after a rebuild, say) and it replaces
+just this plugin's entry, leaving every other hook untouched. It backs up
+`~/.claude/settings.json` first (`~/.claude/settings.json.herdr-notes.bak`).
+Pass `-Remove` to uninstall.
+
+Would rather not run a script against your global settings? Add this to the
+`hooks.UserPromptSubmit` array in `~/.claude/settings.json` yourself:
+
+```json
+{
+  "hooks": [
+    {
+      "type": "command",
+      "command": "\"C:\\path\\to\\herdr-notes\\target\\release\\herdr-notes.exe\" --capture-prompt",
+      "timeout": 5
+    }
+  ]
+}
+```
+
+Set `HERDR_NOTES_NO_CAPTURE=1` in the environment to turn capture off without
+touching the hook registration.
+
+Known limits:
+
+- Claude Code only — the hook fires on `UserPromptSubmit`, which Codex has no
+  equivalent for, so Codex panes capture nothing.
+- The tab's note must exist first — capture is a no-op until Notes has been
+  opened at least once in that tab, so a tab that never wanted a note never
+  gets a prompt file either.
+- Pane files orphan — like the note files themselves, a pane's `.prompts.json`
+  outlives its closed pane; nothing prunes it.
+
 ## Hacking
 
 `CLAUDE.md` has the build/dev workflow and the hard-won herdr/Windows
