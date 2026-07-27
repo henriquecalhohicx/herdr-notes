@@ -227,7 +227,7 @@ pub struct App {
     /// pane's file by `prompts::load_for_tab`, refreshed on the heartbeat
     /// rather than per draw (a directory scan every 500ms frame is waste).
     /// Rendered above the note, never part of the edit buffer.
-    prompts: Vec<crate::prompts::Prompt>,
+    prompts: Vec<crate::prompts::PromptGroup>,
     confirm_clear: bool,
     dirty: bool,
     last_edit: Instant,
@@ -1022,7 +1022,13 @@ impl App {
         // without going through it, so the render site re-checks
         // `showing_tab_note()` itself rather than trusting that invariant to
         // still hold by the time we draw.
-        let block = if self.showing_tab_note() { prompt_block(&self.prompts, text_w) } else { Vec::new() };
+        // TASK 1 TEMPORARY FLATTEN (Task 3 replaces this with real grouping):
+        // `prompt_block` still renders a flat `&[Prompt]`, so the per-pane
+        // groups are flattened back into one list — byte-identical to the
+        // pre-grouping render.
+        let flat: Vec<crate::prompts::Prompt> =
+            self.prompts.iter().flat_map(|g| g.prompts.iter()).cloned().collect();
+        let block = if self.showing_tab_note() { prompt_block(&flat, text_w) } else { Vec::new() };
         if self.note.text.trim().is_empty() {
             // The block is at most RING + 2 rows, so nothing scrolls here and
             // both the zeroed scroll and the `None` hint stay correct.
@@ -1476,6 +1482,14 @@ mod tests {
         crate::prompts::Prompt { ts, pane: "w1:p5".into(), agent: "claude".into(), text: text.into() }
     }
 
+    /// TASK 1 TEMPORARY: wraps a fixture's flat prompt list into the single
+    /// pane group `App.prompts` now holds, so these pre-grouping fixtures
+    /// keep compiling. `prompt()` always stamps pane "w1:p5", so one group
+    /// is enough. Task 3 replaces this with real multi-pane fixtures.
+    fn group(prompts: Vec<crate::prompts::Prompt>) -> crate::prompts::PromptGroup {
+        crate::prompts::PromptGroup { pane: "w1:p5".into(), prompts }
+    }
+
     /// The env var `state::config_base()` reads. Tests that drive real
     /// persistence must redirect the MIGRATION SOURCE as well as the store
     /// dir: the tab note and (since the global note got the same one-time
@@ -1516,7 +1530,7 @@ mod tests {
     #[test]
     fn preview_renders_the_prompt_block_above_the_note() {
         let mut a = app("## Status\nmid-refactor");
-        a.prompts = vec![prompt(2, "add the rate limiter"), prompt(1, "why is auth flaky")];
+        a.prompts = vec![group(vec![prompt(2, "add the rate limiter"), prompt(1, "why is auth flaky")])];
         let screen = rendered(&mut a, 60, 14);
         assert!(screen.contains("Last Prompts"), "{screen}");
         assert!(screen.contains("add the rate limiter"), "{screen}");
@@ -1534,12 +1548,12 @@ mod tests {
     #[test]
     fn the_prompt_block_never_shows_on_the_global_note_or_in_edit_mode() {
         let mut a = app("## Status\nmid-refactor");
-        a.prompts = vec![prompt(1, "add the rate limiter")];
+        a.prompts = vec![group(vec![prompt(1, "add the rate limiter")])];
         a.active = ActiveNote::Global;
         assert!(!rendered(&mut a, 60, 14).contains("Last Prompts"), "global is not a tab");
 
         let mut b = app("## Status\nmid-refactor");
-        b.prompts = vec![prompt(1, "add the rate limiter")];
+        b.prompts = vec![group(vec![prompt(1, "add the rate limiter")])];
         b.on_key(key(KeyCode::Char('e')));
         assert!(!rendered(&mut b, 60, 14).contains("Last Prompts"), "the edit buffer is yours alone");
     }
@@ -1552,7 +1566,7 @@ mod tests {
         // nothing but the help forever and capture looks broken.
         let mut a = app("");
         a.note.title = "Auth refactor".into();
-        a.prompts = vec![prompt(1, "why is auth flaky")];
+        a.prompts = vec![group(vec![prompt(1, "why is auth flaky")])];
         let screen = rendered(&mut a, 60, 24);
         assert!(screen.contains("Last Prompts"), "{screen}");
         assert!(screen.contains("why is auth flaky"), "{screen}");
@@ -1564,7 +1578,7 @@ mod tests {
         // The showing_tab_note() gate applies on this path exactly as it does
         // on the rendered-note one.
         let mut b = app("");
-        b.prompts = vec![prompt(1, "why is auth flaky")];
+        b.prompts = vec![group(vec![prompt(1, "why is auth flaky")])];
         b.active = ActiveNote::Global;
         assert!(
             !rendered(&mut b, 60, 24).contains("Last Prompts"),
@@ -1581,7 +1595,7 @@ mod tests {
         // below is what actually exercises the map's two real consumers (the
         // REVERSED highlight and the follow-scroll arithmetic).
         let mut a = app("[ ] first\n[ ] second");
-        a.prompts = vec![prompt(2, "add the rate limiter"), prompt(1, "why is auth flaky")];
+        a.prompts = vec![group(vec![prompt(2, "add the rate limiter"), prompt(1, "why is auth flaky")])];
         let _ = rendered(&mut a, 60, 14);
         a.on_key(key(KeyCode::Char('j')));
         assert_eq!(a.box_cursor, Some(0));
@@ -1622,7 +1636,7 @@ mod tests {
         // `prompt_block_truncates_by_display_columns` above is what actually
         // proves the truncation.
         let mut a = app("## Status\nmid-refactor");
-        a.prompts = vec![prompt(1, &"z".repeat(200))];
+        a.prompts = vec![group(vec![prompt(1, &"z".repeat(200))])];
         let screen = rendered(&mut a, 30, 14);
         for line in screen.lines() {
             assert!(dwidth(line.trim_end()) <= 30, "row overflows the pane: {line:?}");
@@ -1644,7 +1658,7 @@ mod tests {
         let _ = rendered(&mut bare, 60, 14);
 
         let mut with_block = app(&text);
-        with_block.prompts = vec![prompt(2, "add the rate limiter"), prompt(1, "why is auth flaky")];
+        with_block.prompts = vec![group(vec![prompt(2, "add the rate limiter"), prompt(1, "why is auth flaky")])];
         for _ in 0..40 {
             with_block.on_key(key(KeyCode::Char('j')));
         }
@@ -1653,7 +1667,10 @@ mod tests {
         // Matches draw_preview's own `text_w` derivation: area.width - 1 for
         // the scrollbar column, with the 60-wide `rendered()` call above.
         let text_w = usize::from(60u16).saturating_sub(1).max(1);
-        let block_rows = prompt_block(&with_block.prompts, text_w).len();
+        // TASK 1 TEMPORARY FLATTEN: mirrors draw_preview's own flatten above.
+        let flat: Vec<crate::prompts::Prompt> =
+            with_block.prompts.iter().flat_map(|g| g.prompts.iter()).cloned().collect();
+        let block_rows = prompt_block(&flat, text_w).len();
         assert!(block_rows > 0, "the fixture must actually produce a block");
         assert_eq!(
             with_block.preview_scroll,
@@ -2282,7 +2299,7 @@ mod tests {
         let mut a = App::new();
         assert_eq!(a.note.text, "TAB BODY");
         assert_eq!(
-            a.prompts.iter().map(|p| p.text.as_str()).collect::<Vec<_>>(),
+            a.prompts.iter().flat_map(|g| g.prompts.iter()).map(|p| p.text.as_str()).collect::<Vec<_>>(),
             vec!["why is auth flaky"],
             "the prompt block must be populated at construction, not up to 5s later"
         );
