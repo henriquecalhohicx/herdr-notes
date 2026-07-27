@@ -149,6 +149,11 @@ just this plugin's entry, leaving every other hook untouched. It backs up
 `~/.claude/settings.json` first (`~/.claude/settings.json.herdr-notes.bak`).
 Pass `-Remove` to uninstall.
 
+The installer only ever touches its own hook entry: if you've merged the
+herdr-notes command into an existing `UserPromptSubmit` entry alongside some
+other tool, re-running it (or `-Remove`) drops just the herdr-notes hook
+object and leaves every sibling hook in that entry alone.
+
 Would rather not run a script against your global settings? Add this to the
 `hooks.UserPromptSubmit` array in `~/.claude/settings.json` yourself:
 
@@ -167,15 +172,18 @@ Would rather not run a script against your global settings? Add this to the
 Set `HERDR_NOTES_NO_CAPTURE=1` in the environment to turn capture off without
 touching the hook registration.
 
-Known limits:
+Known limits, from the design doc:
 
-- Claude Code only — the hook fires on `UserPromptSubmit`, which Codex has no
-  equivalent for, so Codex panes capture nothing.
-- The tab's note must exist first — capture is a no-op until Notes has been
-  opened at least once in that tab, so a tab that never wanted a note never
-  gets a prompt file either.
-- Pane files orphan — like the note files themselves, a pane's `.prompts.json`
-  outlives its closed pane; nothing prunes it.
+- **Codex panes capture nothing.** Codex has no submit-time hook equivalent to
+  `UserPromptSubmit`. On a mixed grid, only the Claude panes will have
+  history. This is a gap in the ecosystem, not something this design can
+  close.
+- **The note must exist first.** Open Notes in a tab, write something, and
+  only then do prompts start accumulating. "I opened Notes and see no
+  prompts" is the expected behavior on a fresh tab, not a bug.
+- **Pane files orphan** when their pane closes, exactly as note files orphan
+  when their tab closes. Tab and pane ids are never reused, so an orphan is a
+  dead file rather than a stale-content risk.
 
 ## Hacking
 
