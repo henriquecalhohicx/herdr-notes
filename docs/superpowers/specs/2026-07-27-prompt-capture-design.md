@@ -44,6 +44,23 @@ writers and the captured prompts never enter the note's text buffer.
   hook on this machine (`caveman-mode-tracker.js` reads `data.prompt`).
 - Hook entries take a `timeout` (herdr's uses 10, caveman's 5).
 
+> **AMENDED after Task 4 review (human partner's ruling).** This design assumed
+> the hook could resolve the same store dir as the Notes pane simply by both
+> reading `state::store_dir()`. A live check in a real herdr agent pane proved
+> that assumption wrong: the pane's environment carries `HERDR_ENV=1`,
+> `HERDR_TAB_ID`, `HERDR_PANE_ID`, etc., but `HERDR_PLUGIN_STATE_DIR` is
+> plugin-scoped — herdr injects it only into the Notes pane itself (via
+> `pane split --env`/the unix `[[panes]]` entry), never into a Claude Code
+> agent pane. Left alone, the hook would fall through to the config-dir
+> layout while the pane resolved the plugin-state layout, and gate 4 (no note
+> file for this tab) would never fire for a real user because it would be
+> checking the wrong directory. `state::store_base()` now adds a middle tier:
+> `HERDR_PLUGIN_STATE_DIR` set and non-empty still wins outright (the pane),
+> but `HERDR_ENV == "1"` alone (no explicit dir — the hook) now resolves the
+> conventional plugin state dir (`%LOCALAPPDATA%\herdr\plugins\herdr-notes` /
+> `$XDG_DATA_HOME/herdr/plugins/herdr-notes`) instead of degrading to the
+> config layout. See `src/state.rs`.
+
 ## User decisions (approved)
 
 - **Capture only when the tab already has a note file.** No note, no capture,

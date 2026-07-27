@@ -65,6 +65,20 @@ pub struct Note {
 /// it through `pane split --env`). A TUI started by hand has neither, so the
 /// pre-existing config-dir layout stays as the fallback — and as the
 /// migration source when the state dir is empty.
+///
+/// A third case sits between those two: the `--capture-prompt` hook runs as a
+/// child of Claude Code inside an AGENT pane, not a plugin-run command. Verified
+/// live — that pane's environment carries `HERDR_ENV=1`, `HERDR_TAB_ID`,
+/// `HERDR_PANE_ID`, etc., but NOT `HERDR_PLUGIN_STATE_DIR` (that var is
+/// plugin-scoped, injected only into the Notes pane itself by
+/// `open-notes.ps1`/the unix `[[panes]]` entry). Without the middle tier below,
+/// the hook would fall all the way through to the config-dir layout while the
+/// Notes pane resolves the plugin-state layout — two processes disagreeing on
+/// one file means captured prompts are written where the pane never reads them.
+/// So `HERDR_ENV == "1"` alone (no explicit dir) resolves the CONVENTIONAL
+/// plugin state dir instead of degrading to config-dir, keeping the hook and
+/// the pane on the same file without the hook needing its own copy of
+/// `HERDR_PLUGIN_STATE_DIR`.
 enum StoreBase {
     /// `HERDR_PLUGIN_STATE_DIR`: files live directly in the dir
     /// (`<dir>/<key>.json`, no-tab fallback `<dir>/note.json`).
@@ -78,7 +92,28 @@ fn store_base() -> Option<StoreBase> {
     if let Some(dir) = std::env::var_os("HERDR_PLUGIN_STATE_DIR").filter(|d| !d.is_empty()) {
         return Some(StoreBase::PluginState(PathBuf::from(dir)));
     }
+    if std::env::var("HERDR_ENV").as_deref() == Ok("1")
+        && let Some(dir) = plugin_state_default()
+    {
+        return Some(StoreBase::PluginState(dir));
+    }
     config_base().map(StoreBase::Config)
+}
+
+/// The conventional plugin state dir a hook process falls back to when
+/// `HERDR_PLUGIN_STATE_DIR` isn't in its environment but `HERDR_ENV == "1"`
+/// says it's running inside herdr: `%LOCALAPPDATA%\herdr\plugins\herdr-notes`
+/// on Windows, `$XDG_DATA_HOME/herdr/plugins/herdr-notes` elsewhere, falling
+/// back to `$HOME/.local/share/herdr/plugins/herdr-notes`. `None` when even
+/// the base var is missing.
+fn plugin_state_default() -> Option<PathBuf> {
+    #[cfg(windows)]
+    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    #[cfg(not(windows))]
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share")));
+    base.map(|b| b.join("herdr").join("plugins").join("herdr-notes"))
 }
 
 /// Platform config base (`%APPDATA%` / `$XDG_CONFIG_HOME` / `~/.config`),
@@ -474,6 +509,95 @@ pub fn set_title(file: &Path, title: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializes the tests below that mutate process-global `HERDR_*` env
+    /// vars (`store_base` reads them directly). No non-env test reads these.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn store_base_prefers_explicit_plugin_state_dir_over_herdr_env() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_dir = std::env::var_os("HERDR_PLUGIN_STATE_DIR");
+        let prev_env = std::env::var_os("HERDR_ENV");
+        // SAFETY: serialized by ENV_LOCK; restored below.
+        unsafe {
+            std::env::set_var("HERDR_PLUGIN_STATE_DIR", "explicit-plugin-dir");
+            std::env::set_var("HERDR_ENV", "1");
+        }
+        match store_base() {
+            Some(StoreBase::PluginState(dir)) => {
+                assert_eq!(dir, PathBuf::from("explicit-plugin-dir"), "explicit var always wins");
+            }
+            other => panic!("expected PluginState(explicit-plugin-dir), got is_plugin_state={:?}", other.is_some()),
+        }
+        unsafe {
+            match prev_dir {
+                Some(v) => std::env::set_var("HERDR_PLUGIN_STATE_DIR", v),
+                None => std::env::remove_var("HERDR_PLUGIN_STATE_DIR"),
+            }
+            match prev_env {
+                Some(v) => std::env::set_var("HERDR_ENV", v),
+                None => std::env::remove_var("HERDR_ENV"),
+            }
+        }
+    }
+
+    #[test]
+    fn store_base_falls_back_to_the_conventional_plugin_dir_under_herdr_env() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_dir = std::env::var_os("HERDR_PLUGIN_STATE_DIR");
+        let prev_env = std::env::var_os("HERDR_ENV");
+        unsafe {
+            std::env::remove_var("HERDR_PLUGIN_STATE_DIR");
+            std::env::set_var("HERDR_ENV", "1");
+        }
+        // The hook's own environment (a Claude Code agent pane inside herdr):
+        // HERDR_ENV=1 but no HERDR_PLUGIN_STATE_DIR — must land on the same
+        // conventional dir the pane would use, not the config layout.
+        let expected = plugin_state_default().expect("LOCALAPPDATA/XDG_DATA_HOME/HOME must be set in test env");
+        match store_base() {
+            Some(StoreBase::PluginState(dir)) => assert_eq!(dir, expected),
+            other => panic!("expected PluginState({expected:?}), got is_plugin_state={:?}", other.is_some()),
+        }
+        unsafe {
+            match prev_dir {
+                Some(v) => std::env::set_var("HERDR_PLUGIN_STATE_DIR", v),
+                None => std::env::remove_var("HERDR_PLUGIN_STATE_DIR"),
+            }
+            match prev_env {
+                Some(v) => std::env::set_var("HERDR_ENV", v),
+                None => std::env::remove_var("HERDR_ENV"),
+            }
+        }
+    }
+
+    #[test]
+    fn store_base_uses_the_config_layout_when_neither_var_is_set() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_dir = std::env::var_os("HERDR_PLUGIN_STATE_DIR");
+        let prev_env = std::env::var_os("HERDR_ENV");
+        unsafe {
+            std::env::remove_var("HERDR_PLUGIN_STATE_DIR");
+            std::env::remove_var("HERDR_ENV");
+        }
+        // Neither the pane's nor the hook's herdr signal is present — running
+        // by hand, outside herdr entirely.
+        match (store_base(), config_base()) {
+            (Some(StoreBase::Config(got)), Some(expected)) => assert_eq!(got, expected),
+            (None, None) => {}
+            (got, expected) => panic!("expected Config({expected:?}), got is_config={:?}", got.is_some()),
+        }
+        unsafe {
+            match prev_dir {
+                Some(v) => std::env::set_var("HERDR_PLUGIN_STATE_DIR", v),
+                None => std::env::remove_var("HERDR_PLUGIN_STATE_DIR"),
+            }
+            match prev_env {
+                Some(v) => std::env::set_var("HERDR_ENV", v),
+                None => std::env::remove_var("HERDR_ENV"),
+            }
+        }
+    }
 
     #[test]
     fn roundtrip_preserves_text_and_mode() {
