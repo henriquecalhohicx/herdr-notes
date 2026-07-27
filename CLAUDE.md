@@ -26,11 +26,17 @@ findings doc (and the reference implementation, `herdr-sidebar`) lives in
   cursor merely existing instead would re-force the viewport to it on every
   draw and make `Up`/`Down`/`g`/`G`/PgUp/PgDn look broken the instant a
   cursor is set. A fresh note is seeded with `template::DEFAULT` on the
-  first `e` (lazy — a tab you only toggled Notes into writes no file); the
-  header shows mode, title, scroll hint, then the note's age last (so age is
-  the first thing clipped on a narrow dock); the footer has a full and a
-  short form (`PREVIEW_HINTS`/`PREVIEW_HINTS_SHORT`), chosen by pane width
-  so a narrow dock never clips `q quit`. There is also a notes-list overlay
+  first INTERACTIVE `e` (lazy — a tab you only toggled Notes into writes no
+  file; `enter_edit(seed)` takes the flag so restoring a persisted
+  `mode: "edit"` never seeds), landing the cursor on the template's blank
+  line under `## Status` so the first keystroke IS the status; the header
+  shows mode, title, scroll hint, then the note's age last and
+  ALL-OR-NOTHING (pushed only when the whole `2h ago` token fits the header
+  width, measured in display columns — never clipped to `2h ag`); the footer
+  has a full (69-col) and a short (37-col) form
+  (`PREVIEW_HINTS`/`PREVIEW_HINTS_SHORT`), chosen by pane width, which drops
+  the floor for keeping `q quit` on screen from 69 columns to 37. There is
+  also a notes-list overlay
   (`l` in preview: navigate with Up/Down or j/k, `enter` opens a read-only
   scrollable preview of the selected note, `r` renames it, `d` deletes it
   with a y/N confirm, `esc`/`l` closes the overlay). v2 turned the overlay
@@ -46,7 +52,12 @@ findings doc (and the reference implementation, `herdr-sidebar`) lives in
   `[mode] — ★ Global`; the global row is immune to `r`/`d`/`g` and stays
   pinned+visible through any filter). Row layout fills the box inner width
   with balanced 1-space margins, truncating by unicode display width
-  (`format_row`/`dwidth`/`truncate_w`). NOTE: `is_self` self-mutation on
+  (`format_row`/`dwidth`/`truncate_w`); the note NAME keeps a `NAME_MIN`
+  (8-column) floor before the right-hand segment gets any budget
+  (`right_budget`), and that segment degrades in WHOLE tokens — progress
+  count first, then context (`fit_right`) — so a 40-column dock still shows
+  both a title and `workspace · agent` instead of one column of title.
+  NOTE: `is_self` self-mutation on
   delete/rename is gated on `showing_tab_note()` — acting on your own
   tab-note row while viewing the global note must NOT touch the global buffer
   (that path silently deleted `global.json`; see Gotchas)
@@ -58,7 +69,13 @@ findings doc (and the reference implementation, `herdr-sidebar`) lives in
   (one source line can wrap to several rows, which all map back to it);
   `render_markdown` is now a thin wrapper over the mapped form with its
   signature unchanged
-- `src/template.rs` — the Status/Next/Notes skeleton, one const. `is_blank`
+- `src/template.rs` — the Status/Next/Notes skeleton, one const. Every
+  section ships EMPTY — no placeholder prose: edit mode has no line-kill,
+  word-delete or selection, so a placeholder would cost `End` plus one
+  Backspace per character on every new note. The `[ ] ` line's TRAILING
+  SPACE is load-bearing (`is_blank` compares the buffer to the const with
+  `==`; whitespace-stripping editor tooling silently breaks it — verify with
+  `git show HEAD:src/template.rs | cat -A`). `is_blank`
   treats the pristine template as blank, so seeding cannot leak orphan files
 - `src/state.rs` — `{text, mode, title, tab_id, created, updated}` JSON (v2 —
   older `{text, mode}` files still load, missing fields fall back to
@@ -236,6 +253,36 @@ Learned building this plugin:
   viewport back to the cursor on every draw, so every other scroll key
   (`Up`/`Down`/`g`/`G`/PgUp/PgDn) looks broken the instant a checkbox cursor
   is set.
+- EVERY piece of per-document state must reset in `toggle_global`:
+  `preview_scroll`, `box_cursor` AND `follow_box` (`clear_box_cursor`).
+  Same class of bug as the `global.json` clobber above — a field added later
+  that the document swap does not know about. A `box_cursor` carried across
+  the swap highlights an arbitrary checkbox in the note you just opened to
+  READ, and one pager-habit `space` ticks it. The same clear belongs on
+  every text-wiping path (`x` confirm, overlay self-delete): a stale ordinal
+  is harmless only while the text is empty (`cursor_line()` returns None),
+  and stops being harmless the moment `e` re-seeds text under it.
+- `state::persist_at` stamps `created`/`updated` onto a CLONE of the note, so
+  `App::save` has to mirror them back onto `self.note` (hence `&mut self`).
+  Without that, the in-session note keeps whatever `load()` read at startup:
+  a note CREATED this session never shows an age at all (the `updated > 0`
+  gate), and an older one keeps ageing while you type into it — the header
+  says `3h ago` about text written thirty seconds ago while the overlay row
+  for the same file, which re-reads from disk, says `just now`.
+- Residual hole in the blank-note delete rule: `is_blank` matches the
+  pristine template EXACTLY, and preview-mode `space` writes into
+  `note.text` outside edit mode. So `e` (seeds) → `Esc` (correctly writes no
+  file) → `j` → `space` leaves the buffer at DEFAULT-with-`[x]`, no longer
+  `== DEFAULT`, and a file containing nothing but an empty skeleton with one
+  ticked empty box is written — orphaned forever (tab ids are never reused).
+  Two keystrokes. Known and ACCEPTED: do NOT widen `is_blank` to chase
+  template variants, that trades a dead file for a risk of deleting real
+  notes.
+- `mode: "edit"` persists on disk (`herdr pane close` sends no signal, so a
+  note autosaved mid-edit keeps it), and `with_note` re-enters edit at
+  startup. Seeding there — rather than only on the interactive `e` — would
+  give a titled, bodyless note a body nobody typed and autosave it 2s later.
+  Seed on the interactive path only.
 
 ## README screenshots (Alex's criteria — follow on every reshoot)
 

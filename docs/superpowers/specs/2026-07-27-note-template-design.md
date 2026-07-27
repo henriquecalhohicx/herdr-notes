@@ -66,6 +66,12 @@ Seed point: `App::enter_edit()`, when `note.text` is whitespace-empty. The edit
 cursor is placed at the start of the `<one line: where this stands>` line so the
 first keystroke replaces the placeholder region the user is looking at.
 
+> **SUPERSEDED by the final branch review (human partner's ruling).** Edit mode
+> has no line-kill, word-delete or selection, so nothing "replaces" the
+> placeholder — removing it costs `End` plus 29 Backspaces on every new note.
+> The placeholder line is now EMPTY and the seed path lands the cursor on it
+> (line index 1). See `src/template.rs` and `CLAUDE.md`.
+
 `App.note` is whichever buffer is active (`ActiveNote::Tab | Global`), so the
 global note gets the same treatment with no extra code. This is deliberate.
 
