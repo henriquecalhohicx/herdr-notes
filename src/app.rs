@@ -1024,10 +1024,18 @@ impl App {
         // still hold by the time we draw.
         // TASK 1 TEMPORARY FLATTEN (Task 3 replaces this with real grouping):
         // `prompt_block` still renders a flat `&[Prompt]`, so the per-pane
-        // groups are flattened back into one list — byte-identical to the
-        // pre-grouping render.
-        let flat: Vec<crate::prompts::Prompt> =
+        // groups are flattened back into one list. The OLD `load_for_tab`
+        // capped the MERGED list at RING; grouping caps per pane instead, so
+        // a multi-pane tab would otherwise hand `prompt_block` far more than
+        // RING rows (no truncation downstream — it renders everything it is
+        // given). Re-sort with the old merge's exact comparator and re-cap
+        // at RING here so this interim commit renders byte-identical to the
+        // pre-grouping binary; Task 3 replaces this whole flatten (sort,
+        // cap, and all) with real per-agent grouping.
+        let mut flat: Vec<crate::prompts::Prompt> =
             self.prompts.iter().flat_map(|g| g.prompts.iter()).cloned().collect();
+        flat.sort_by(|a, b| b.ts.cmp(&a.ts).then_with(|| a.pane.cmp(&b.pane)).then_with(|| a.text.cmp(&b.text)));
+        flat.truncate(crate::prompts::RING);
         let block = if self.showing_tab_note() { prompt_block(&flat, text_w) } else { Vec::new() };
         if self.note.text.trim().is_empty() {
             // The block is at most RING + 2 rows, so nothing scrolls here and
@@ -1667,9 +1675,13 @@ mod tests {
         // Matches draw_preview's own `text_w` derivation: area.width - 1 for
         // the scrollbar column, with the 60-wide `rendered()` call above.
         let text_w = usize::from(60u16).saturating_sub(1).max(1);
-        // TASK 1 TEMPORARY FLATTEN: mirrors draw_preview's own flatten above.
-        let flat: Vec<crate::prompts::Prompt> =
+        // TASK 1 TEMPORARY FLATTEN: mirrors draw_preview's own flatten-sort-cap
+        // above, so this test computes the same rows draw_preview actually
+        // renders.
+        let mut flat: Vec<crate::prompts::Prompt> =
             with_block.prompts.iter().flat_map(|g| g.prompts.iter()).cloned().collect();
+        flat.sort_by(|a, b| b.ts.cmp(&a.ts).then_with(|| a.pane.cmp(&b.pane)).then_with(|| a.text.cmp(&b.text)));
+        flat.truncate(crate::prompts::RING);
         let block_rows = prompt_block(&flat, text_w).len();
         assert!(block_rows > 0, "the fixture must actually produce a block");
         assert_eq!(
@@ -1677,6 +1689,42 @@ mod tests {
             bare.preview_scroll + block_rows,
             "the follow must offset by exactly the block's height"
         );
+    }
+
+    #[test]
+    fn the_interim_flatten_still_caps_the_block_at_ring() {
+        // TASK 1 TEMPORARY: guards the stopgap. Grouping caps per pane, so
+        // without a re-cap here a two-pane tab would render six rows where
+        // the pre-grouping binary rendered three. Task 3 deletes this test
+        // along with the flatten.
+        let mut a = app("## Status\nmid-refactor");
+        let mk = |pane: &str, base: u64| crate::prompts::PromptGroup {
+            pane: pane.into(),
+            prompts: (0..3)
+                .map(|i| crate::prompts::Prompt {
+                    ts: base + i,
+                    pane: pane.into(),
+                    agent: "claude".into(),
+                    text: format!("{pane}-{i}"),
+                })
+                .collect(),
+        };
+        a.prompts = vec![mk("w1:p5", 100), mk("w1:p6", 200)];
+        let screen = rendered(&mut a, 60, 20);
+        // Block rows are the only lines of the form "N. <text>" (`prompt_block`
+        // formats each entry as `"{}. {body}"`); the note body itself has no
+        // ordered-list markup in this fixture, so the leading-digit-then-dot
+        // shape uniquely identifies a block row and does not accidentally
+        // count "## Status" or "mid-refactor".
+        let rows = screen
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                let digits: String = t.chars().take_while(|c| c.is_ascii_digit()).collect();
+                !digits.is_empty() && t[digits.len()..].starts_with(". ")
+            })
+            .count();
+        assert_eq!(rows, crate::prompts::RING, "the interim block must still cap at RING: {screen}");
     }
 
     #[test]

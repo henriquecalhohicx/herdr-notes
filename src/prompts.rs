@@ -140,6 +140,10 @@ pub fn load_for_tab(dir: &Path, tab_key: &str) -> Vec<PromptGroup> {
         g.prompts.truncate(RING);
     }
     groups.sort_by(|a, b| {
+        // `unwrap_or(0)` is unreachable in practice: every `PromptGroup` above
+        // is created together with its first prompt (`vec![p]`), so `prompts`
+        // is never empty here. Kept defensive rather than `.unwrap()` in case
+        // that invariant ever grows an exception, without implying one exists.
         let newest = |g: &PromptGroup| g.prompts.first().map(|p| p.ts).unwrap_or(0);
         newest(b).cmp(&newest(a)).then_with(|| a.pane.cmp(&b.pane))
     });
