@@ -866,6 +866,14 @@ impl App {
                     Style::default().add_modifier(Modifier::DIM),
                 ));
             }
+            // Last, so it is the first thing clipped when the dock is narrow.
+            if self.note.updated > 0 {
+                let age = state::format_age(state::unix_now().saturating_sub(self.note.updated));
+                title.push(Span::styled(
+                    format!("  {age} ago"),
+                    Style::default().add_modifier(Modifier::DIM),
+                ));
+            }
         }
         frame.render_widget(Paragraph::new(Line::from(title)), title_a);
 
@@ -1257,6 +1265,22 @@ mod tests {
             Note { text: text.to_string(), mode: Mode::Preview, ..Default::default() },
             false, // never touch the real state file from tests
         )
+    }
+
+    #[test]
+    fn header_shows_the_note_age() {
+        let mut a = app("body");
+        a.note.updated = state::unix_now().saturating_sub(2 * 60 * 60);
+        let screen = rendered(&mut a, 60, 8);
+        assert!(screen.contains("2h ago"), "{screen}");
+    }
+
+    #[test]
+    fn header_omits_age_for_a_note_with_no_timestamp() {
+        let mut a = app("body");
+        a.note.updated = 0; // a v1 file, before `updated` existed
+        let screen = rendered(&mut a, 60, 8);
+        assert!(!screen.contains("ago"), "{screen}");
     }
 
     #[test]
