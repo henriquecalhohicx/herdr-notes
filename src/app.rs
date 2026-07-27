@@ -217,6 +217,11 @@ pub struct App {
     /// the preview cursor sits on. NOT a source line index: the text can
     /// change under it, so it is re-resolved and re-clamped on every use.
     box_cursor: Option<usize>,
+    /// One-shot request to scroll the cursor into view on the next draw.
+    /// Only set right after `move_box`/`toggle_box` place or move the cursor
+    /// — draw clears it once applied — so a cursor merely existing does not
+    /// fight manual scrolling (`Up`/`Dn`/`g`/`G`/PgUp/PgDn) on every frame.
+    follow_box: bool,
     confirm_clear: bool,
     dirty: bool,
     last_edit: Instant,
@@ -251,6 +256,7 @@ impl App {
             edit_scroll: 0,
             preview_scroll: 0,
             box_cursor: None,
+            follow_box: false,
             confirm_clear: false,
             dirty: false,
             last_edit: Instant::now(),
@@ -642,6 +648,7 @@ impl App {
             None => n - 1,
             Some(c) => c.saturating_add_signed(delta).min(n - 1),
         });
+        self.follow_box = true;
     }
 
     /// Flips the selected checkbox straight in `note.text`. Preview mode never
@@ -652,6 +659,7 @@ impl App {
         let Some(text) = markdown::toggle_checkbox(&self.note.text, line) else { return };
         self.note.text = text;
         self.touch();
+        self.follow_box = true;
     }
 
     fn enter_edit(&mut self) {
@@ -908,20 +916,28 @@ impl App {
         let max = total.saturating_sub(usize::from(area.height));
         if let Some(src) = self.cursor_line() {
             // Highlight EVERY row of the selected item — a wrapped checkbox
-            // spans several and would otherwise look half-selected.
+            // spans several and would otherwise look half-selected. This runs
+            // unconditionally whenever a cursor exists; only the scrolling
+            // below is one-shot.
             for (i, line) in lines.iter_mut().enumerate() {
                 if map.get(i).copied().flatten() == Some(src) {
                     line.style = line.style.add_modifier(Modifier::REVERSED);
                 }
             }
-            // Scroll follows the cursor, mirroring the overlay's list clamp.
-            if let Some(first) = map.iter().position(|m| *m == Some(src)) {
-                let h = usize::from(area.height).max(1);
-                if first < self.preview_scroll {
-                    self.preview_scroll = first;
-                } else if first >= self.preview_scroll + h {
-                    self.preview_scroll = first + 1 - h;
+            // Scroll follows the cursor, mirroring the overlay's list clamp —
+            // but only on a fresh move/toggle (`follow_box`), not on every
+            // draw. Otherwise a cursor merely existing would fight manual
+            // scrolling (Up/Dn/g/G/PgUp/PgDn) on the very next frame.
+            if self.follow_box {
+                if let Some(first) = map.iter().position(|m| *m == Some(src)) {
+                    let h = usize::from(area.height).max(1);
+                    if first < self.preview_scroll {
+                        self.preview_scroll = first;
+                    } else if first >= self.preview_scroll + h {
+                        self.preview_scroll = first + 1 - h;
+                    }
                 }
+                self.follow_box = false;
             }
         }
         self.preview_scroll = clamp_scroll(self.preview_scroll, total, usize::from(area.height));
@@ -1991,7 +2007,37 @@ mod tests {
             a.on_key(key(KeyCode::Char('j')));
         }
         let _ = rendered(&mut a, 40, 12); // 12 rows - header - hint = 10 body rows
-        assert!(a.preview_scroll > 0, "draw must scroll the cursor into view");
+        // Cursor clamps to the last box (index 29). Every line here is a
+        // single unwrapped checkbox row, so its rendered row equals its
+        // source line (29) — the follow must land it inside the visible
+        // window, not merely produce some non-zero scroll.
+        assert!(
+            a.preview_scroll <= 29 && 29 < a.preview_scroll + a.body_height,
+            "cursor's row (29) must be inside the visible window [{}, {}): scroll={}",
+            a.preview_scroll,
+            a.preview_scroll + a.body_height,
+            a.preview_scroll
+        );
+        // The offset is also exactly derivable: first=29, h=10 (12 rows minus
+        // the 1-row header and 1-row hint) -> scroll = 29 + 1 - 10 = 20.
+        assert_eq!(a.preview_scroll, 20, "draw must scroll the cursor into view");
+    }
+
+    #[test]
+    fn manual_scrolling_survives_a_live_checkbox_cursor() {
+        // The follow is one-shot: it must not drag the viewport back to the
+        // cursor on every frame, or Up/Dn/g/G become unusable after one `j`.
+        let text: String = (0..30)
+            .map(|i| format!("[ ] item {i}\n"))
+            .chain((0..30).map(|i| format!("prose {i}\n")))
+            .collect();
+        let mut a = app(&text);
+        a.on_key(key(KeyCode::Char('j'))); // cursor on the first box
+        let _ = rendered(&mut a, 40, 12);
+        a.on_key(key(KeyCode::Char('G'))); // jump to the bottom
+        let after = rendered(&mut a, 40, 12);
+        assert!(a.preview_scroll > 0, "G must not be undone by the follow: {after}");
+        assert!(a.box_cursor.is_some(), "scrolling away does not drop the cursor");
     }
 
     #[test]
