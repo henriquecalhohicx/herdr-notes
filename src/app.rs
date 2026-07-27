@@ -630,6 +630,9 @@ impl App {
             KeyCode::Enter => {
                 if let Some(buf) = self.title_input.take() {
                     self.note.title = buf.trim().to_string();
+                    // Typing a title freezes it; clearing it hands the note
+                    // back to auto-titling on the next heartbeat.
+                    self.note.title_auto = self.note.title.is_empty();
                     self.save();
                 }
             }
@@ -2121,6 +2124,39 @@ mod tests {
         a.on_key(key(KeyCode::Esc));
         assert_eq!(a.note.title, "Hi", "Esc discards the title edit");
         assert!(!a.on_key(key(KeyCode::Esc)), "Esc still never quits");
+    }
+
+    #[test]
+    fn typing_a_title_freezes_it_and_clearing_re_enables_auto() {
+        let mut a = app("body");
+        assert!(a.note.title_auto, "an untitled note starts derivable");
+        a.on_key(key(KeyCode::Char('r')));
+        for c in "HM-1".chars() {
+            a.on_key(key(KeyCode::Char(c)));
+        }
+        a.on_key(key(KeyCode::Enter));
+        assert_eq!(a.note.title, "HM-1");
+        assert!(!a.note.title_auto, "a typed title is frozen");
+
+        a.on_key(key(KeyCode::Char('r')));
+        for _ in 0..8 {
+            a.on_key(key(KeyCode::Backspace));
+        }
+        a.on_key(key(KeyCode::Enter));
+        assert_eq!(a.note.title, "");
+        assert!(a.note.title_auto, "clearing hands it back to auto");
+    }
+
+    #[test]
+    fn escaping_the_title_editor_leaves_the_flag_alone() {
+        let mut a = app("body");
+        a.note.title = "Mine".into();
+        a.note.title_auto = false;
+        a.on_key(key(KeyCode::Char('r')));
+        a.on_key(key(KeyCode::Char('x')));
+        a.on_key(key(KeyCode::Esc));
+        assert_eq!(a.note.title, "Mine");
+        assert!(!a.note.title_auto);
     }
 
     #[test]

@@ -45,18 +45,37 @@ impl Mode {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Note {
     /// Raw markdown of the single note.
     pub text: String,
     pub mode: Mode,
     /// Optional user-set title (blank shows as "(untitled)").
     pub title: String,
+    /// True when the title was derived rather than typed. The missing-field
+    /// default is `title.trim().is_empty()`, which migrates existing files for
+    /// free: one that already has a title reads as manual, an untitled one
+    /// reads as derivable.
+    pub title_auto: bool,
     /// Raw herdr tab id that owns this note (e.g. "w9:t1"); "" if unknown.
     pub tab_id: String,
     /// Unix seconds; 0 = unknown. `created` is set once, `updated` per save.
     pub created: u64,
     pub updated: u64,
+}
+
+impl Default for Note {
+    fn default() -> Self {
+        Note {
+            text: String::new(),
+            mode: Mode::Preview,
+            title: String::new(),
+            title_auto: true,
+            tab_id: String::new(),
+            created: 0,
+            updated: 0,
+        }
+    }
 }
 
 /// Where notes live. herdr's plugin docs say durable state belongs in
@@ -420,10 +439,14 @@ pub fn parse(json: &str) -> Note {
         _ => Mode::Preview,
     };
     let title = value.get("title").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let title_auto = value
+        .get("title_auto")
+        .and_then(|v| v.as_bool())
+        .unwrap_or_else(|| title.trim().is_empty());
     let tab_id = value.get("tab_id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
     let created = value.get("created").and_then(|v| v.as_u64()).unwrap_or(0);
     let updated = value.get("updated").and_then(|v| v.as_u64()).unwrap_or(0);
-    Note { text, mode, title, tab_id, created, updated }
+    Note { text, mode, title, title_auto, tab_id, created, updated }
 }
 
 /// The JSON that goes on disk: `{ "text", "mode", "title", "tab_id", "created",
@@ -433,6 +456,7 @@ pub fn to_json(note: &Note) -> String {
         "text": note.text,
         "mode": note.mode.name(),
         "title": note.title,
+        "title_auto": note.title_auto,
         "tab_id": note.tab_id,
         "created": note.created,
         "updated": note.updated,
@@ -555,6 +579,9 @@ pub(crate) fn write_atomic(path: &Path, contents: &str) -> bool {
 pub fn set_title(file: &Path, title: &str) {
     let mut note = read_note(file);
     note.title = title.trim().to_string();
+    // A rename from the overlay is a manual title; clearing it hands the note
+    // back to auto-titling.
+    note.title_auto = note.title.is_empty();
     let tab_id = note.tab_id.clone();
     persist_at(file, &note, &tab_id, unix_now());
 }
@@ -907,6 +934,7 @@ mod tests {
             text: "body".into(),
             mode: Mode::Edit,
             title: "My Title".into(),
+            title_auto: false,
             tab_id: "w9:t1".into(),
             created: 100,
             updated: 200,
@@ -1011,6 +1039,44 @@ mod tests {
         set_title(&path, "  New Name  ");
         assert_eq!(read_note(&path).title, "New Name");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn title_auto_defaults_from_whether_a_title_exists() {
+        // The free migration: a v2 file with no `title_auto` reads as manual
+        // when it has a title, auto when it does not.
+        assert!(parse(r#"{"text":"body"}"#).title_auto, "untitled -> auto");
+        assert!(!parse(r#"{"text":"body","title":"Mine"}"#).title_auto, "titled -> manual");
+        assert!(parse(r#"{"text":"body","title":"  "}"#).title_auto, "whitespace title -> auto");
+        // An explicit value always wins over the default.
+        assert!(!parse(r#"{"title":"","title_auto":false}"#).title_auto);
+        assert!(parse(r#"{"title":"Mine","title_auto":true}"#).title_auto);
+    }
+
+    #[test]
+    fn title_auto_round_trips_through_to_json() {
+        let mut n = Note { title: "Mine".into(), title_auto: false, ..Note::default() };
+        assert!(!parse(&to_json(&n)).title_auto);
+        n.title_auto = true;
+        assert!(parse(&to_json(&n)).title_auto);
+    }
+
+    #[test]
+    fn a_default_note_is_auto_titled() {
+        assert!(Note::default().title_auto, "a fresh note has no title, so it is derivable");
+    }
+
+    #[test]
+    fn set_title_marks_the_note_manual_and_clearing_marks_it_auto() {
+        let dir = temp_base("set-title-auto");
+        let file = dir.join("w1_t1.json");
+        persist_at(&file, &Note { text: "body".into(), ..Note::default() }, "w1:t1", 100);
+        set_title(&file, "Named By Hand");
+        let n = read_note(&file);
+        assert_eq!(n.title, "Named By Hand");
+        assert!(!n.title_auto, "an overlay rename is a manual title");
+        set_title(&file, "   ");
+        assert!(read_note(&file).title_auto, "clearing hands it back to auto");
     }
 
     #[test]
