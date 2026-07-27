@@ -32,9 +32,19 @@ fn main() -> std::io::Result<()> {
             println!("{}", launch::open_plan(&read_stdin()?));
             return Ok(());
         }
+        // A UserPromptSubmit hook. Two hard rules, both from how that hook
+        // works: ALWAYS exit 0, because a non-zero exit can block the user's
+        // prompt from being sent; and NEVER write to stdout, because whatever
+        // this prints is injected into that prompt as context. So the return
+        // value is deliberately discarded and nothing is printed.
+        Some("--capture-prompt") => {
+            let stdin = read_stdin().unwrap_or_default();
+            let _ = prompts::capture_from_env(&stdin);
+            return Ok(());
+        }
         Some(other) => {
             eprintln!("herdr-notes: unknown argument `{other}`");
-            eprintln!("usage: herdr-notes [--launch-decision|--focused-pane|--open-plan]");
+            eprintln!("usage: herdr-notes [--launch-decision|--focused-pane|--open-plan|--capture-prompt]");
             std::process::exit(2);
         }
         None => {}

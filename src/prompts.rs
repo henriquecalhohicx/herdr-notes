@@ -13,13 +13,10 @@
 use std::path::{Path, PathBuf};
 
 /// Entries kept per pane. Oldest evicted on append.
-#[allow(dead_code)] // wired up by the capture gate chain (Task 4)
 pub const RING: usize = 3;
 /// Characters kept per prompt, ellipsis included.
-#[allow(dead_code)] // wired up by the capture gate chain (Task 4)
 pub const MAX_CHARS: usize = 120;
 
-#[allow(dead_code)] // constructed once the capture gate chain lands (Task 4)
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Prompt {
     pub ts: u64,
@@ -30,7 +27,6 @@ pub struct Prompt {
 
 /// A prompt reduced to what gets stored and shown: its first line, trimmed,
 /// cut to `MAX_CHARS` with a trailing ellipsis when it overflows.
-#[allow(dead_code)] // called by the capture gate chain (Task 4)
 pub fn condense(prompt: &str) -> String {
     let first = prompt.lines().next().unwrap_or("").trim();
     if first.chars().count() <= MAX_CHARS {
@@ -43,7 +39,6 @@ pub fn condense(prompt: &str) -> String {
 /// The `prompt` field of a `UserPromptSubmit` payload, or `None` when the
 /// payload is unparseable, carries no `prompt` string, or the prompt is blank.
 /// Strips a leading BOM — PS 5.1 prepends one when piping into a native exe.
-#[allow(dead_code)] // called by the `--capture-prompt` arg (Task 4)
 pub fn payload_prompt(json: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(json.trim_start_matches('\u{feff}')).ok()?;
     let prompt = value.get("prompt")?.as_str()?;
@@ -52,14 +47,12 @@ pub fn payload_prompt(json: &str) -> Option<String> {
 
 /// `<dir>/<tab-key>__<pane-key>.prompts.json`. Both keys come from
 /// `state::id_key`, so they are already filename-safe.
-#[allow(dead_code)] // called by the capture gate chain and load_for_tab (Tasks 3-4)
 pub fn prompts_file(dir: &Path, tab_key: &str, pane_key: &str) -> PathBuf {
     dir.join(format!("{tab_key}__{pane_key}.prompts.json"))
 }
 
 /// Forgiving parse, matching the notes files: a garbled file or a missing
 /// field degrades to a default rather than wedging the pane.
-#[allow(dead_code)] // called by load_for_tab and append_at's callers (Task 3)
 pub fn parse_file(json: &str) -> Vec<Prompt> {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(json.trim_start_matches('\u{feff}'))
     else {
@@ -80,7 +73,6 @@ pub fn parse_file(json: &str) -> Vec<Prompt> {
 }
 
 /// `{ "version": 1, "prompts": [ { ts, pane, agent, text } ] }`, oldest first.
-#[allow(dead_code)] // called by append_at's persistence path once wired (Task 3)
 pub fn to_json(prompts: &[Prompt]) -> String {
     let items: Vec<serde_json::Value> = prompts
         .iter()
@@ -93,7 +85,6 @@ pub fn to_json(prompts: &[Prompt]) -> String {
 /// Best-effort throughout: an unreadable file is treated as empty and a failed
 /// write is silently dropped, because this runs inside a prompt-submit hook
 /// where surfacing an error would cost the user their message.
-#[allow(dead_code)] // called by the `--capture-prompt` arg (Task 4)
 pub fn append_at(path: &Path, entry: Prompt) {
     let mut entries = std::fs::read_to_string(path).map(|j| parse_file(&j)).unwrap_or_default();
     entries.push(entry);
@@ -129,6 +120,74 @@ pub fn load_for_tab(dir: &Path, tab_key: &str) -> Vec<Prompt> {
     out.sort_by(|a, b| b.ts.cmp(&a.ts).then_with(|| a.pane.cmp(&b.pane)).then_with(|| a.text.cmp(&b.text)));
     out.truncate(RING);
     out
+}
+
+/// The environment the capture gate chain reads, lifted out of `std::env` so
+/// every gate is testable without mutating process-global state.
+pub struct CaptureEnv {
+    /// `HERDR_NOTES_NO_CAPTURE` is set and non-empty.
+    pub no_capture: bool,
+    /// `HERDR_ENV == "1"`.
+    pub in_herdr: bool,
+    pub tab_id: Option<String>,
+    pub pane_id: Option<String>,
+}
+
+impl CaptureEnv {
+    /// Read the real process environment.
+    pub fn from_process() -> Self {
+        let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+        CaptureEnv {
+            no_capture: var("HERDR_NOTES_NO_CAPTURE").is_some(),
+            in_herdr: std::env::var("HERDR_ENV").as_deref() == Ok("1"),
+            tab_id: var("HERDR_TAB_ID"),
+            pane_id: var("HERDR_PANE_ID"),
+        }
+    }
+}
+
+/// The `UserPromptSubmit` gate chain. Returns `true` only when an entry was
+/// written; every rejection is silent and total, because the caller runs
+/// inside a prompt-submit hook.
+///
+/// Gates, in order: the off switch, running inside herdr, filename-safe tab
+/// AND pane ids (no legacy fallback — prompts are per-tab or nothing), an
+/// existing note file for the tab, and a usable payload.
+pub fn capture(dir: Option<&Path>, env: &CaptureEnv, stdin: &str, now: u64) -> bool {
+    if env.no_capture || !env.in_herdr {
+        return false;
+    }
+    let (Some(dir), Some(tab_id), Some(pane_id)) = (dir, env.tab_id.as_deref(), env.pane_id.as_deref())
+    else {
+        return false;
+    };
+    let (Some(tab_key), Some(pane_key)) = (crate::state::id_key(tab_id), crate::state::id_key(pane_id))
+    else {
+        return false;
+    };
+    // No note for this tab means the user has not opened Notes here; writing
+    // would leave a file behind for a tab that never wanted one.
+    if !dir.join(format!("{tab_key}.json")).exists() {
+        return false;
+    }
+    let Some(text) = payload_prompt(stdin) else {
+        return false;
+    };
+    append_at(
+        &prompts_file(dir, &tab_key, &pane_key),
+        Prompt { ts: now, pane: pane_id.to_string(), agent: "claude".to_string(), text: condense(&text) },
+    );
+    true
+}
+
+/// `capture` against the real environment and store dir.
+pub fn capture_from_env(stdin: &str) -> bool {
+    capture(
+        crate::state::store_dir().as_deref(),
+        &CaptureEnv::from_process(),
+        stdin,
+        crate::state::unix_now(),
+    )
 }
 
 #[cfg(test)]
@@ -340,6 +399,114 @@ mod tests {
         let other = vec![Prompt { ts: 5, pane: "w1:p9".into(), agent: "claude".into(), text: "t10".into() }];
         std::fs::write(prompts_file(&dir, "w1_t10", "w1_p9"), to_json(&other)).unwrap();
         assert_eq!(load_for_tab(&dir, "w1_t1"), vec![]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn env_ok() -> CaptureEnv {
+        CaptureEnv {
+            no_capture: false,
+            in_herdr: true,
+            tab_id: Some("w1:t1".into()),
+            pane_id: Some("w1:p5".into()),
+        }
+    }
+
+    /// A store dir holding a note file for `w1:t1`, so gate 4 passes.
+    fn store_with_note(name: &str) -> std::path::PathBuf {
+        let dir = tempdir().join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = crate::state::id_key("w1:t1").unwrap();
+        std::fs::write(dir.join(format!("{key}.json")), r#"{"text":"a note"}"#).unwrap();
+        dir
+    }
+
+    fn captured(dir: &std::path::Path) -> Vec<Prompt> {
+        load_for_tab(dir, &crate::state::id_key("w1:t1").unwrap())
+    }
+
+    #[test]
+    fn capture_writes_a_condensed_entry_when_every_gate_passes() {
+        let dir = store_with_note("gate_pass");
+        assert!(capture(Some(&dir), &env_ok(), r#"{"prompt":"fix the auth test\nsecond line"}"#, 99));
+        let got = captured(&dir);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].text, "fix the auth test", "first line only");
+        assert_eq!(got[0].ts, 99);
+        assert_eq!(got[0].pane, "w1:p5");
+        assert_eq!(got[0].agent, "claude");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn capture_gate_1_off_switch() {
+        let dir = store_with_note("gate1");
+        let env = CaptureEnv { no_capture: true, ..env_ok() };
+        assert!(!capture(Some(&dir), &env, r#"{"prompt":"x"}"#, 1));
+        assert_eq!(captured(&dir), vec![]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn capture_gate_2_outside_herdr() {
+        let dir = store_with_note("gate2");
+        let env = CaptureEnv { in_herdr: false, ..env_ok() };
+        assert!(!capture(Some(&dir), &env, r#"{"prompt":"x"}"#, 1));
+        assert_eq!(captured(&dir), vec![]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn capture_gate_3_missing_or_unsafe_ids() {
+        let dir = store_with_note("gate3");
+        for env in [
+            CaptureEnv { tab_id: None, ..env_ok() },
+            CaptureEnv { tab_id: Some("bad id".into()), ..env_ok() },
+            CaptureEnv { pane_id: None, ..env_ok() },
+            CaptureEnv { pane_id: Some("../escape".into()), ..env_ok() },
+        ] {
+            assert!(!capture(Some(&dir), &env, r#"{"prompt":"x"}"#, 1));
+        }
+        assert_eq!(captured(&dir), vec![], "no legacy fallback: per-tab or nothing");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn capture_gate_4_no_note_file_for_this_tab() {
+        let dir = tempdir().join("gate4");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!capture(Some(&dir), &env_ok(), r#"{"prompt":"x"}"#, 1));
+        assert_eq!(captured(&dir), vec![], "no note, no capture, no file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn capture_gate_5_unusable_payloads() {
+        let dir = store_with_note("gate5");
+        for stdin in ["", "not json", r#"{}"#, r#"{"prompt":""}"#, r#"{"prompt":"  "}"#] {
+            assert!(!capture(Some(&dir), &env_ok(), stdin, 1), "stdin {stdin:?} must not write");
+        }
+        assert_eq!(captured(&dir), vec![]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn capture_without_a_store_dir_is_a_noop() {
+        assert!(!capture(None, &env_ok(), r#"{"prompt":"x"}"#, 1));
+    }
+
+    #[test]
+    fn capture_writes_only_this_panes_file() {
+        let dir = store_with_note("per_pane");
+        let p5 = CaptureEnv { pane_id: Some("w1:p5".into()), ..env_ok() };
+        let p6 = CaptureEnv { pane_id: Some("w1:p6".into()), ..env_ok() };
+        assert!(capture(Some(&dir), &p5, r#"{"prompt":"from p5"}"#, 10));
+        assert!(capture(Some(&dir), &p6, r#"{"prompt":"from p6"}"#, 20));
+        assert!(prompts_file(&dir, "w1_t1", &crate::state::id_key("w1:p5").unwrap()).exists());
+        assert!(prompts_file(&dir, "w1_t1", &crate::state::id_key("w1:p6").unwrap()).exists());
+        let got = captured(&dir);
+        assert_eq!(got.iter().map(|p| p.text.as_str()).collect::<Vec<_>>(), vec!["from p6", "from p5"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
