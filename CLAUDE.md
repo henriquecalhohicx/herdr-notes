@@ -72,6 +72,34 @@ findings doc (and the reference implementation, `herdr-sidebar`) lives in
   (one source line can wrap to several rows, which all map back to it);
   `render_markdown` is now a thin wrapper over the mapped form with its
   signature unchanged
+- `src/prompts.rs` — prompt capture storage for the `--capture-prompt` hook
+  mode (a `UserPromptSubmit` hook piping its JSON payload into the binary; see
+  Gotchas). One file PER PANE, not per tab —
+  `<tab-key>__<pane-key>.prompts.json` in the same store dir as note files,
+  keys from `state::id_key` so both layouts agree on what an id spells on
+  disk — because a tab can hold several agent panes and a shared per-tab file
+  would mean concurrent read-modify-write from independent hook processes. A
+  ring of the last `RING` (3) prompts per pane file; each prompt is condensed
+  to its first line, trimmed, cut to `MAX_CHARS` (120) with a trailing
+  ellipsis, so nothing sits on disk that isn't also shown. `load_for_tab`
+  merges every pane file belonging to a tab, newest `ts` first (ties broken by
+  pane then text, since `read_dir` order isn't guaranteed across platforms),
+  capped at `RING`. `capture` is a gate chain — the `HERDR_NOTES_NO_CAPTURE`
+  off switch, running inside herdr, filename-safe tab AND pane ids, an
+  existing note file for this tab (no note, no capture — a tab that never
+  opened Notes gets no prompt file either), a usable `prompt` field in the
+  hook's stdin payload — every rejection silent and total, because the caller
+  runs inside a `UserPromptSubmit` hook. Gate 4 asks `state::note_file_in` for
+  the note path rather than spelling `<key>.json` again — the hook is a second
+  process and prints nothing, so a layout drift would stop capture with no
+  diagnostic anywhere. `App.prompts` (`app.rs`) re-reads via `load_for_tab`
+  and renders a dim "Last Prompts" block above the note in preview — including
+  above the empty-note help, since a titled body-less note keeps its file and
+  so keeps accumulating prompts — gated on `showing_tab_note()` (the global
+  note is not a tab and carries no prompts). `refresh_prompts` runs at
+  construction, at the end of `toggle_global`, and on the 5s heartbeat: the
+  first two exist so the block is never blank while the user waits out a
+  throttled heartbeat, which reads exactly like capture being broken
 - `src/template.rs` — the Status/Next/Notes skeleton, one const. Every
   section ships EMPTY — no placeholder prose: edit mode has no line-kill,
   word-delete or selection, so a placeholder would cost `End` plus one
@@ -89,10 +117,28 @@ findings doc (and the reference implementation, `herdr-sidebar`) lives in
   `%LOCALAPPDATA%\herdr\plugins\herdr-notes\` — the docs-mandated home for
   durable plugin state; actions get the env var and the launchers pass it
   into the pane via `pane split --env`, the unix `[[panes]]` entry gets it
-  natively). Without it (binary run by hand): config-dir fallback
+  natively). `store_base` has a THIRD tier between that and the config-dir
+  fallback: `HERDR_ENV == "1"` with no explicit `HERDR_PLUGIN_STATE_DIR` also
+  resolves the conventional plugin state dir (same path as above), rather than
+  falling through to the config layout. This exists for the `--capture-prompt`
+  hook — verified live, a Claude Code agent pane inside herdr inherits
+  `HERDR_ENV`/`HERDR_TAB_ID`/`HERDR_PANE_ID` but NOT the plugin-scoped
+  `HERDR_PLUGIN_STATE_DIR` (that var is injected only into the Notes pane
+  itself). Without this tier the hook process and the Notes pane would
+  resolve two different directories for the same tab and silently disagree
+  about where a captured prompt lives. So: THREE tiers, in order — (1)
+  explicit `HERDR_PLUGIN_STATE_DIR` → that dir; (2) `HERDR_ENV == "1"` with no
+  such var (ANY pane inside herdr, including the binary or `open-notes.ps1`
+  run by hand in one) → the conventional plugin state dir
+  `%LOCALAPPDATA%\herdr\plugins\herdr-notes\` (unix
+  `$XDG_DATA_HOME|~/.local/share/herdr/plugins/herdr-notes/`); (3) OUTSIDE
+  herdr entirely, neither var → the config-dir fallback
   `%APPDATA%\herdr\notes\<tab-key>.json` (unix:
-  `$XDG_CONFIG_HOME|~/.config/herdr/notes/`); the state dir migrates
-  fallback-layout files in on first load. Keyed by the
+  `$XDG_CONFIG_HOME|~/.config/herdr/notes/`). Tiers 1–2 migrate
+  config-layout files in on first load — the tab note (`load_state_dir`) AND
+  the shared `global.json` (`load_global`/`load_global_state_dir`, added with
+  prompt capture: without it the one explicitly cross-session document read
+  back empty after tier 2 appeared). Keyed by the
   `HERDR_TAB_ID` herdr injects into every pane (form `<workspace>:<n>`, e.g.
   `w1:t2`; monotonic and never reused within a session, so a closed tab
   leaves a harmless orphan file that no future tab reclaims). The `:`
@@ -147,8 +193,14 @@ while the TUI is running in a pane — quit/close the pane first (and
   keep the old binary).
 - End-to-end verification: drive the real binary in a throwaway pane —
   `herdr pane split` + `pane run` + `pane send-keys` + `pane read --source visible`,
-  then check `%APPDATA%\herdr\notes\<tab-key>.json` (the pane's
-  `HERDR_TAB_ID` with `:` sanitized to `_`). Cheap, catches what unit tests can't.
+  then check the note file. WHICH PATH depends on the pane's env (see the
+  three tiers in `src/state.rs` above): a plain `pane split` pane has
+  `HERDR_ENV=1` but NOT `HERDR_PLUGIN_STATE_DIR`, so it writes
+  `%LOCALAPPDATA%\herdr\plugins\herdr-notes\<tab-key>.json` — NOT
+  `%APPDATA%\herdr\notes\`, which only applies outside herdr. A pane launched
+  through `open-notes.ps1`/the action gets the var explicitly and lands in the
+  same plugin state dir. `<tab-key>` is the pane's `HERDR_TAB_ID` with `:`
+  sanitized to `_` (lowercased on Windows). Cheap, catches what unit tests can't.
 
 ## Gotchas (verified against herdr 0.7.1)
 
@@ -286,6 +338,43 @@ Learned building this plugin:
   startup. Seeding there — rather than only on the interactive `e` — would
   give a titled, bodyless note a body nobody typed and autosave it 2s later.
   Seed on the interactive path only.
+- `UserPromptSubmit` hooks must exit 0 and print nothing: a non-zero exit
+  blocks the user's prompt from being sent, and Claude Code injects whatever
+  the hook writes to stdout into that prompt as context. `--capture-prompt`
+  therefore always returns `Ok(())` regardless of whether `capture_from_env`
+  actually wrote an entry, and never prints — a genuine capture failure must
+  fail exactly as silently as an intentional gate rejection.
+- `list_notes` filters on extension `json`, and `<tab-key>__<pane-key>.prompts.json`
+  also ends in `.json` — without an explicit skip for that suffix, every
+  prompt file becomes a junk row in the notes overlay.
+- `Set-Content -Encoding UTF8` means two DIFFERENT things: utf8-no-BOM in
+  pwsh 7, BOM-prefixed UTF-8 in Windows PowerShell 5.1 (measured on this
+  machine: `EF BB BF` vs none). herdr panes run 5.1, so any script that writes
+  a file another tool parses must write the encoding explicitly —
+  `[System.IO.File]::WriteAllText($p, $s, (New-Object System.Text.UTF8Encoding($false)))`.
+  `install-prompt-hook.ps1` writes the user's GLOBAL `~/.claude/settings.json`;
+  a stray BOM there could take out every setting they have.
+- `std::env::args()` PANICS on a non-Unicode argument, and `.nth(1)` forces
+  argv[0] (the exe path) through that check first. On the `--capture-prompt`
+  path that panic is exit 101 + stderr — the two things a `UserPromptSubmit`
+  hook must never do — and it fires before the arm that would swallow it. Use
+  `args_os()` + a LOSSY conversion (`first_arg` in main.rs) so a bad argument
+  becomes an ordinary unknown argument instead of a crash or a silent TUI launch.
+- Every new store tier needs a migration for EVERY document, not just the tab
+  note. Adding the `HERDR_ENV=1` middle tier moved the tab note (which had
+  `load_state_dir`) but left `global.json` behind, so the one explicitly
+  cross-session document read back empty — presenting as data loss on exactly
+  the note a user would most notice. Same class as the `toggle_global` reset
+  bug: a second document added later has to be walked through every
+  single-document code path.
+- An installer's backup must not be re-taken on re-run. The README invites
+  re-running `install-prompt-hook.ps1`; `Copy-Item -Force` made the second
+  run's "backup" a copy of the already-modified file, destroying the only
+  pristine copy. It now keeps the FIRST backup and says so.
+- Prompt storage is one file PER PANE, not per tab: a tab can hold several
+  agent panes, and a shared per-tab file would mean concurrent
+  read-modify-write from independent hook processes (each `UserPromptSubmit`
+  fires as its own short-lived process with no coordination between panes).
 
 ## README screenshots (Alex's criteria — follow on every reshoot)
 

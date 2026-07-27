@@ -65,6 +65,20 @@ pub struct Note {
 /// it through `pane split --env`). A TUI started by hand has neither, so the
 /// pre-existing config-dir layout stays as the fallback — and as the
 /// migration source when the state dir is empty.
+///
+/// A third case sits between those two: the `--capture-prompt` hook runs as a
+/// child of Claude Code inside an AGENT pane, not a plugin-run command. Verified
+/// live — that pane's environment carries `HERDR_ENV=1`, `HERDR_TAB_ID`,
+/// `HERDR_PANE_ID`, etc., but NOT `HERDR_PLUGIN_STATE_DIR` (that var is
+/// plugin-scoped, injected only into the Notes pane itself by
+/// `open-notes.ps1`/the unix `[[panes]]` entry). Without the middle tier below,
+/// the hook would fall all the way through to the config-dir layout while the
+/// Notes pane resolves the plugin-state layout — two processes disagreeing on
+/// one file means captured prompts are written where the pane never reads them.
+/// So `HERDR_ENV == "1"` alone (no explicit dir) resolves the CONVENTIONAL
+/// plugin state dir instead of degrading to config-dir, keeping the hook and
+/// the pane on the same file without the hook needing its own copy of
+/// `HERDR_PLUGIN_STATE_DIR`.
 enum StoreBase {
     /// `HERDR_PLUGIN_STATE_DIR`: files live directly in the dir
     /// (`<dir>/<key>.json`, no-tab fallback `<dir>/note.json`).
@@ -78,7 +92,28 @@ fn store_base() -> Option<StoreBase> {
     if let Some(dir) = std::env::var_os("HERDR_PLUGIN_STATE_DIR").filter(|d| !d.is_empty()) {
         return Some(StoreBase::PluginState(PathBuf::from(dir)));
     }
+    if std::env::var("HERDR_ENV").as_deref() == Ok("1")
+        && let Some(dir) = plugin_state_default()
+    {
+        return Some(StoreBase::PluginState(dir));
+    }
     config_base().map(StoreBase::Config)
+}
+
+/// The conventional plugin state dir a hook process falls back to when
+/// `HERDR_PLUGIN_STATE_DIR` isn't in its environment but `HERDR_ENV == "1"`
+/// says it's running inside herdr: `%LOCALAPPDATA%\herdr\plugins\herdr-notes`
+/// on Windows, `$XDG_DATA_HOME/herdr/plugins/herdr-notes` elsewhere, falling
+/// back to `$HOME/.local/share/herdr/plugins/herdr-notes`. `None` when even
+/// the base var is missing.
+fn plugin_state_default() -> Option<PathBuf> {
+    #[cfg(windows)]
+    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    #[cfg(not(windows))]
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share")));
+    base.map(|b| b.join("herdr").join("plugins").join("herdr-notes"))
 }
 
 /// Platform config base (`%APPDATA%` / `$XDG_CONFIG_HOME` / `~/.config`),
@@ -106,8 +141,15 @@ pub(crate) fn tab_env() -> Option<String> {
 /// alongside plain alphanumerics; [`note_key`] sanitizes it to `_`. Everything
 /// else — dots, spaces, `-`, `_`, anything path-traversal-shaped — falls back
 /// to the legacy path instead.
+///
+/// At most ONE `:`: a malformed `a::b` would otherwise sanitize to a key
+/// containing `__`, which is exactly the separator `prompts::load_for_tab`
+/// leans on to keep one tab's prompt files out of another's. Unreachable with
+/// real herdr ids — this makes the invariant watertight instead of argued.
 fn is_filename_safe(id: &str) -> bool {
-    !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == ':')
+    !id.is_empty()
+        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == ':')
+        && id.matches(':').count() <= 1
 }
 
 /// Pre-per-tab single-note file; also the fallback when no (safe)
@@ -116,21 +158,30 @@ fn legacy_path_in(base: &Path) -> PathBuf {
     base.join("herdr").join("notes.json")
 }
 
-/// The note-FILE identity of a tab id: `Some(key)` when the id gets its own
-/// per-tab file, `None` when it falls back to the shared legacy `notes.json`.
-/// Panes whose keys are EQUAL load and save the SAME file. This is the identity
-/// the launcher's duplicate-instance guard (launch.rs) compares — never raw tab
-/// ids — so the guard can't drift from the on-disk layout: unsafe/missing ids
-/// all coarsen to one legacy file, the `:` separator is sanitized to `_`
-/// (herdr ids never contain `_`, so no collision), and on Windows ASCII case is
-/// folded because NTFS filenames are case-insensitive ("W6_T1.json" and
-/// "w6_t1.json" are one file).
-pub fn note_key(tab_id: Option<&str>) -> Option<String> {
-    let id = tab_id.filter(|id| is_filename_safe(id))?;
+/// A herdr id (`<a>:<n>`, e.g. `w6:t1` or `wA:p5`) sanitized into a
+/// filename-safe key: the single `:` becomes `_` (herdr ids never contain
+/// `_`, so no collision), and on Windows ASCII case is folded because NTFS
+/// filenames are case-insensitive ("W6_T1" and "w6_t1" are one file).
+/// `None` when the id is empty or holds anything beyond alphanumerics and
+/// that one `:`. Shared by note files and prompt files so the two layouts
+/// can never disagree about what a given id spells on disk.
+pub fn id_key(id: &str) -> Option<String> {
+    if !is_filename_safe(id) {
+        return None;
+    }
     let key = id.replace(':', "_");
     #[cfg(windows)]
     let key = key.to_ascii_lowercase();
     Some(key)
+}
+
+/// The note-FILE identity of a tab id: `Some(key)` when the id gets its own
+/// per-tab file, `None` when it falls back to the shared legacy `notes.json`.
+/// Panes whose keys are EQUAL load and save the SAME file. This is the identity
+/// the launcher's duplicate-instance guard (launch.rs) compares — never raw tab
+/// ids — so the guard can't drift from the on-disk layout.
+pub fn note_key(tab_id: Option<&str>) -> Option<String> {
+    tab_id.and_then(id_key)
 }
 
 /// Pure path selection: `<base>/herdr/notes/<note-key>.json` for a
@@ -147,9 +198,18 @@ fn state_path_in(base: &Path, tab_id: Option<&str>) -> PathBuf {
 /// the shared `<dir>/note.json` for missing/unsafe tab ids.
 fn state_dir_path(dir: &Path, tab_id: Option<&str>) -> PathBuf {
     match note_key(tab_id) {
-        Some(key) => dir.join(format!("{key}.json")),
+        Some(key) => note_file_in(dir, &key),
         None => dir.join("note.json"),
     }
+}
+
+/// The note file a keyed note gets inside a store dir. The ONE place that
+/// layout is spelled: `prompts::capture`'s "does this tab have a note?" gate
+/// runs in a second process and must not re-derive it, or a future change to
+/// the note filename would silently stop capture with no diagnostic anywhere
+/// (the hook is 100% silent by design). Same reason `id_key` is shared.
+pub(crate) fn note_file_in(dir: &Path, key: &str) -> PathBuf {
+    dir.join(format!("{key}.json"))
 }
 
 /// Fixed filename for the cross-session global note — not tab-keyed, shared
@@ -179,6 +239,43 @@ pub fn global_path() -> Option<PathBuf> {
         StoreBase::PluginState(dir) => global_dir_path(&dir),
         StoreBase::Config(base) => global_path_in(&base),
     })
+}
+
+/// The cross-session global note for THIS process, with the same one-time
+/// migration `load()` gives the tab note. Without it, a user who previously
+/// resolved the config layout (`HERDR_ENV=1` with no `HERDR_PLUGIN_STATE_DIR`
+/// — the binary or `open-notes.ps1` run by hand in a pane) reads the one
+/// explicitly cross-session document back EMPTY after the store dir gained
+/// its middle tier, and the next keystroke writes a fresh `global.json` beside
+/// it while the old one orphans.
+pub fn load_global() -> Note {
+    match store_base() {
+        Some(StoreBase::PluginState(dir)) => load_global_state_dir(&dir, config_base().as_deref()),
+        Some(StoreBase::Config(base)) => read_note(&global_path_in(&base)),
+        None => Note::default(),
+    }
+}
+
+/// Load the global note from the plugin state dir, migrating from the
+/// config-dir layout the first time: if it is missing there, MOVE the
+/// config-dir one into place. A failed rename falls back to reading the source
+/// without moving it; when both exist the state-dir one wins and the config
+/// file is untouched. Same shape as `load_state_dir`, which does this for the
+/// tab note — there is no second pattern here on purpose.
+fn load_global_state_dir(dir: &Path, config: Option<&Path>) -> Note {
+    let path = global_dir_path(dir);
+    if !path.exists()
+        && let Some(base) = config
+    {
+        let src = global_path_in(base);
+        if src.exists() {
+            let moved = std::fs::create_dir_all(dir).is_ok() && std::fs::rename(&src, &path).is_ok();
+            if !moved {
+                return read_note(&src);
+            }
+        }
+    }
+    read_note(&path)
 }
 
 pub fn load() -> Note {
@@ -264,6 +361,11 @@ pub fn list_notes(dir: &Path) -> Vec<NoteSummary> {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        // `<tab>__<pane>.prompts.json` also ends in `.json`; without this it
+        // would list as a note and fill the overlay with junk rows.
+        if path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with(".prompts.json")) {
             continue;
         }
         let note = read_note(&path);
@@ -430,18 +532,23 @@ pub fn persist_at(path: &Path, note: &Note, tab_id: &str, now: u64) {
     }
     out.created = if note.created == 0 { now } else { note.created };
     out.updated = now;
+    write_atomic(path, &to_json(&out));
+}
+
+/// Atomic best-effort write: create the parent dir, write a `.tmp` sibling,
+/// `sync_all`, rename over the target. `true` when the rename landed. Shared
+/// by note and prompt files so both get the same crash behavior.
+pub(crate) fn write_atomic(path: &Path, contents: &str) -> bool {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
     let tmp = path.with_extension("json.tmp");
     let written = std::fs::File::create(&tmp).and_then(|mut f| {
         use std::io::Write;
-        f.write_all(to_json(&out).as_bytes())?;
+        f.write_all(contents.as_bytes())?;
         f.sync_all()
     });
-    if written.is_ok() {
-        let _ = std::fs::rename(&tmp, path);
-    }
+    written.is_ok() && std::fs::rename(&tmp, path).is_ok()
 }
 
 /// Set a note file's title in place (blank text + blank title would delete it).
@@ -452,9 +559,112 @@ pub fn set_title(file: &Path, title: &str) {
     persist_at(file, &note, &tab_id, unix_now());
 }
 
+/// Serializes every test in this crate that mutates the process-global
+/// `HERDR_*` env vars — the `store_base_*` tests below, which read them
+/// directly, AND several `app.rs` tests that point `HERDR_PLUGIN_STATE_DIR`/
+/// `HERDR_TAB_ID`/etc. at a temp dir to drive real persistence. All tests in
+/// the crate compile into ONE binary and `cargo test` runs them on separate
+/// threads, so two per-module locks do not serialize against each other —
+/// only a single shared instance does, which is why this lives here at
+/// module scope instead of inside `mod tests` (and why `app.rs` reaches
+/// across to it rather than declaring its own). A test that panics while
+/// holding this lock poisons it for every other test that acquires it
+/// afterward; every acquisition site recovers with
+/// `.unwrap_or_else(|e| e.into_inner())` rather than `.unwrap()`, treating a
+/// poisoned lock as still validly held (the guarded state — process env — is
+/// not itself corrupted by a panic elsewhere, only mid-mutation, and each
+/// acquirer already restores every var it touches before releasing).
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn store_base_prefers_explicit_plugin_state_dir_over_herdr_env() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_dir = std::env::var_os("HERDR_PLUGIN_STATE_DIR");
+        let prev_env = std::env::var_os("HERDR_ENV");
+        // SAFETY: serialized by ENV_LOCK; restored below.
+        unsafe {
+            std::env::set_var("HERDR_PLUGIN_STATE_DIR", "explicit-plugin-dir");
+            std::env::set_var("HERDR_ENV", "1");
+        }
+        match store_base() {
+            Some(StoreBase::PluginState(dir)) => {
+                assert_eq!(dir, PathBuf::from("explicit-plugin-dir"), "explicit var always wins");
+            }
+            other => panic!("expected PluginState(explicit-plugin-dir), got is_plugin_state={:?}", other.is_some()),
+        }
+        unsafe {
+            match prev_dir {
+                Some(v) => std::env::set_var("HERDR_PLUGIN_STATE_DIR", v),
+                None => std::env::remove_var("HERDR_PLUGIN_STATE_DIR"),
+            }
+            match prev_env {
+                Some(v) => std::env::set_var("HERDR_ENV", v),
+                None => std::env::remove_var("HERDR_ENV"),
+            }
+        }
+    }
+
+    #[test]
+    fn store_base_falls_back_to_the_conventional_plugin_dir_under_herdr_env() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_dir = std::env::var_os("HERDR_PLUGIN_STATE_DIR");
+        let prev_env = std::env::var_os("HERDR_ENV");
+        unsafe {
+            std::env::remove_var("HERDR_PLUGIN_STATE_DIR");
+            std::env::set_var("HERDR_ENV", "1");
+        }
+        // The hook's own environment (a Claude Code agent pane inside herdr):
+        // HERDR_ENV=1 but no HERDR_PLUGIN_STATE_DIR — must land on the same
+        // conventional dir the pane would use, not the config layout.
+        let expected = plugin_state_default().expect("LOCALAPPDATA/XDG_DATA_HOME/HOME must be set in test env");
+        match store_base() {
+            Some(StoreBase::PluginState(dir)) => assert_eq!(dir, expected),
+            other => panic!("expected PluginState({expected:?}), got is_plugin_state={:?}", other.is_some()),
+        }
+        unsafe {
+            match prev_dir {
+                Some(v) => std::env::set_var("HERDR_PLUGIN_STATE_DIR", v),
+                None => std::env::remove_var("HERDR_PLUGIN_STATE_DIR"),
+            }
+            match prev_env {
+                Some(v) => std::env::set_var("HERDR_ENV", v),
+                None => std::env::remove_var("HERDR_ENV"),
+            }
+        }
+    }
+
+    #[test]
+    fn store_base_uses_the_config_layout_when_neither_var_is_set() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_dir = std::env::var_os("HERDR_PLUGIN_STATE_DIR");
+        let prev_env = std::env::var_os("HERDR_ENV");
+        unsafe {
+            std::env::remove_var("HERDR_PLUGIN_STATE_DIR");
+            std::env::remove_var("HERDR_ENV");
+        }
+        // Neither the pane's nor the hook's herdr signal is present — running
+        // by hand, outside herdr entirely.
+        match (store_base(), config_base()) {
+            (Some(StoreBase::Config(got)), Some(expected)) => assert_eq!(got, expected),
+            (None, None) => {}
+            (got, expected) => panic!("expected Config({expected:?}), got is_config={:?}", got.is_some()),
+        }
+        unsafe {
+            match prev_dir {
+                Some(v) => std::env::set_var("HERDR_PLUGIN_STATE_DIR", v),
+                None => std::env::remove_var("HERDR_PLUGIN_STATE_DIR"),
+            }
+            match prev_env {
+                Some(v) => std::env::set_var("HERDR_ENV", v),
+                None => std::env::remove_var("HERDR_ENV"),
+            }
+        }
+    }
 
     #[test]
     fn roundtrip_preserves_text_and_mode() {
@@ -549,6 +759,44 @@ mod tests {
     }
 
     #[test]
+    fn id_key_sanitizes_pane_and_tab_ids_alike() {
+        assert_eq!(id_key("wA:t1").as_deref(), Some(if cfg!(windows) { "wa_t1" } else { "wA_t1" }));
+        assert_eq!(id_key("wA:p5").as_deref(), Some(if cfg!(windows) { "wa_p5" } else { "wA_p5" }));
+        assert_eq!(id_key(""), None);
+        assert_eq!(id_key("has space"), None);
+        assert_eq!(id_key("../escape"), None);
+        assert_eq!(id_key("under_score"), None, "herdr ids never contain _; it is our separator");
+    }
+
+    #[test]
+    fn note_key_still_routes_through_id_key() {
+        assert_eq!(note_key(Some("w1:t2")), id_key("w1:t2"));
+        assert_eq!(note_key(Some("bad id")), None);
+        assert_eq!(note_key(None), None);
+    }
+
+    #[test]
+    fn write_atomic_creates_the_dir_and_leaves_no_temp_behind() {
+        let dir = temp_base("write-atomic");
+        let path = dir.join("nested").join("thing.json");
+        assert!(write_atomic(&path, "{\"a\":1}"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"a\":1}");
+        assert!(!path.with_extension("json.tmp").exists(), "temp file must be renamed away");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_notes_skips_prompt_files() {
+        let dir = temp_base("list-prompts");
+        std::fs::write(dir.join("w1_t1.json"), r#"{"text":"real note"}"#).unwrap();
+        std::fs::write(dir.join("w1_t1__w1_p5.prompts.json"), r#"{"prompts":[]}"#).unwrap();
+        let rows = list_notes(&dir);
+        assert_eq!(rows.len(), 1, "the prompts file must not become a note row: {rows:?}");
+        assert_eq!(rows[0].text, "real note");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn first_load_moves_the_legacy_note_into_the_tab_slot() {
         let base = temp_base("migrate");
         write_note(&legacy_path_in(&base), "old note");
@@ -591,6 +839,66 @@ mod tests {
         // Nothing anywhere is still just an empty note.
         assert_eq!(load_state_dir(&dir, Some(&base), Some("w9")), Note::default());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn global_note_migrates_from_the_config_layout_once() {
+        // The global note is the one document that is explicitly
+        // cross-session, so it needs the same one-time move into the plugin
+        // state dir that the tab note gets — otherwise a user who previously
+        // resolved the config layout reads it back EMPTY after the upgrade.
+        let base = temp_base("global-migrate");
+        let dir = base.join("plugin-state");
+        let cfg = global_path_in(&base);
+        std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+        write_note(&cfg, "shared note");
+
+        assert_eq!(load_global_state_dir(&dir, Some(&base)).text, "shared note");
+        assert!(!cfg.exists(), "moved, not copied");
+        assert!(global_dir_path(&dir).exists());
+        // Second load reads the migrated file; nothing left to migrate.
+        assert_eq!(load_global_state_dir(&dir, Some(&base)).text, "shared note");
+
+        // A state-dir global already in place wins; a lingering config one is
+        // left untouched rather than clobbering it.
+        write_note(&cfg, "stale");
+        assert_eq!(load_global_state_dir(&dir, Some(&base)).text, "shared note");
+        assert!(cfg.exists(), "config file untouched when both exist");
+
+        // Nothing anywhere is still just an empty note, and no config base at
+        // all (outside herdr, no APPDATA) must not panic.
+        let empty = temp_base("global-empty");
+        assert_eq!(load_global_state_dir(&empty.join("plugin-state"), Some(&empty)), Note::default());
+        assert_eq!(load_global_state_dir(&empty.join("plugin-state"), None), Note::default());
+
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&empty);
+    }
+
+    #[test]
+    fn note_file_in_is_the_only_spelling_of_a_store_dir_note() {
+        // `prompts::capture`'s gate 4 checks for this tab's note file in a
+        // SECOND process; it must not re-derive the filename itself, or a
+        // future layout change silently stops capture with no diagnostic.
+        let dir = Path::new("store");
+        let key = id_key("w6:t1").unwrap();
+        assert_eq!(note_file_in(dir, &key), dir.join(format!("{key}.json")));
+        assert_eq!(state_dir_path(dir, Some("w6:t1")), note_file_in(dir, &key));
+    }
+
+    #[test]
+    fn a_second_colon_is_not_filename_safe() {
+        // Real herdr ids are `<workspace>:<n>` — exactly one separator. A
+        // malformed `a::b` would otherwise sanitize to a key containing `__`,
+        // the very separator `prompts::load_for_tab` relies on to keep one
+        // tab's prompt files out of another's.
+        assert_eq!(id_key("a::b"), None);
+        assert_eq!(id_key(":::"), None);
+        assert_eq!(note_key(Some("a::b")), None);
+        assert_eq!(state_path_in(Path::new("base"), Some("a::b")), legacy_path_in(Path::new("base")));
+        // The single-separator form and a bare id still key normally.
+        assert!(id_key("w6:t1").is_some());
+        assert!(id_key("w6").is_some());
     }
 
     #[test]

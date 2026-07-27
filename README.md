@@ -129,6 +129,66 @@ across tabs — title (or "(untitled)"), age, and whether its tab is still
 open (`live`/`closed`/`?`) — with read-only preview, rename, and delete
 built in.
 
+## Prompt capture
+
+Notes can show the last few prompts you typed into a Claude Code pane sharing
+the tab, so you don't lose track of what you asked for while you're jotting
+things down beside it. A `UserPromptSubmit` hook writes each prompt (first
+line, truncated) to a small per-pane file; the pane merges every agent pane's
+file for the tab and renders a dim "Last Prompts" block above the note in
+preview.
+
+Install the hook into your global Claude Code settings:
+
+```
+pwsh scripts/install-prompt-hook.ps1
+```
+
+It's idempotent — re-run it any time (after a rebuild, say) and it replaces
+just this plugin's entry, leaving every other hook untouched. The first run
+backs `~/.claude/settings.json` up to `~/.claude/settings.json.herdr-notes.bak`;
+later runs KEEP that original backup rather than overwriting it, so it always
+holds your pre-install settings. Pass `-Remove` to uninstall.
+
+Windows PowerShell 5.1 works too (`powershell scripts\install-prompt-hook.ps1`)
+— the script writes UTF-8 without a BOM on both editions.
+
+The installer only ever touches its own hook entry: if you've merged the
+herdr-notes command into an existing `UserPromptSubmit` entry alongside some
+other tool, re-running it (or `-Remove`) drops just the herdr-notes hook
+object and leaves every sibling hook in that entry alone.
+
+Would rather not run a script against your global settings? Add this to the
+`hooks.UserPromptSubmit` array in `~/.claude/settings.json` yourself:
+
+```json
+{
+  "hooks": [
+    {
+      "type": "command",
+      "command": "\"C:\\path\\to\\herdr-notes\\target\\release\\herdr-notes.exe\" --capture-prompt",
+      "timeout": 5
+    }
+  ]
+}
+```
+
+Set `HERDR_NOTES_NO_CAPTURE=1` in the environment to turn capture off without
+touching the hook registration.
+
+Known limits, from the design doc:
+
+- **Codex panes capture nothing.** Codex has no submit-time hook equivalent to
+  `UserPromptSubmit`. On a mixed grid, only the Claude panes will have
+  history. This is a gap in the ecosystem, not something this design can
+  close.
+- **The note must exist first.** Open Notes in a tab, write something, and
+  only then do prompts start accumulating. "I opened Notes and see no
+  prompts" is the expected behavior on a fresh tab, not a bug.
+- **Pane files orphan** when their pane closes, exactly as note files orphan
+  when their tab closes. Tab and pane ids are never reused, so an orphan is a
+  dead file rather than a stale-content risk.
+
 ## Hacking
 
 `CLAUDE.md` has the build/dev workflow and the hard-won herdr/Windows
