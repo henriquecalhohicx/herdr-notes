@@ -19,7 +19,9 @@ findings doc (and the reference implementation, `herdr-sidebar`) lives in
   shows the title). Preview also carries a checkbox cursor (`box_cursor`, an
   ordinal into `markdown::checkbox_lines` — `j`/`k` hop between checkbox
   lines and clamp at either end, `space` flips the box straight in
-  `note.text`; every rendered row of a wrapped item highlights together via
+  `note.text`, `esc` drops the cursor — the ONLY deliberate exit, every
+  other one is a side effect; every rendered row of a wrapped item
+  highlights together via
   `render_markdown_mapped`'s row→source-line map). Scrolling the cursor into
   view is one-shot (`follow_box`, cleared after the next draw) so it only
   fires right after `j`/`k`/`space` move the cursor — gating it on the
@@ -33,10 +35,11 @@ findings doc (and the reference implementation, `herdr-sidebar`) lives in
   shows mode, title, scroll hint, then the note's age last and
   ALL-OR-NOTHING (pushed only when the whole `2h ago` token fits the header
   width, measured in display columns — never clipped to `2h ag`); the footer
-  has a full (69-col) and a short (37-col) form
-  (`PREVIEW_HINTS`/`PREVIEW_HINTS_SHORT`), chosen by pane width, which drops
-  the floor for keeping `q quit` on screen from 69 columns to 37. There is
-  also a notes-list overlay
+  has a full and a short form, chosen by pane width, which drops the floor
+  for keeping `q quit` on screen from 69 columns to 37 — and a second pair
+  (`PREVIEW_HINTS_CURSOR`/`_CURSOR_SHORT`, 79/39 cols) used only while a
+  checkbox cursor is live, adding `esc drop` at the cost of `l list` in the
+  narrow form. There is also a notes-list overlay
   (`l` in preview: navigate with Up/Down or j/k, `enter` opens a read-only
   scrollable preview of the selected note, `r` renames it, `d` deletes it
   with a y/N confirm, `esc`/`l` closes the overlay). v2 turned the overlay

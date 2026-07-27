@@ -450,6 +450,12 @@ impl App {
             KeyCode::Char('j') => self.move_box(1),
             KeyCode::Char('k') => self.move_box(-1),
             KeyCode::Char(' ') => self.toggle_box(),
+            // The only way out of the checkbox cursor. Without it the
+            // highlight is a mode you can enter and not leave — the other
+            // exits are all side effects (swap documents, `x` clear, edit the
+            // last box away). Esc is otherwise unbound here and still must
+            // never quit the TUI.
+            KeyCode::Esc => self.clear_box_cursor(),
             KeyCode::PageUp => self.preview_scroll = self.preview_scroll.saturating_sub(page),
             KeyCode::PageDown => self.preview_scroll = self.preview_scroll.saturating_add(page),
             // g/G because herdr `pane send-keys` rejects Home/End.
@@ -928,20 +934,29 @@ impl App {
         }
         frame.render_widget(Paragraph::new(Line::from(title)), title_a);
 
-        // The full hint line (69 columns) no longer fits a narrow right dock,
-        // and it ends in `q quit` — exactly what clipping would eat. The short
-        // form is 37 columns, so it clips too below 37; the floor for keeping
-        // `q quit` on screen just drops from 69 columns to 37.
+        // The full hint line no longer fits a narrow right dock, and it ends
+        // in `q quit` — exactly what clipping would eat. Each form is picked
+        // by width so `q quit` survives down to the shortest one's own length
+        // (37 columns bare, 39 with the cursor hint); below that it clips.
+        // `esc drop` appears only while a checkbox cursor is live: it is the
+        // only exit from that cursor, and advertising it unconditionally
+        // would spend scarce columns on a key that does nothing. It costs
+        // `l list` its place in the narrow cursor form — while you are stuck
+        // in a cursor, the way out beats the way to the dashboard.
         const PREVIEW_HINTS: &str =
             " e edit  j/k spc tick  r title  l list  Up/Dn scroll  x clear  q quit";
         const PREVIEW_HINTS_SHORT: &str = " e edit  j/k spc tick  l list  q quit";
+        const PREVIEW_HINTS_CURSOR: &str =
+            " e edit  j/k spc tick  esc drop  r title  l list  Up/Dn scroll  x clear  q quit";
+        const PREVIEW_HINTS_CURSOR_SHORT: &str = " e edit  j/k spc tick  esc drop  q quit";
         let hints = match self.note.mode {
             Mode::Preview => {
-                if usize::from(hint_a.width) >= PREVIEW_HINTS.chars().count() {
-                    PREVIEW_HINTS
+                let (full, short) = if self.box_cursor.is_some() {
+                    (PREVIEW_HINTS_CURSOR, PREVIEW_HINTS_CURSOR_SHORT)
                 } else {
-                    PREVIEW_HINTS_SHORT
-                }
+                    (PREVIEW_HINTS, PREVIEW_HINTS_SHORT)
+                };
+                if usize::from(hint_a.width) >= full.chars().count() { full } else { short }
             }
             Mode::Edit => " Esc preview (saves)   Ctrl+S save",
         };
@@ -2228,6 +2243,36 @@ mod tests {
         let narrow = rendered(&mut a, 40, 8);
         assert!(narrow.contains("j/k spc tick"), "the new binding survives truncation: {narrow}");
         assert!(narrow.contains("q quit"), "quit must never be the thing that gets clipped: {narrow}");
+    }
+
+    #[test]
+    fn esc_drops_the_checkbox_cursor() {
+        // A mode you can enter must be a mode you can leave. Esc is the only
+        // free key in preview and it must still never quit the TUI.
+        let mut a = app("[ ] one\n[ ] two");
+        a.on_key(key(KeyCode::Char('j')));
+        assert_eq!(a.box_cursor, Some(0));
+        assert!(!a.on_key(key(KeyCode::Esc)), "Esc in preview must not quit");
+        assert_eq!(a.box_cursor, None, "Esc drops the cursor");
+        assert!(!a.follow_box, "and the pending scroll-follow with it");
+        // Harmless with no cursor set.
+        assert!(!a.on_key(key(KeyCode::Esc)));
+        assert_eq!(a.box_cursor, None);
+        // The note itself is untouched — Esc cancels the cursor, not an edit.
+        assert_eq!(a.note.text, "[ ] one\n[ ] two");
+    }
+
+    #[test]
+    fn the_footer_advertises_esc_only_while_a_cursor_is_live() {
+        let mut a = app("[ ] one");
+        assert!(!rendered(&mut a, 90, 8).contains("esc drop"), "no cursor, no hint");
+        a.on_key(key(KeyCode::Char('j')));
+        let wide = rendered(&mut a, 90, 8);
+        assert!(wide.contains("esc drop"), "cursor live, hint shown: {wide}");
+        // The hint must not cost `q quit` its place at a real dock width.
+        let narrow = rendered(&mut a, 40, 8);
+        assert!(narrow.contains("esc drop"), "{narrow}");
+        assert!(narrow.contains("q quit"), "{narrow}");
     }
 
     // ----- per-document state must not survive a document swap or a wipe ---
