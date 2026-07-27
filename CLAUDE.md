@@ -16,10 +16,25 @@ findings doc (and the reference implementation, `herdr-sidebar`) lives in
 - `src/app.rs` — App state: preview/edit, clear-confirm overlay, 2s debounced
   autosave, 5s heartbeat, scrollbars, in-note title editing (`r` in preview
   sets/renames the note's title — Enter saves, Esc cancels — the header
-  shows the title), and a notes-list overlay (`l` in preview: navigate with
-  Up/Down or j/k, `enter` opens a read-only scrollable preview of the
-  selected note, `r` renames it, `d` deletes it with a y/N confirm, `esc`/`l`
-  closes the overlay). v2 turned the overlay into a cross-session dashboard:
+  shows the title). Preview also carries a checkbox cursor (`box_cursor`, an
+  ordinal into `markdown::checkbox_lines` — `j`/`k` hop between checkbox
+  lines and clamp at either end, `space` flips the box straight in
+  `note.text`; every rendered row of a wrapped item highlights together via
+  `render_markdown_mapped`'s row→source-line map). Scrolling the cursor into
+  view is one-shot (`follow_box`, cleared after the next draw) so it only
+  fires right after `j`/`k`/`space` move the cursor — gating it on the
+  cursor merely existing instead would re-force the viewport to it on every
+  draw and make `Up`/`Down`/`g`/`G`/PgUp/PgDn look broken the instant a
+  cursor is set. A fresh note is seeded with `template::DEFAULT` on the
+  first `e` (lazy — a tab you only toggled Notes into writes no file); the
+  header shows mode, title, scroll hint, then the note's age last (so age is
+  the first thing clipped on a narrow dock); the footer has a full and a
+  short form (`PREVIEW_HINTS`/`PREVIEW_HINTS_SHORT`), chosen by pane width
+  so a narrow dock never clips `q quit`. There is also a notes-list overlay
+  (`l` in preview: navigate with Up/Down or j/k, `enter` opens a read-only
+  scrollable preview of the selected note, `r` renames it, `d` deletes it
+  with a y/N confirm, `esc`/`l` closes the overlay). v2 turned the overlay
+  into a cross-session dashboard:
   each row shows session context (`workspace · agent` for live tabs, else a
   dim `closed`/`?`) instead of a status word, colored (green live / gray
   closed / cyan global) and sorted live-first-then-newest; `/` filters rows by
@@ -35,8 +50,16 @@ findings doc (and the reference implementation, `herdr-sidebar`) lives in
   delete/rename is gated on `showing_tab_note()` — acting on your own
   tab-note row while viewing the global note must NOT touch the global buffer
   (that path silently deleted `global.json`; see Gotchas)
-- `src/markdown.rs` — hand-rolled renderer (headings, lists, checkboxes, quotes,
-  code, bold/italic, hr) + display-width wrapping
+- `src/markdown.rs` — hand-rolled renderer (headings, lists, checkboxes —
+  bare `[ ]`/`[x]` as well as `- [ ]`/`* [ ]` — quotes, code, bold/italic, hr)
+  + display-width wrapping. Also the crate's ONLY checkbox parser:
+  `checkbox_lines`/`checkbox_counts`/`toggle_checkbox` (all fence-aware) and
+  `render_markdown_mapped`, which returns a per-rendered-row source-line map
+  (one source line can wrap to several rows, which all map back to it);
+  `render_markdown` is now a thin wrapper over the mapped form with its
+  signature unchanged
+- `src/template.rs` — the Status/Next/Notes skeleton, one const. `is_blank`
+  treats the pristine template as blank, so seeding cannot leak orphan files
 - `src/state.rs` — `{text, mode, title, tab_id, created, updated}` JSON (v2 —
   older `{text, mode}` files still load, missing fields fall back to
   defaults; `created` is stamped once, `updated` bumps on every save). A
@@ -192,6 +215,27 @@ Learned building this plugin:
   carry `tab_id` and — only once an agent is reported on the pane — `agent`
   (a bare shell pane has just `agent_status`, so the code's
   `else continue` on a missing `agent` is the normal path, not an error).
+- The markdown checkbox parser accepts a BARE `[ ]` as well as `- [ ]` /
+  `* [ ]`. It did not originally, which made the seed template's own tasks
+  invisible to the cursor and the progress count while rendering identically
+  (`- [ ] x` renders as `[ ] x`, so the bug was invisible on screen). Any
+  second `[ ]` scan added anywhere else in the crate will drift from this one
+  — count and toggle through `markdown::` only.
+- Seeding a template into a fresh note re-opens the orphan-file hole the
+  blank-note delete rule closed: the buffer is no longer empty, so the file
+  persists for every tab where someone pressed `e` once and walked away, and
+  tab ids are never reused to reclaim it. `is_blank` therefore also matches
+  the pristine template exactly.
+- One source line can render to several rows (width wrapping), so anything
+  mapping a screen row back to the note text needs `render_markdown_mapped`,
+  not row arithmetic. Highlight ALL rows of a wrapped item or it looks
+  half-selected.
+- The checkbox cursor's scroll-follow must be gated on the cursor having
+  just MOVED (`follow_box`, a one-shot flag cleared after the next draw),
+  not on a cursor merely existing. Gating on existence alone re-forces the
+  viewport back to the cursor on every draw, so every other scroll key
+  (`Up`/`Down`/`g`/`G`/PgUp/PgDn) looks broken the instant a checkbox cursor
+  is set.
 
 ## README screenshots (Alex's criteria — follow on every reshoot)
 
