@@ -230,6 +230,30 @@ mod tests {
     }
 
     #[test]
+    fn equal_timestamps_in_one_file_order_by_text_not_by_file_order() {
+        // Deliberately stored zebra-then-alpha: a ts-only stable sort would
+        // preserve that, so this is the case that actually discriminates the
+        // tie-break from the pre-fix comparator. Unlike the cross-pane test
+        // below, it does not lean on read_dir order, which on NTFS is
+        // already alphabetical and would mask the bug.
+        let dir = tempdir().join("text_ties");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let entries = vec![
+            Prompt { ts: 100, pane: "w1:p5".into(), agent: "claude".into(), text: "zebra".into() },
+            Prompt { ts: 100, pane: "w1:p5".into(), agent: "claude".into(), text: "alpha".into() },
+        ];
+        std::fs::write(prompts_file(&dir, "w1_t1", "w1_p5"), to_json(&entries)).unwrap();
+        let got = load_for_tab(&dir, "w1_t1");
+        assert_eq!(
+            got.iter().map(|p| p.text.as_str()).collect::<Vec<_>>(),
+            vec!["alpha", "zebra"],
+            "equal ts in one file order by text, not by position in the file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn load_for_tab_merges_pane_files_newest_first() {
         let dir = tempdir().join("merge");
         let _ = std::fs::remove_dir_all(&dir);
@@ -257,7 +281,15 @@ mod tests {
     #[test]
     fn load_for_tab_breaks_ts_ties_deterministically() {
         // Four agent panes in one tab write within the same second; read_dir
-        // order is not guaranteed, so the merge must impose its own.
+        // order is not guaranteed, so the merge must impose its own. NOTE:
+        // on a filesystem whose read_dir already returns entries in
+        // filename-alphabetical order (e.g. NTFS), this test cannot
+        // discriminate the tie-break fix from the pre-fix ts-only sort,
+        // since "alphabetical by filename" and "pane ascending" coincide for
+        // these inputs. It stays as a useful determinism/idempotence check;
+        // `equal_timestamps_in_one_file_order_by_text_not_by_file_order`
+        // above is the test that actually fails against the pre-fix
+        // comparator on every platform.
         let dir = tempdir().join("ties");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
