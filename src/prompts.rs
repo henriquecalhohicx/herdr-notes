@@ -100,7 +100,6 @@ pub fn append_at(path: &Path, entry: Prompt) {
 /// `RING`. The `__` in the filename is what keeps `w1_t1` from matching
 /// `w1_t10`'s files — the separator is part of the prefix. Best-effort: an
 /// unreadable dir or file contributes nothing.
-#[allow(dead_code)] // called by the capture-gate render path (Task 5)
 pub fn load_for_tab(dir: &Path, tab_key: &str) -> Vec<Prompt> {
     let prefix = format!("{tab_key}__");
     let Ok(entries) = std::fs::read_dir(dir) else {

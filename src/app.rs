@@ -223,6 +223,11 @@ pub struct App {
     /// — draw clears it once applied — so a cursor merely existing does not
     /// fight manual scrolling (`Up`/`Dn`/`g`/`G`/PgUp/PgDn) on every frame.
     follow_box: bool,
+    /// The tab's captured prompts, newest first — merged from every agent
+    /// pane's file by `prompts::load_for_tab`, refreshed on the heartbeat
+    /// rather than per draw (a directory scan every 500ms frame is waste).
+    /// Rendered above the note, never part of the edit buffer.
+    prompts: Vec<crate::prompts::Prompt>,
     confirm_clear: bool,
     dirty: bool,
     last_edit: Instant,
@@ -258,6 +263,7 @@ impl App {
             preview_scroll: 0,
             box_cursor: None,
             follow_box: false,
+            prompts: Vec::new(),
             confirm_clear: false,
             dirty: false,
             last_edit: Instant::now(),
@@ -382,6 +388,7 @@ impl App {
         }
         self.last_beat = Instant::now();
         self.report_tokens();
+        self.refresh_prompts();
     }
 
     fn report_tokens(&self) {
@@ -397,6 +404,19 @@ impl App {
                 "tokens": { METADATA_SOURCE: now },
             }),
         );
+    }
+
+    /// Re-read the tab's prompt files. Only the tab note has prompts — the
+    /// global note is not a tab. Gated on `persist` so unit tests never touch
+    /// the real store dir.
+    fn refresh_prompts(&mut self) {
+        if !self.persist || !self.showing_tab_note() {
+            self.prompts.clear();
+            return;
+        }
+        let Some(dir) = state::store_dir() else { return };
+        let Some(key) = state::tab_env().as_deref().and_then(state::id_key) else { return };
+        self.prompts = crate::prompts::load_for_tab(&dir, &key);
     }
 
     // ----- keys --------------------------------------------------------
@@ -987,7 +1007,24 @@ impl App {
         // The rightmost column is reserved for the overflow scrollbar so text
         // never sits underneath it.
         let text_w = usize::from(area.width).saturating_sub(1).max(1);
-        let (mut lines, map) = render_markdown_mapped(&self.note.text, text_w);
+        let (mut lines, mut map) = render_markdown_mapped(&self.note.text, text_w);
+        // The block's rows map to NO source line, so the checkbox cursor can
+        // never land on one and the highlight/scroll-follow keep pointing at
+        // real note lines. Edit mode never reaches here. `refresh_prompts`
+        // clears `self.prompts` off the tab note in the running app, but a
+        // unit test can set `active`/`prompts` directly without going through
+        // it, so the render site re-checks `showing_tab_note()` itself rather
+        // than trusting that invariant to always hold by the time we draw.
+        let block = if self.showing_tab_note() { prompt_block(&self.prompts, text_w) } else { Vec::new() };
+        if !block.is_empty() {
+            let n = block.len();
+            let mut merged = block;
+            merged.append(&mut lines);
+            lines = merged;
+            let mut merged_map = vec![None; n];
+            merged_map.append(&mut map);
+            map = merged_map;
+        }
         let total = lines.len();
         let max = total.saturating_sub(usize::from(area.height));
         if let Some(src) = self.cursor_line() {
@@ -1334,6 +1371,27 @@ fn fit_right(context: &str, progress: &str, age: &str, budget: usize) -> String 
     .unwrap_or_default()
 }
 
+/// The dim `Last Prompts` block rendered above the note: a heading, up to
+/// `RING` numbered entries truncated to the pane width, and a rule. Returns
+/// no rows at all when there is nothing to show, so the note keeps the space.
+fn prompt_block(prompts: &[crate::prompts::Prompt], width: usize) -> Vec<Line<'static>> {
+    if prompts.is_empty() {
+        return Vec::new();
+    }
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let mut out = vec![Line::from(Span::styled(
+        "Last Prompts",
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
+    ))];
+    for (i, p) in prompts.iter().enumerate() {
+        // The number and its separator cost 3 columns.
+        let body = truncate_w(&p.text, width.saturating_sub(3));
+        out.push(Line::from(Span::styled(format!("{}. {body}", i + 1), dim)));
+    }
+    out.push(Line::from(Span::styled("─".repeat(width), dim)));
+    out
+}
+
 fn format_row(marker: &str, self_mark: &str, name: &str, right: &str, inner_width: usize) -> String {
     let budget = inner_width.saturating_sub(2);
     let prefix_w = dwidth(marker) + dwidth(self_mark);
@@ -1389,6 +1447,65 @@ mod tests {
             Note { text: text.to_string(), mode: Mode::Preview, ..Default::default() },
             false, // never touch the real state file from tests
         )
+    }
+
+    fn prompt(ts: u64, text: &str) -> crate::prompts::Prompt {
+        crate::prompts::Prompt { ts, pane: "w1:p5".into(), agent: "claude".into(), text: text.into() }
+    }
+
+    #[test]
+    fn preview_renders_the_prompt_block_above_the_note() {
+        let mut a = app("## Status\nmid-refactor");
+        a.prompts = vec![prompt(2, "add the rate limiter"), prompt(1, "why is auth flaky")];
+        let screen = rendered(&mut a, 60, 14);
+        assert!(screen.contains("Last Prompts"), "{screen}");
+        assert!(screen.contains("add the rate limiter"), "{screen}");
+        let block_at = screen.find("add the rate limiter").unwrap();
+        let note_at = screen.find("mid-refactor").unwrap();
+        assert!(block_at < note_at, "the block sits above the note: {screen}");
+    }
+
+    #[test]
+    fn the_prompt_block_is_absent_without_prompts() {
+        let mut a = app("## Status\nmid-refactor");
+        assert!(!rendered(&mut a, 60, 14).contains("Last Prompts"));
+    }
+
+    #[test]
+    fn the_prompt_block_never_shows_on_the_global_note_or_in_edit_mode() {
+        let mut a = app("## Status\nmid-refactor");
+        a.prompts = vec![prompt(1, "add the rate limiter")];
+        a.active = ActiveNote::Global;
+        assert!(!rendered(&mut a, 60, 14).contains("Last Prompts"), "global is not a tab");
+
+        let mut b = app("## Status\nmid-refactor");
+        b.prompts = vec![prompt(1, "add the rate limiter")];
+        b.on_key(key(KeyCode::Char('e')));
+        assert!(!rendered(&mut b, 60, 14).contains("Last Prompts"), "the edit buffer is yours alone");
+    }
+
+    #[test]
+    fn the_checkbox_cursor_ignores_the_prompt_block() {
+        // The block's rows carry None in the provenance map, so j/k and the
+        // highlight must still resolve to the note's own checkbox lines.
+        let mut a = app("[ ] first\n[ ] second");
+        a.prompts = vec![prompt(2, "add the rate limiter"), prompt(1, "why is auth flaky")];
+        let _ = rendered(&mut a, 60, 14);
+        a.on_key(key(KeyCode::Char('j')));
+        assert_eq!(a.box_cursor, Some(0));
+        a.on_key(key(KeyCode::Char(' ')));
+        assert_eq!(a.note.text, "[x] first\n[ ] second", "space hit the note's first box, not a prompt row");
+        let _ = rendered(&mut a, 60, 14);
+    }
+
+    #[test]
+    fn long_prompts_are_truncated_to_the_pane_width() {
+        let mut a = app("## Status\nmid-refactor");
+        a.prompts = vec![prompt(1, &"z".repeat(200))];
+        let screen = rendered(&mut a, 30, 14);
+        for line in screen.lines() {
+            assert!(dwidth(line.trim_end()) <= 30, "row overflows the pane: {line:?}");
+        }
     }
 
     #[test]
