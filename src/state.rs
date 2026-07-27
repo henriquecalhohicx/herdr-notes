@@ -506,13 +506,27 @@ pub fn set_title(file: &Path, title: &str) {
     persist_at(file, &note, &tab_id, unix_now());
 }
 
+/// Serializes every test in this crate that mutates the process-global
+/// `HERDR_*` env vars — the `store_base_*` tests below, which read them
+/// directly, AND several `app.rs` tests that point `HERDR_PLUGIN_STATE_DIR`/
+/// `HERDR_TAB_ID`/etc. at a temp dir to drive real persistence. All tests in
+/// the crate compile into ONE binary and `cargo test` runs them on separate
+/// threads, so two per-module locks do not serialize against each other —
+/// only a single shared instance does, which is why this lives here at
+/// module scope instead of inside `mod tests` (and why `app.rs` reaches
+/// across to it rather than declaring its own). A test that panics while
+/// holding this lock poisons it for every other test that acquires it
+/// afterward; every acquisition site recovers with
+/// `.unwrap_or_else(|e| e.into_inner())` rather than `.unwrap()`, treating a
+/// poisoned lock as still validly held (the guarded state — process env — is
+/// not itself corrupted by a panic elsewhere, only mid-mutation, and each
+/// acquirer already restores every var it touches before releasing).
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Serializes the tests below that mutate process-global `HERDR_*` env
-    /// vars (`store_base` reads them directly). No non-env test reads these.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn store_base_prefers_explicit_plugin_state_dir_over_herdr_env() {

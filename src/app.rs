@@ -1354,11 +1354,13 @@ fn format_row(marker: &str, self_mark: &str, name: &str, right: &str, inner_widt
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Serializes the env-mutating tests (they set process-global HERDR_* vars).
-    /// No non-env test reads these, so this only guards env tests against each
-    /// other.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // Shared with `state.rs` (`crate::state::ENV_LOCK`): both modules have
+    // tests that mutate the same process-global `HERDR_*` vars, and since
+    // every test in the crate compiles into one binary running on parallel
+    // threads, a lock private to this module would not serialize against
+    // `state.rs`'s tests touching the same vars. See its doc comment there
+    // for the poisoned-lock convention.
+    use crate::state::ENV_LOCK;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
