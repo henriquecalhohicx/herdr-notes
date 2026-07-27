@@ -191,9 +191,10 @@ fn build_tab_index(
 /// What the prompt block needs to know about a pane. Built from one
 /// `pane.list` call; every field is optional at the source, so a missing one
 /// degrades rather than dropping the pane.
-// Whole item unused until Task 5 wires the grouped renderer up to this
-// index; `cwd` and `tab_id` stay unread even after `build_pane_index` and
-// `pane_label` are exercised by the tests below. Task 5 removes this.
+// Task 3 gives `pane_index`/`build_pane_index`/`meaningful_title`/
+// `pane_label` a production caller, but `cwd` and `tab_id` stay unread even
+// then — Task 5's `maybe_autotitle` is the first to read them. Task 5
+// removes this allow.
 #[allow(dead_code)]
 struct PaneInfo {
     /// "" when herdr has not reported an agent on this pane yet — a bare
@@ -212,9 +213,9 @@ const GENERIC_TITLES: [&str; 4] = ["claude code", "claude", "codex", "codex cli"
 
 /// One `pane.list` round-trip. `None` on any call or parse failure — every
 /// caller falls back, so the block works offline.
-// No production caller until Task 5 wires the grouped renderer to this
-// fetcher (mirrors `tab_contexts`, which gets its caller in the same way).
-// Task 5 removes this allow.
+// No production caller until Task 3's `refresh_prompts` calls this
+// directly (mirrors `tab_contexts`, which gets its caller the same way).
+// Task 3 removes this allow.
 #[allow(dead_code)]
 fn pane_index() -> Option<PaneIndex> {
     Some(build_pane_index(&fetch_array("pane.list", "panes")?))
@@ -223,8 +224,8 @@ fn pane_index() -> Option<PaneIndex> {
 /// Pure builder over an already-fetched `panes` array — no I/O, so it is
 /// unit-tested against captured live responses. An item with no `pane_id` is
 /// the only thing skipped; everything else degrades to a default.
-// Exercised only by tests until Task 5 wires up the grouped renderer that
-// calls this from production code. Task 5 removes this allow.
+// Exercised only by tests until Task 3's `refresh_prompts` calls
+// `pane_index`, which calls this. Task 3 removes this allow.
 #[allow(dead_code)]
 fn build_pane_index(panes: &[serde_json::Value]) -> PaneIndex {
     let mut out = PaneIndex::new();
@@ -249,8 +250,8 @@ fn build_pane_index(panes: &[serde_json::Value]) -> PaneIndex {
 /// A terminal title worth showing: trimmed, non-empty, not the tool naming
 /// itself (`Claude Code` on an idle pane), and not a filesystem path (a bare
 /// shell pane reports its `powershell.exe` path). `None` when it says nothing.
-// Exercised only by tests until Task 3/5 call this from the grouped
-// renderer's heading logic. Task 5 removes this allow.
+// Exercised only by tests until Task 3's `pane_label` calls this
+// internally. Task 3 removes this allow.
 #[allow(dead_code)]
 fn meaningful_title(title: &str, agent: &str) -> Option<String> {
     let t = title.trim();
@@ -271,8 +272,8 @@ fn meaningful_title(title: &str, agent: &str) -> Option<String> {
 /// otherwise `{agent} {pane-suffix}` (`claude p8`) built from data the stored
 /// prompt always carries — so a closed pane or an unreachable socket still
 /// names its group.
-// Exercised only by tests until Task 3 wires this into the grouped
-// renderer. Task 5 removes this allow.
+// Exercised only by tests until Task 3's `refresh_prompts` calls this
+// directly. Task 3 removes this allow.
 #[allow(dead_code)]
 fn pane_label(pane_id: &str, agent: &str, index: Option<&PaneIndex>) -> String {
     if let Some(info) = index.and_then(|i| i.get(pane_id))
