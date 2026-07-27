@@ -102,10 +102,13 @@ pub fn append_at(path: &Path, entry: Prompt) {
     crate::state::write_atomic(path, &to_json(&entries));
 }
 
-/// Every pane file belonging to `tab_key`, merged and sorted newest-first,
-/// capped at `RING`. The `__` in the filename is what keeps `w1_t1` from
-/// matching `w1_t10`'s files — the separator is part of the prefix.
-/// Best-effort: an unreadable dir or file contributes nothing.
+/// Every pane file belonging to `tab_key`, merged and sorted newest `ts`
+/// first, ties broken by `pane` ascending then `text` ascending (so panes
+/// racing within the same second still order deterministically — `read_dir`
+/// order is not guaranteed across platforms or filesystems), capped at
+/// `RING`. The `__` in the filename is what keeps `w1_t1` from matching
+/// `w1_t10`'s files — the separator is part of the prefix. Best-effort: an
+/// unreadable dir or file contributes nothing.
 #[allow(dead_code)] // called by the capture-gate render path (Task 5)
 pub fn load_for_tab(dir: &Path, tab_key: &str) -> Vec<Prompt> {
     let prefix = format!("{tab_key}__");
@@ -123,7 +126,7 @@ pub fn load_for_tab(dir: &Path, tab_key: &str) -> Vec<Prompt> {
             out.extend(parse_file(&json));
         }
     }
-    out.sort_by_key(|p| std::cmp::Reverse(p.ts));
+    out.sort_by(|a, b| b.ts.cmp(&a.ts).then_with(|| a.pane.cmp(&b.pane)).then_with(|| a.text.cmp(&b.text)));
     out.truncate(RING);
     out
 }
@@ -248,6 +251,29 @@ mod tests {
             vec!["new p5", "new p6", "old p6"],
             "newest first across both panes, capped at RING"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_for_tab_breaks_ts_ties_deterministically() {
+        // Four agent panes in one tab write within the same second; read_dir
+        // order is not guaranteed, so the merge must impose its own.
+        let dir = tempdir().join("ties");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for pane in ["w1_p9", "w1_p5", "w1_p7"] {
+            let raw = pane.replace('_', ":");
+            let entry = Prompt { ts: 100, pane: raw, agent: "claude".into(), text: format!("from {pane}") };
+            std::fs::write(prompts_file(&dir, "w1_t1", pane), to_json(&[entry])).unwrap();
+        }
+        let got = load_for_tab(&dir, "w1_t1");
+        assert_eq!(
+            got.iter().map(|p| p.pane.as_str()).collect::<Vec<_>>(),
+            vec!["w1:p5", "w1:p7", "w1:p9"],
+            "equal timestamps order by pane, not by read_dir"
+        );
+        // Same input, same output, every time.
+        assert_eq!(load_for_tab(&dir, "w1_t1"), got);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
