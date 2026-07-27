@@ -63,7 +63,21 @@ findings doc (and the reference implementation, `herdr-sidebar`) lives in
   NOTE: `is_self` self-mutation on
   delete/rename is gated on `showing_tab_note()` — acting on your own
   tab-note row while viewing the global note must NOT touch the global buffer
-  (that path silently deleted `global.json`; see Gotchas)
+  (that path silently deleted `global.json`; see Gotchas). Per-agent grouping
+  support lives here too: `PaneInfo { agent, tab_id, title, cwd }` and a
+  `PaneIndex` (pane id → `PaneInfo`) built by `build_pane_index` from one
+  `pane.list` call (`pane_index`); `meaningful_title(title, agent)` rejects a
+  blank, tool-generic (`GENERIC_TITLES`), or path-shaped title; `pane_label`
+  heads a prompt group with that title when meaningful, else `{agent}
+  {pane-suffix}`. `App.prompt_labels` is resolved once per `refresh_prompts`
+  (never per draw) from a single best-effort `pane.list`, index-aligned with
+  `App.prompts`. An untitled note with `title_auto` still set derives a title
+  on the heartbeat (`maybe_autotitle`, gated on `showing_tab_note()` and an
+  empty `note.title`): the tab's agent pane's terminal title when meaningful
+  (chosen by `pick_agent_pane`), else its git branch (`git_branch`, at most
+  one `git rev-parse --abbrev-ref HEAD` per cwd for the process's life via
+  `App.git_tried`), else the oldest SURVIVING captured prompt
+  (`oldest_prompt_text`) — resolved by `pick_title`.
 - `src/markdown.rs` — hand-rolled renderer (headings, lists, checkboxes —
   bare `[ ]`/`[x]` as well as `- [ ]`/`* [ ]` — quotes, code, bold/italic, hr)
   + display-width wrapping. Also the crate's ONLY checkbox parser:
@@ -82,24 +96,32 @@ findings doc (and the reference implementation, `herdr-sidebar`) lives in
   ring of the last `RING` (3) prompts per pane file; each prompt is condensed
   to its first line, trimmed, cut to `MAX_CHARS` (120) with a trailing
   ellipsis, so nothing sits on disk that isn't also shown. `load_for_tab`
-  merges every pane file belonging to a tab, newest `ts` first (ties broken by
-  pane then text, since `read_dir` order isn't guaranteed across platforms),
-  capped at `RING`. `capture` is a gate chain — the `HERDR_NOTES_NO_CAPTURE`
-  off switch, running inside herdr, filename-safe tab AND pane ids, an
-  existing note file for this tab (no note, no capture — a tab that never
-  opened Notes gets no prompt file either), a usable `prompt` field in the
-  hook's stdin payload — every rejection silent and total, because the caller
-  runs inside a `UserPromptSubmit` hook. Gate 4 asks `state::note_file_in` for
-  the note path rather than spelling `<key>.json` again — the hook is a second
-  process and prints nothing, so a layout drift would stop capture with no
-  diagnostic anywhere. `App.prompts` (`app.rs`) re-reads via `load_for_tab`
-  and renders a dim "Last Prompts" block above the note in preview — including
-  above the empty-note help, since a titled body-less note keeps its file and
-  so keeps accumulating prompts — gated on `showing_tab_note()` (the global
-  note is not a tab and carries no prompts). `refresh_prompts` runs at
-  construction, at the end of `toggle_global`, and on the 5s heartbeat: the
-  first two exist so the block is never blank while the user waits out a
-  throttled heartbeat, which reads exactly like capture being broken
+  returns one `PromptGroup { pane, prompts }` per distinct `pane` FIELD across
+  every file belonging to the tab (not per filename — a hand-edited file
+  holding two panes' entries still splits correctly), each group's own
+  prompts newest-`ts`-first and capped at its own `RING` (four agents keep
+  three each, not three between them), groups themselves ordered by newest
+  `ts` descending, ties broken on `pane` ascending (`read_dir` order isn't
+  guaranteed across platforms). `capture` is a gate chain — the
+  `HERDR_NOTES_NO_CAPTURE` off switch, running inside herdr, filename-safe tab
+  AND pane ids, an existing note file for this tab (no note, no capture — a
+  tab that never opened Notes gets no prompt file either), a usable `prompt`
+  field in the hook's stdin payload — every rejection silent and total,
+  because the caller runs inside a `UserPromptSubmit` hook. Gate 4 asks
+  `state::note_file_in` for the note path rather than spelling `<key>.json`
+  again — the hook is a second process and prints nothing, so a layout drift
+  would stop capture with no diagnostic anywhere. `App.prompts` (`app.rs`)
+  re-reads via `load_for_tab` into a `Vec<PromptGroup>`, and `prompt_block`
+  renders one heading per group above the note in preview — there is
+  deliberately NO single "Last Prompts" heading any more, each group is headed
+  by its own resolved label, numbering restarts at 1 per group, and a blank
+  line separates groups — including above the empty-note help, since a titled
+  body-less note keeps its file and so keeps accumulating prompts — gated on
+  `showing_tab_note()` (the global note is not a tab and carries no prompts).
+  `refresh_prompts` runs at construction, at the end of `toggle_global`, and
+  on the 5s heartbeat: the first two exist so the block is never blank while
+  the user waits out a throttled heartbeat, which reads exactly like capture
+  being broken
 - `src/template.rs` — the Status/Next/Notes skeleton, one const. Every
   section ships EMPTY — no placeholder prose: edit mode has no line-kill,
   word-delete or selection, so a placeholder would cost `End` plus one
@@ -108,9 +130,12 @@ findings doc (and the reference implementation, `herdr-sidebar`) lives in
   `==`; whitespace-stripping editor tooling silently breaks it — verify with
   `git show HEAD:src/template.rs | cat -A`). `is_blank`
   treats the pristine template as blank, so seeding cannot leak orphan files
-- `src/state.rs` — `{text, mode, title, tab_id, created, updated}` JSON (v2 —
-  older `{text, mode}` files still load, missing fields fall back to
-  defaults; `created` is stamped once, `updated` bumps on every save). A
+- `src/state.rs` — `{text, mode, title, title_auto, tab_id, created, updated}`
+  JSON (v2 — older `{text, mode}` files still load, missing fields fall back
+  to defaults; `created` is stamped once, `updated` bumps on every save).
+  `title_auto`'s missing-field default is `title.trim().is_empty()` — a
+  pre-existing file with a title reads as manual, an untitled one reads as
+  derivable, which is the entire migration for free. A
   note with no text AND no title is DELETED on save instead of written —
   see Gotchas. One file PER TAB in herdr's
   plugin state dir (`HERDR_PLUGIN_STATE_DIR/<tab-key>.json`, e.g.
@@ -375,6 +400,39 @@ Learned building this plugin:
   agent panes, and a shared per-tab file would mean concurrent
   read-modify-write from independent hook processes (each `UserPromptSubmit`
   fires as its own short-lived process with no coordination between panes).
+- `terminal_title_stripped` is the ONLY human-readable per-pane string herdr
+  exposes — there is no pane label or name field (verified against a live
+  `pane.list` on 0.7.4, whose full key set is `agent`, `agent_session`,
+  `agent_status`, `cwd`, `focused`, `pane_id`, `revision`, `scroll`, `tab_id`,
+  `terminal_id`, `terminal_title`, `terminal_title_stripped`, `tokens`,
+  `workspace_id`). It is unreliable: a working Claude pane reads `HM-54271
+  Generic Importer Config API`, an idle one reads `Claude Code`, a shell pane
+  reads its `powershell.exe` path. Anything using it needs the generic-name
+  and path-shaped rejections in `meaningful_title`.
+- `title_auto`'s missing-field default is `title.trim().is_empty()`. That is
+  the entire migration for existing notes, and inverting it would make every
+  note the user has already named start re-deriving over the top of them.
+- The auto-title git call is bounded to one attempt per cwd per process
+  (`App.git_tried`). Without the bound, a tab that is not a repo spawns `git`
+  every 5 seconds for the life of the pane. On Windows it is spawned with
+  `CREATE_NO_WINDOW`, or a console flashes over the TUI on every attempt.
+- Title source 3 is the oldest SURVIVING prompt, not the first one ever sent
+  — the ring evicts after `RING` submissions.
+- `pick_agent_pane` picks a tab's agent pane by LOWEST pane id, not "first
+  found". `PaneIndex` is a `HashMap`, so `.values().find(...)` would visit
+  panes in an arbitrary, per-process order — on exactly the tab shape this
+  feature targets (a 2×2 agent grid), that means the auto-title source could
+  silently flip between panes across restarts. Sorting by pane id makes the
+  same tab state always yield the same pane, and so the same title/cwd.
+- The empty-note preview branch used to be a fixed-height special case
+  (forced `preview_scroll = 0`, no scrollbar, no hint) on the assumption the
+  prompt block above it could never run more than a couple of rows. Grouping
+  removed that bound — a multi-agent tab's block alone can exceed the pane
+  height — so a titled, body-less note could push the quick-start help off
+  screen with no key able to reach it. `draw_preview` now builds
+  `(lines, map)` the same way on both the empty-note and real-note paths and
+  shares one clamp/scroll/scrollbar/hint tail, so the help is always
+  reachable regardless of block height.
 
 ## README screenshots (Alex's criteria — follow on every reshoot)
 

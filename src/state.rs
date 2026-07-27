@@ -1,16 +1,30 @@
-//! Persistent note state: one scrollable markdown note PER TAB plus the
-//! last-active mode, stored as a small JSON file beside herdr's own config
+//! Persistent note state: one scrollable markdown note PER TAB, plus a single
+//! shared cross-session "global" note, stored as small JSON files so they
+//! survive computer restarts. The store location has three tiers, tried in
+//! order (see `store_base`): an explicit `HERDR_PLUGIN_STATE_DIR` (herdr's
+//! docs-mandated home for durable plugin state); `HERDR_ENV == "1"` with no
+//! such var (any pane running inside herdr, including a `--capture-prompt`
+//! hook pane, which never gets the plugin-scoped var), which resolves the
+//! SAME conventional plugin state dir by convention
+//! (`%LOCALAPPDATA%\herdr\plugins\herdr-notes\` on Windows,
+//! `$XDG_DATA_HOME|~/.local/share/herdr/plugins/herdr-notes/` elsewhere); or,
+//! outside herdr entirely, the legacy config-dir layout
 //! (`%APPDATA%\herdr\notes\<tab-key>.json` on Windows,
-//! `$XDG_CONFIG_HOME/herdr/…` elsewhere) so the note survives computer
-//! restarts. The key is the `HERDR_TAB_ID` herdr injects into every managed
-//! pane (its `:` separator sanitized to `_`); outside herdr (or on an id
-//! unsafe for a filename) the pane falls back to the legacy single-note
-//! `herdr/notes.json`, and the first tab to load notes MOVES that legacy file
-//! into its own slot.
+//! `$XDG_CONFIG_HOME|~/.config/herdr/notes/` elsewhere). The key is the
+//! `HERDR_TAB_ID` herdr injects into every managed pane (its `:` separator
+//! sanitized to `_`); outside herdr (or on an id unsafe for a filename) the
+//! pane falls back to a shared legacy single-note file. The tab note and the
+//! global note each migrate independently: the first load after a newer tier
+//! appears MOVES the file forward from whichever older tier holds it.
 //!
 //! Loading is forgiving — a missing, hand-edited, or truncated file falls back
-//! to an empty note and never panics. Saving is atomic (temp file + rename)
-//! and best-effort: the pane keeps working for the session if persist fails.
+//! to an empty note and never panics. Saving is atomic (temp file + fsync +
+//! rename) and best-effort: the pane keeps working for the session if persist
+//! fails. This module also holds the notes-manager helpers behind the `l`
+//! overlay (`list_notes`, `store_dir`, `classify_tab`, `format_age`,
+//! `filter_rows`, `set_title`) and the `id_key`/`note_file_in` naming shared
+//! with `prompts.rs` so note and prompt files can never disagree about what a
+//! tab/pane id spells on disk.
 
 use std::path::{Path, PathBuf};
 
@@ -449,8 +463,8 @@ pub fn parse(json: &str) -> Note {
     Note { text, mode, title, title_auto, tab_id, created, updated }
 }
 
-/// The JSON that goes on disk: `{ "text", "mode", "title", "tab_id", "created",
-/// "updated" }`.
+/// The JSON that goes on disk: `{ "text", "mode", "title", "title_auto",
+/// "tab_id", "created", "updated" }`.
 pub fn to_json(note: &Note) -> String {
     serde_json::json!({
         "text": note.text,
