@@ -1486,8 +1486,12 @@ mod tests {
 
     #[test]
     fn the_checkbox_cursor_ignores_the_prompt_block() {
-        // The block's rows carry None in the provenance map, so j/k and the
-        // highlight must still resolve to the note's own checkbox lines.
+        // This proves j/k/space resolve against `note.text` (via `box_cursor`
+        // / `move_box` / `toggle_box`, none of which read `map`) independently
+        // of a prompt block being present — NOT that the provenance map is
+        // correctly padded. `the_scroll_follow_accounts_for_the_prompt_block_rows`
+        // below is what actually exercises the map's two real consumers (the
+        // REVERSED highlight and the follow-scroll arithmetic).
         let mut a = app("[ ] first\n[ ] second");
         a.prompts = vec![prompt(2, "add the rate limiter"), prompt(1, "why is auth flaky")];
         let _ = rendered(&mut a, 60, 14);
@@ -1498,14 +1502,76 @@ mod tests {
         let _ = rendered(&mut a, 60, 14);
     }
 
+    /// Converts a rendered `Line`'s spans back to plain text, mirroring
+    /// `markdown::tests::text`.
+    fn line_text(line: &Line) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn prompt_block_truncates_by_display_columns() {
+        // Through `rendered()` this cannot fail — the TestBackend buffer is
+        // exactly w cells wide and Paragraph clips at the edge, so even an
+        // untruncated block would look fine. Call the builder directly, and
+        // use double-width chars: storage truncates by CHAR count, so a
+        // 120-char CJK prompt is ~240 columns and only this render-side
+        // truncation keeps it inside the pane.
+        let wide = prompt(1, &"文".repeat(80));
+        for width in [12usize, 30, 60] {
+            for line in prompt_block(std::slice::from_ref(&wide), width) {
+                let text = line_text(&line);
+                assert!(dwidth(&text) <= width, "row {text:?} is {} cols, want <= {width}", dwidth(&text));
+            }
+        }
+    }
+
     #[test]
     fn long_prompts_are_truncated_to_the_pane_width() {
+        // A smoke test that the whole draw path does not overflow the pane —
+        // NOT evidence that `prompt_block` truncates: `rendered()`'s
+        // TestBackend buffer is exactly `w` cells wide and `Paragraph` clips
+        // at the edge, so this would pass even with no truncation at all.
+        // `prompt_block_truncates_by_display_columns` above is what actually
+        // proves the truncation.
         let mut a = app("## Status\nmid-refactor");
         a.prompts = vec![prompt(1, &"z".repeat(200))];
         let screen = rendered(&mut a, 30, 14);
         for line in screen.lines() {
             assert!(dwidth(line.trim_end()) <= 30, "row overflows the pane: {line:?}");
         }
+    }
+
+    #[test]
+    fn the_scroll_follow_accounts_for_the_prompt_block_rows() {
+        // The block prepends rows to BOTH `lines` and `map`, so the row index
+        // the follow computes is a merged index. If the map padding were
+        // dropped or mis-sized, the follow would land short by exactly the
+        // block's height. Same note, same cursor, block vs no block.
+        let text: String = (0..40).map(|i| format!("[ ] item {i}\n")).collect();
+
+        let mut bare = app(&text);
+        for _ in 0..40 {
+            bare.on_key(key(KeyCode::Char('j')));
+        }
+        let _ = rendered(&mut bare, 60, 14);
+
+        let mut with_block = app(&text);
+        with_block.prompts = vec![prompt(2, "add the rate limiter"), prompt(1, "why is auth flaky")];
+        for _ in 0..40 {
+            with_block.on_key(key(KeyCode::Char('j')));
+        }
+        let _ = rendered(&mut with_block, 60, 14);
+
+        // Matches draw_preview's own `text_w` derivation: area.width - 1 for
+        // the scrollbar column, with the 60-wide `rendered()` call above.
+        let text_w = usize::from(60u16).saturating_sub(1).max(1);
+        let block_rows = prompt_block(&with_block.prompts, text_w).len();
+        assert!(block_rows > 0, "the fixture must actually produce a block");
+        assert_eq!(
+            with_block.preview_scroll,
+            bare.preview_scroll + block_rows,
+            "the follow must offset by exactly the block's height"
+        );
     }
 
     #[test]
