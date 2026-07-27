@@ -17,7 +17,7 @@ use ratatui::widgets::{
 };
 use unicode_width::UnicodeWidthChar;
 
-use crate::markdown::render_markdown;
+use crate::markdown::{self, render_markdown, render_markdown_mapped};
 use crate::state::{self, METADATA_SOURCE, Mode, Note, PANE_LABEL};
 use crate::template;
 
@@ -213,6 +213,10 @@ pub struct App {
     col: usize,
     edit_scroll: usize,
     preview_scroll: usize,
+    /// Ordinal into `markdown::checkbox_lines(&note.text)` — which checkbox
+    /// the preview cursor sits on. NOT a source line index: the text can
+    /// change under it, so it is re-resolved and re-clamped on every use.
+    box_cursor: Option<usize>,
     confirm_clear: bool,
     dirty: bool,
     last_edit: Instant,
@@ -246,6 +250,7 @@ impl App {
             col: 0,
             edit_scroll: 0,
             preview_scroll: 0,
+            box_cursor: None,
             confirm_clear: false,
             dirty: false,
             last_edit: Instant::now(),
@@ -412,6 +417,9 @@ impl App {
             KeyCode::Char('e') | KeyCode::Enter => self.enter_edit(),
             KeyCode::Up => self.preview_scroll = self.preview_scroll.saturating_sub(1),
             KeyCode::Down => self.preview_scroll = self.preview_scroll.saturating_add(1),
+            KeyCode::Char('j') => self.move_box(1),
+            KeyCode::Char('k') => self.move_box(-1),
+            KeyCode::Char(' ') => self.toggle_box(),
             KeyCode::PageUp => self.preview_scroll = self.preview_scroll.saturating_sub(page),
             KeyCode::PageDown => self.preview_scroll = self.preview_scroll.saturating_add(page),
             // g/G because herdr `pane send-keys` rejects Home/End.
@@ -613,6 +621,39 @@ impl App {
         true
     }
 
+    /// Source line of the selected checkbox, re-resolved against the current
+    /// text so a stale ordinal can never point at the wrong line.
+    fn cursor_line(&self) -> Option<usize> {
+        let boxes = markdown::checkbox_lines(&self.note.text);
+        boxes.get(self.box_cursor?).map(|(line, _)| *line)
+    }
+
+    /// Steps the checkbox cursor. From no cursor, `j` lands on the first box
+    /// and `k` on the last. Clamps at both ends; clears when the note has no
+    /// checkboxes left.
+    fn move_box(&mut self, delta: isize) {
+        let n = markdown::checkbox_lines(&self.note.text).len();
+        if n == 0 {
+            self.box_cursor = None;
+            return;
+        }
+        self.box_cursor = Some(match self.box_cursor {
+            None if delta > 0 => 0,
+            None => n - 1,
+            Some(c) => c.saturating_add_signed(delta).min(n - 1),
+        });
+    }
+
+    /// Flips the selected checkbox straight in `note.text`. Preview mode never
+    /// touches `lines`, so `commit` has nothing to overwrite this with — the
+    /// existing debounce persists it.
+    fn toggle_box(&mut self) {
+        let Some(line) = self.cursor_line() else { return };
+        let Some(text) = markdown::toggle_checkbox(&self.note.text, line) else { return };
+        self.note.text = text;
+        self.touch();
+    }
+
     fn enter_edit(&mut self) {
         // Lazy seed: a tab you merely toggled Notes into and never edited
         // still writes no file. `dirty` so the seed survives to the next
@@ -643,6 +684,13 @@ impl App {
         self.commit();
         self.note.mode = Mode::Preview;
         self.dirty = false;
+        // The edit may have deleted the box the cursor pointed at.
+        let n = markdown::checkbox_lines(&self.note.text).len();
+        self.box_cursor = match (self.box_cursor, n) {
+            (_, 0) => None,
+            (Some(c), _) => Some(c.min(n - 1)),
+            (None, _) => None,
+        };
         self.save();
     }
 
@@ -813,8 +861,19 @@ impl App {
         }
         frame.render_widget(Paragraph::new(Line::from(title)), title_a);
 
+        // The full hint line no longer fits a narrow right dock; clipping it
+        // would eat `q quit`, so fall back to a short form instead.
+        const PREVIEW_HINTS: &str =
+            " e edit  j/k spc tick  r title  l list  Up/Dn scroll  x clear  q quit";
+        const PREVIEW_HINTS_SHORT: &str = " e edit  j/k spc tick  l list  q quit";
         let hints = match self.note.mode {
-            Mode::Preview => " e edit  r title  l list  Up/Dn scroll  x clear  q quit",
+            Mode::Preview => {
+                if usize::from(hint_a.width) >= PREVIEW_HINTS.chars().count() {
+                    PREVIEW_HINTS
+                } else {
+                    PREVIEW_HINTS_SHORT
+                }
+            }
             Mode::Edit => " Esc preview (saves)   Ctrl+S save",
         };
         frame.render_widget(
@@ -844,9 +903,27 @@ impl App {
         // The rightmost column is reserved for the overflow scrollbar so text
         // never sits underneath it.
         let text_w = usize::from(area.width).saturating_sub(1).max(1);
-        let lines = render_markdown(&self.note.text, text_w);
+        let (mut lines, map) = render_markdown_mapped(&self.note.text, text_w);
         let total = lines.len();
         let max = total.saturating_sub(usize::from(area.height));
+        if let Some(src) = self.cursor_line() {
+            // Highlight EVERY row of the selected item — a wrapped checkbox
+            // spans several and would otherwise look half-selected.
+            for (i, line) in lines.iter_mut().enumerate() {
+                if map.get(i).copied().flatten() == Some(src) {
+                    line.style = line.style.add_modifier(Modifier::REVERSED);
+                }
+            }
+            // Scroll follows the cursor, mirroring the overlay's list clamp.
+            if let Some(first) = map.iter().position(|m| *m == Some(src)) {
+                let h = usize::from(area.height).max(1);
+                if first < self.preview_scroll {
+                    self.preview_scroll = first;
+                } else if first >= self.preview_scroll + h {
+                    self.preview_scroll = first + 1 - h;
+                }
+            }
+        }
         self.preview_scroll = clamp_scroll(self.preview_scroll, total, usize::from(area.height));
         let scroll = u16::try_from(self.preview_scroll).unwrap_or(u16::MAX);
         frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), area);
@@ -1825,5 +1902,104 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn j_k_walk_the_checkbox_cursor_and_clamp() {
+        let mut a = app("## Next\n[ ] one\ntext\n[ ] two");
+        assert_eq!(a.box_cursor, None, "no cursor until you ask for one");
+        a.on_key(key(KeyCode::Char('j')));
+        assert_eq!(a.box_cursor, Some(0));
+        a.on_key(key(KeyCode::Char('j')));
+        assert_eq!(a.box_cursor, Some(1));
+        a.on_key(key(KeyCode::Char('j')));
+        assert_eq!(a.box_cursor, Some(1), "clamps at the last box");
+        a.on_key(key(KeyCode::Char('k')));
+        assert_eq!(a.box_cursor, Some(0));
+        a.on_key(key(KeyCode::Char('k')));
+        assert_eq!(a.box_cursor, Some(0), "clamps at the first box");
+    }
+
+    #[test]
+    fn k_from_no_cursor_starts_at_the_last_box() {
+        let mut a = app("[ ] one\n[ ] two");
+        a.on_key(key(KeyCode::Char('k')));
+        assert_eq!(a.box_cursor, Some(1));
+    }
+
+    #[test]
+    fn space_toggles_the_selected_box() {
+        let mut a = app("[ ] one\n[ ] two");
+        a.on_key(key(KeyCode::Char('j')));
+        a.on_key(key(KeyCode::Char('j')));
+        a.on_key(key(KeyCode::Char(' ')));
+        assert_eq!(a.note.text, "[ ] one\n[x] two");
+        assert!(a.dirty, "the toggle must reach disk on the next flush");
+        a.on_key(key(KeyCode::Char(' ')));
+        assert_eq!(a.note.text, "[ ] one\n[ ] two", "toggles back");
+    }
+
+    #[test]
+    fn space_with_no_cursor_is_a_noop() {
+        let mut a = app("[ ] one");
+        a.on_key(key(KeyCode::Char(' ')));
+        assert_eq!(a.note.text, "[ ] one");
+        assert!(!a.dirty);
+    }
+
+    #[test]
+    fn checkbox_keys_are_noops_without_checkboxes() {
+        let mut a = app("just prose\nmore prose");
+        for k in ['j', 'k', ' '] {
+            a.on_key(key(KeyCode::Char(k)));
+        }
+        assert_eq!(a.box_cursor, None);
+        assert_eq!(a.note.text, "just prose\nmore prose");
+    }
+
+    #[test]
+    fn cursor_clamps_when_an_edit_removes_checkboxes() {
+        let mut a = app("[ ] one\n[ ] two");
+        a.on_key(key(KeyCode::Char('j')));
+        a.on_key(key(KeyCode::Char('j')));
+        assert_eq!(a.box_cursor, Some(1));
+        a.note.text = "[ ] one".into(); // an edit deleted the second box
+        a.on_key(key(KeyCode::Char('j')));
+        assert_eq!(a.box_cursor, Some(0), "clamped to the surviving box");
+        a.note.text = "no boxes left".into();
+        a.on_key(key(KeyCode::Char('j')));
+        assert_eq!(a.box_cursor, None);
+    }
+
+    #[test]
+    fn leaving_edit_drops_a_cursor_with_nothing_to_point_at() {
+        let mut a = app("[ ] one");
+        a.on_key(key(KeyCode::Char('j')));
+        assert_eq!(a.box_cursor, Some(0));
+        a.on_key(key(KeyCode::Char('e')));
+        a.lines = vec!["prose only".into()];
+        a.on_key(key(KeyCode::Esc));
+        assert_eq!(a.box_cursor, None);
+    }
+
+    #[test]
+    fn cursor_scrolls_itself_into_view() {
+        // 30 boxes in a 10-row body: the last one is far below the fold.
+        let text: String = (0..30).map(|i| format!("[ ] item {i}\n")).collect();
+        let mut a = app(&text);
+        for _ in 0..30 {
+            a.on_key(key(KeyCode::Char('j')));
+        }
+        let _ = rendered(&mut a, 40, 12); // 12 rows - header - hint = 10 body rows
+        assert!(a.preview_scroll > 0, "draw must scroll the cursor into view");
+    }
+
+    #[test]
+    fn preview_footer_falls_back_to_the_short_form_when_narrow() {
+        let mut a = app("body");
+        assert!(rendered(&mut a, 90, 8).contains("Up/Dn scroll"), "wide pane shows the full hints");
+        let narrow = rendered(&mut a, 40, 8);
+        assert!(narrow.contains("j/k spc tick"), "the new binding survives truncation: {narrow}");
+        assert!(narrow.contains("q quit"), "quit must never be the thing that gets clipped: {narrow}");
     }
 }

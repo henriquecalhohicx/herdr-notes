@@ -143,9 +143,6 @@ fn checkbox(t: &str) -> Option<(bool, &str)> {
 /// `(source line index, done)` for every checkbox line, in source order.
 /// Lines inside a fenced code block are code and are skipped, matching what
 /// `render_markdown` draws. Indices are `str::lines()` indices.
-// Consumed by later tasks (preview cursor, overlay progress column); unused
-// for now so clippy's dead_code lint needs a nudge.
-#[allow(dead_code)]
 pub fn checkbox_lines(text: &str) -> Vec<(usize, bool)> {
     let mut out = Vec::new();
     let mut in_code = false;
@@ -176,7 +173,6 @@ pub fn checkbox_counts(text: &str) -> (usize, usize) {
 /// is not a checkbox. Splits on `'\n'` rather than `lines()` so a trailing
 /// newline survives the round-trip; the two index identically for every line
 /// `lines()` yields, so a `checkbox_lines` index is safe here.
-#[allow(dead_code)]
 pub fn toggle_checkbox(text: &str, line_idx: usize) -> Option<String> {
     if !checkbox_lines(text).iter().any(|(i, _)| *i == line_idx) {
         return None;
