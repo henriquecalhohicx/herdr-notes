@@ -116,21 +116,30 @@ fn legacy_path_in(base: &Path) -> PathBuf {
     base.join("herdr").join("notes.json")
 }
 
-/// The note-FILE identity of a tab id: `Some(key)` when the id gets its own
-/// per-tab file, `None` when it falls back to the shared legacy `notes.json`.
-/// Panes whose keys are EQUAL load and save the SAME file. This is the identity
-/// the launcher's duplicate-instance guard (launch.rs) compares — never raw tab
-/// ids — so the guard can't drift from the on-disk layout: unsafe/missing ids
-/// all coarsen to one legacy file, the `:` separator is sanitized to `_`
-/// (herdr ids never contain `_`, so no collision), and on Windows ASCII case is
-/// folded because NTFS filenames are case-insensitive ("W6_T1.json" and
-/// "w6_t1.json" are one file).
-pub fn note_key(tab_id: Option<&str>) -> Option<String> {
-    let id = tab_id.filter(|id| is_filename_safe(id))?;
+/// A herdr id (`<a>:<n>`, e.g. `w6:t1` or `wA:p5`) sanitized into a
+/// filename-safe key: the single `:` becomes `_` (herdr ids never contain
+/// `_`, so no collision), and on Windows ASCII case is folded because NTFS
+/// filenames are case-insensitive ("W6_T1" and "w6_t1" are one file).
+/// `None` when the id is empty or holds anything beyond alphanumerics and
+/// that one `:`. Shared by note files and prompt files so the two layouts
+/// can never disagree about what a given id spells on disk.
+pub fn id_key(id: &str) -> Option<String> {
+    if !is_filename_safe(id) {
+        return None;
+    }
     let key = id.replace(':', "_");
     #[cfg(windows)]
     let key = key.to_ascii_lowercase();
     Some(key)
+}
+
+/// The note-FILE identity of a tab id: `Some(key)` when the id gets its own
+/// per-tab file, `None` when it falls back to the shared legacy `notes.json`.
+/// Panes whose keys are EQUAL load and save the SAME file. This is the identity
+/// the launcher's duplicate-instance guard (launch.rs) compares — never raw tab
+/// ids — so the guard can't drift from the on-disk layout.
+pub fn note_key(tab_id: Option<&str>) -> Option<String> {
+    tab_id.and_then(id_key)
 }
 
 /// Pure path selection: `<base>/herdr/notes/<note-key>.json` for a
@@ -264,6 +273,11 @@ pub fn list_notes(dir: &Path) -> Vec<NoteSummary> {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        // `<tab>__<pane>.prompts.json` also ends in `.json`; without this it
+        // would list as a note and fill the overlay with junk rows.
+        if path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with(".prompts.json")) {
             continue;
         }
         let note = read_note(&path);
@@ -430,18 +444,23 @@ pub fn persist_at(path: &Path, note: &Note, tab_id: &str, now: u64) {
     }
     out.created = if note.created == 0 { now } else { note.created };
     out.updated = now;
+    write_atomic(path, &to_json(&out));
+}
+
+/// Atomic best-effort write: create the parent dir, write a `.tmp` sibling,
+/// `sync_all`, rename over the target. `true` when the rename landed. Shared
+/// by note and prompt files so both get the same crash behavior.
+pub(crate) fn write_atomic(path: &Path, contents: &str) -> bool {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
     let tmp = path.with_extension("json.tmp");
     let written = std::fs::File::create(&tmp).and_then(|mut f| {
         use std::io::Write;
-        f.write_all(to_json(&out).as_bytes())?;
+        f.write_all(contents.as_bytes())?;
         f.sync_all()
     });
-    if written.is_ok() {
-        let _ = std::fs::rename(&tmp, path);
-    }
+    written.is_ok() && std::fs::rename(&tmp, path).is_ok()
 }
 
 /// Set a note file's title in place (blank text + blank title would delete it).
@@ -546,6 +565,44 @@ mod tests {
         }
         #[cfg(not(windows))]
         assert_eq!(note_key(Some("W6:T1")), Some("W6_T1".to_string()));
+    }
+
+    #[test]
+    fn id_key_sanitizes_pane_and_tab_ids_alike() {
+        assert_eq!(id_key("wA:t1").as_deref(), Some(if cfg!(windows) { "wa_t1" } else { "wA_t1" }));
+        assert_eq!(id_key("wA:p5").as_deref(), Some(if cfg!(windows) { "wa_p5" } else { "wA_p5" }));
+        assert_eq!(id_key(""), None);
+        assert_eq!(id_key("has space"), None);
+        assert_eq!(id_key("../escape"), None);
+        assert_eq!(id_key("under_score"), None, "herdr ids never contain _; it is our separator");
+    }
+
+    #[test]
+    fn note_key_still_routes_through_id_key() {
+        assert_eq!(note_key(Some("w1:t2")), id_key("w1:t2"));
+        assert_eq!(note_key(Some("bad id")), None);
+        assert_eq!(note_key(None), None);
+    }
+
+    #[test]
+    fn write_atomic_creates_the_dir_and_leaves_no_temp_behind() {
+        let dir = temp_base("write-atomic");
+        let path = dir.join("nested").join("thing.json");
+        assert!(write_atomic(&path, "{\"a\":1}"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"a\":1}");
+        assert!(!path.with_extension("json.tmp").exists(), "temp file must be renamed away");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_notes_skips_prompt_files() {
+        let dir = temp_base("list-prompts");
+        std::fs::write(dir.join("w1_t1.json"), r#"{"text":"real note"}"#).unwrap();
+        std::fs::write(dir.join("w1_t1__w1_p5.prompts.json"), r#"{"prompts":[]}"#).unwrap();
+        let rows = list_notes(&dir);
+        assert_eq!(rows.len(), 1, "the prompts file must not become a note row: {rows:?}");
+        assert_eq!(rows[0].text, "real note");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
