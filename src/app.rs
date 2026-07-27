@@ -188,6 +188,106 @@ fn build_tab_index(
     TabIndex { live, ctx }
 }
 
+/// What the prompt block needs to know about a pane. Built from one
+/// `pane.list` call; every field is optional at the source, so a missing one
+/// degrades rather than dropping the pane.
+// Whole item unused until Task 5 wires the grouped renderer up to this
+// index; `cwd` and `tab_id` stay unread even after `build_pane_index` and
+// `pane_label` are exercised by the tests below. Task 5 removes this.
+#[allow(dead_code)]
+struct PaneInfo {
+    /// "" when herdr has not reported an agent on this pane yet — a bare
+    /// shell pane carries only `agent_status`.
+    agent: String,
+    tab_id: String,
+    title: Option<String>,
+    cwd: Option<String>,
+}
+
+type PaneIndex = std::collections::HashMap<String, PaneInfo>;
+
+/// Titles herdr reports that name the tool rather than the work. Compared
+/// case-insensitively against the trimmed title.
+const GENERIC_TITLES: [&str; 4] = ["claude code", "claude", "codex", "codex cli"];
+
+/// One `pane.list` round-trip. `None` on any call or parse failure — every
+/// caller falls back, so the block works offline.
+// No production caller until Task 5 wires the grouped renderer to this
+// fetcher (mirrors `tab_contexts`, which gets its caller in the same way).
+// Task 5 removes this allow.
+#[allow(dead_code)]
+fn pane_index() -> Option<PaneIndex> {
+    Some(build_pane_index(&fetch_array("pane.list", "panes")?))
+}
+
+/// Pure builder over an already-fetched `panes` array — no I/O, so it is
+/// unit-tested against captured live responses. An item with no `pane_id` is
+/// the only thing skipped; everything else degrades to a default.
+// Exercised only by tests until Task 5 wires up the grouped renderer that
+// calls this from production code. Task 5 removes this allow.
+#[allow(dead_code)]
+fn build_pane_index(panes: &[serde_json::Value]) -> PaneIndex {
+    let mut out = PaneIndex::new();
+    for p in panes {
+        let Some(pane_id) = p.get("pane_id").and_then(|v| v.as_str()) else { continue };
+        out.insert(
+            pane_id.to_string(),
+            PaneInfo {
+                agent: p.get("agent").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                tab_id: p.get("tab_id").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                title: p
+                    .get("terminal_title_stripped")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                cwd: p.get("cwd").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            },
+        );
+    }
+    out
+}
+
+/// A terminal title worth showing: trimmed, non-empty, not the tool naming
+/// itself (`Claude Code` on an idle pane), and not a filesystem path (a bare
+/// shell pane reports its `powershell.exe` path). `None` when it says nothing.
+// Exercised only by tests until Task 3/5 call this from the grouped
+// renderer's heading logic. Task 5 removes this allow.
+#[allow(dead_code)]
+fn meaningful_title(title: &str, agent: &str) -> Option<String> {
+    let t = title.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let lower = t.to_ascii_lowercase();
+    if GENERIC_TITLES.contains(&lower.as_str()) || lower == agent.trim().to_ascii_lowercase() {
+        return None;
+    }
+    if t.contains('/') || t.contains('\\') || lower.ends_with(".exe") {
+        return None;
+    }
+    Some(t.to_string())
+}
+
+/// The heading for a pane's prompt group: its terminal title when meaningful,
+/// otherwise `{agent} {pane-suffix}` (`claude p8`) built from data the stored
+/// prompt always carries — so a closed pane or an unreachable socket still
+/// names its group.
+// Exercised only by tests until Task 3 wires this into the grouped
+// renderer. Task 5 removes this allow.
+#[allow(dead_code)]
+fn pane_label(pane_id: &str, agent: &str, index: Option<&PaneIndex>) -> String {
+    if let Some(info) = index.and_then(|i| i.get(pane_id))
+        && let Some(title) = info.title.as_deref().and_then(|t| meaningful_title(t, &info.agent))
+    {
+        return title;
+    }
+    let suffix = pane_id.rsplit(':').next().unwrap_or(pane_id);
+    if agent.trim().is_empty() {
+        suffix.to_string()
+    } else {
+        format!("{agent} {suffix}")
+    }
+}
+
 /// One `method` round-trip, returning `result.<key>` as a JSON array — `None`
 /// on any socket/parse failure (best-effort, never panics; the overlay just
 /// shows Unknown context for every row when this fails).
@@ -2294,6 +2394,81 @@ mod tests {
         // so it gets no context entry — still no panic.
         assert!(idx.live.contains("w1:t1"));
         assert!(idx.ctx.is_empty(), "no resolvable workspace label -> no context, not a crash");
+    }
+
+    fn pane_json(pane_id: &str, tab_id: &str, agent: Option<&str>, title: &str, cwd: &str) -> serde_json::Value {
+        let mut v = serde_json::json!({
+            "pane_id": pane_id,
+            "tab_id": tab_id,
+            "terminal_title_stripped": title,
+            "cwd": cwd,
+        });
+        if let Some(a) = agent {
+            v["agent"] = serde_json::Value::String(a.to_string());
+        }
+        v
+    }
+
+    #[test]
+    fn build_pane_index_keeps_agent_panes_and_their_fields() {
+        // Shapes captured from a live `pane.list` on herdr 0.7.4.
+        let panes = vec![
+            pane_json("wD:p8", "wD:t2", Some("claude"), "Claude Code", "C:\\repo"),
+            pane_json("wD:pB", "wD:t2", None, "C:\\WINDOWS\\powershell.exe", "C:\\repo"),
+        ];
+        let idx = build_pane_index(&panes);
+        let p8 = idx.get("wD:p8").expect("agent pane indexed");
+        assert_eq!(p8.agent, "claude");
+        assert_eq!(p8.tab_id, "wD:t2");
+        assert_eq!(p8.title.as_deref(), Some("Claude Code"));
+        assert_eq!(p8.cwd.as_deref(), Some("C:\\repo"));
+        let shell = idx.get("wD:pB").expect("shell panes are indexed too");
+        assert_eq!(shell.agent, "", "no agent reported yet");
+    }
+
+    #[test]
+    fn build_pane_index_skips_items_missing_a_pane_id() {
+        let panes = vec![serde_json::json!({"tab_id": "wD:t2", "agent": "claude"})];
+        assert!(build_pane_index(&panes).is_empty());
+    }
+
+    #[test]
+    fn meaningful_title_rejects_generic_names_and_paths() {
+        assert_eq!(meaningful_title("HM-54271 Generic Importer", "claude").as_deref(), Some("HM-54271 Generic Importer"));
+        assert_eq!(meaningful_title("  spaced  ", "claude").as_deref(), Some("spaced"), "trimmed");
+        assert_eq!(meaningful_title("", "claude"), None);
+        assert_eq!(meaningful_title("   ", "claude"), None);
+        assert_eq!(meaningful_title("Claude Code", "claude"), None);
+        assert_eq!(meaningful_title("claude code", "claude"), None, "case-insensitive");
+        assert_eq!(meaningful_title("CLAUDE", "claude"), None);
+        assert_eq!(meaningful_title("Codex", "codex"), None);
+        assert_eq!(meaningful_title("C:\\WINDOWS\\powershell.exe", ""), None, "path-shaped");
+        assert_eq!(meaningful_title("/usr/bin/bash", ""), None);
+        assert_eq!(meaningful_title("something.exe", ""), None);
+        assert_eq!(meaningful_title("SOMETHING.EXE", ""), None, "suffix is case-insensitive");
+    }
+
+    #[test]
+    fn pane_label_prefers_a_meaningful_title() {
+        let panes = vec![pane_json("wD:p8", "wD:t2", Some("claude"), "HM-54271 Importer", "C:\\repo")];
+        let idx = build_pane_index(&panes);
+        assert_eq!(pane_label("wD:p8", "claude", Some(&idx)), "HM-54271 Importer");
+    }
+
+    #[test]
+    fn pane_label_falls_back_to_agent_and_pane_suffix() {
+        let panes = vec![pane_json("wD:p8", "wD:t2", Some("claude"), "Claude Code", "C:\\repo")];
+        let idx = build_pane_index(&panes);
+        // Generic title -> fallback.
+        assert_eq!(pane_label("wD:p8", "claude", Some(&idx)), "claude p8");
+        // Pane closed since capture -> not in the index at all.
+        assert_eq!(pane_label("wD:p9", "claude", Some(&idx)), "claude p9");
+        // Socket unreachable -> no index at all.
+        assert_eq!(pane_label("wD:p8", "claude", None), "claude p8");
+        // A pane id with no colon still yields something.
+        assert_eq!(pane_label("odd", "claude", None), "claude odd");
+        // No agent recorded either.
+        assert_eq!(pane_label("wD:p8", "", None), "p8");
     }
 
     #[test]
