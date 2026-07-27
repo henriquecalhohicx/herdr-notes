@@ -12,10 +12,20 @@ const CODE: Color = Color::Yellow;
 const CHECK: Color = Color::Green;
 
 pub fn render_markdown(text: &str, width: usize) -> Vec<Line<'static>> {
+    render_markdown_mapped(text, width).0
+}
+
+/// `render_markdown` plus, for each rendered row, the `str::lines()` index of
+/// the source line that produced it. One source line can wrap to several rows,
+/// which all carry the same index; the synthetic blank row emitted for empty
+/// input carries `None`. Lets the preview map a screen row back to the note
+/// text — needed by the checkbox cursor.
+pub fn render_markdown_mapped(text: &str, width: usize) -> (Vec<Line<'static>>, Vec<Option<usize>>) {
     let width = width.max(8);
     let mut out = Vec::new();
+    let mut map: Vec<Option<usize>> = Vec::new();
     let mut in_code = false;
-    for raw in text.lines() {
+    for (src, raw) in text.lines().enumerate() {
         let line = raw.trim_end();
         if line.trim_start().starts_with("```") {
             in_code = !in_code;
@@ -23,18 +33,20 @@ pub fn render_markdown(text: &str, width: usize) -> Vec<Line<'static>> {
                 line.to_string(),
                 Style::default().fg(CODE).add_modifier(Modifier::DIM),
             )));
-            continue;
-        }
-        if in_code {
+        } else if in_code {
             wrap_into(&mut out, vec![(line.to_string(), Style::default().fg(CODE))], width, 0);
-            continue;
+        } else {
+            render_line(&mut out, line, width);
         }
-        render_line(&mut out, line, width);
+        // `out` only ever grows, so this fills exactly the rows this source
+        // line just added.
+        map.resize(out.len(), Some(src));
     }
     if out.is_empty() {
         out.push(Line::raw(""));
+        map.push(None);
     }
-    out
+    (out, map)
 }
 
 fn render_line(out: &mut Vec<Line<'static>>, line: &str, width: usize) {
@@ -458,5 +470,38 @@ mod tests {
     fn blank_lines_and_empty_input_survive() {
         assert_eq!(texts("a\n\nb", 40), vec!["a", "", "b"]);
         assert_eq!(texts("", 40), vec![""]);
+    }
+
+    #[test]
+    fn mapped_render_tags_every_row_with_its_source_line() {
+        let (lines, map) = render_markdown_mapped("# One\n\n[ ] two", 40);
+        assert_eq!(lines.len(), map.len(), "map is parallel to rows");
+        assert_eq!(map, vec![Some(0), Some(1), Some(2)]);
+    }
+
+    #[test]
+    fn wrapped_source_line_tags_all_of_its_rows() {
+        // Narrow width forces the one checkbox onto several rows; every one of
+        // them must point back at source line 0, or the cursor highlight would
+        // light up half an item.
+        let (lines, map) = render_markdown_mapped("[ ] alpha beta gamma delta", 12);
+        assert!(lines.len() > 1, "should wrap: {} rows", lines.len());
+        assert!(map.iter().all(|m| *m == Some(0)), "{map:?}");
+    }
+
+    #[test]
+    fn mapped_render_matches_plain_render() {
+        let md = "## Next\n[ ] a\n\n```\ncode\n```\n> quote";
+        let plain = render_markdown(md, 30);
+        let (mapped, map) = render_markdown_mapped(md, 30);
+        assert_eq!(plain.len(), mapped.len());
+        assert_eq!(map.len(), mapped.len());
+    }
+
+    #[test]
+    fn mapped_render_of_empty_input_has_an_unmapped_row() {
+        let (lines, map) = render_markdown_mapped("", 40);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(map, vec![None]);
     }
 }
