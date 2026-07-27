@@ -1149,31 +1149,44 @@ impl App {
         } else {
             Vec::new()
         };
-        if self.note.text.trim().is_empty() {
-            // The block is at most RING + 2 rows, so nothing scrolls here and
-            // both the zeroed scroll and the `None` hint stay correct.
-            self.preview_scroll = 0;
-            let mut lines = block;
-            lines.extend(empty_help().lines().map(|l| Line::from(l.to_string())));
-            frame.render_widget(
-                Paragraph::new(lines).style(Style::default().add_modifier(Modifier::DIM)),
-                area,
-            );
-            return None;
-        }
-        let (mut lines, mut map) = render_markdown_mapped(&self.note.text, text_w);
-        // The block's rows map to NO source line, so the checkbox cursor can
-        // never land on one and the highlight/scroll-follow keep pointing at
-        // real note lines. Edit mode never reaches here.
-        if !block.is_empty() {
-            let n = block.len();
-            let mut merged = block;
-            merged.append(&mut lines);
-            lines = merged;
-            let mut merged_map = vec![None; n];
-            merged_map.append(&mut map);
-            map = merged_map;
-        }
+        // The empty-note help used to be a fixed-height special case (forced
+        // `preview_scroll = 0`, no hint, no scrollbar) on the assumption the
+        // block could never exceed a couple of rows. Grouping removed that
+        // bound — a multi-agent tab's block alone can run well past the pane
+        // height — so a titled, body-less note in such a tab would push the
+        // help off screen with no key able to reach it. Both branches now
+        // build `(lines, map)` and share the exact same
+        // clamp/scroll/scrollbar/hint tail below; the help rows map to NO
+        // source line (same as the block's rows), which is safe here for a
+        // stronger reason than in the real-note branch: an empty note has no
+        // checkboxes at all (`markdown::checkbox_lines` on empty text is
+        // always empty), so `cursor_line()` is unconditionally `None` on this
+        // path and the highlight/follow block below is a no-op regardless of
+        // what `map` contains.
+        let (mut lines, map): (Vec<Line<'static>>, Vec<Option<usize>>) =
+            if self.note.text.trim().is_empty() {
+                let mut lines = block;
+                lines.extend(empty_help().lines().map(|l| {
+                    Line::from(Span::styled(l.to_string(), Style::default().add_modifier(Modifier::DIM)))
+                }));
+                let map = vec![None; lines.len()];
+                (lines, map)
+            } else {
+                let (mut lines, mut map) = render_markdown_mapped(&self.note.text, text_w);
+                // The block's rows map to NO source line, so the checkbox cursor can
+                // never land on one and the highlight/scroll-follow keep pointing at
+                // real note lines. Edit mode never reaches here.
+                if !block.is_empty() {
+                    let n = block.len();
+                    let mut merged = block;
+                    merged.append(&mut lines);
+                    lines = merged;
+                    let mut merged_map = vec![None; n];
+                    merged_map.append(&mut map);
+                    map = merged_map;
+                }
+                (lines, map)
+            };
         let total = lines.len();
         let max = total.saturating_sub(usize::from(area.height));
         if let Some(src) = self.cursor_line() {
@@ -1730,6 +1743,32 @@ mod tests {
     }
 
     #[test]
+    fn the_empty_note_help_stays_reachable_behind_a_tall_prompt_block() {
+        // Four agents give a block far taller than RING + 2, so the branch
+        // that used to force preview_scroll = 0 would push the help off
+        // screen with no key able to reach it.
+        let mut a = app("");
+        a.note.title = "Titled but bodyless".into();
+        a.prompts = (0..4)
+            .map(|i| crate::prompts::PromptGroup {
+                pane: format!("w1:p{i}"),
+                prompts: (0..3)
+                    .map(|j| crate::prompts::Prompt {
+                        ts: (i * 10 + j) as u64,
+                        pane: format!("w1:p{i}"),
+                        agent: "claude".into(),
+                        text: format!("prompt {i}-{j}"),
+                    })
+                    .collect(),
+            })
+            .collect();
+        let _ = rendered(&mut a, 60, 12);
+        a.on_key(key(KeyCode::Char('G')));
+        let screen = rendered(&mut a, 60, 12);
+        assert!(a.preview_scroll > 0, "G must scroll the tall empty-note view: {screen}");
+    }
+
+    #[test]
     fn the_checkbox_cursor_ignores_the_prompt_block() {
         // This proves j/k/space resolve against `note.text` (via `box_cursor`
         // / `move_box` / `toggle_box`, none of which read `map`) independently
@@ -1767,12 +1806,29 @@ mod tests {
         assert!(joined.contains("HM-54271 Importer"), "{joined}");
         assert!(joined.contains("claude pB"), "{joined}");
         assert!(joined.contains("1. add the rate limiter"), "{joined}");
-        assert!(joined.contains("2. why is auth flaky"), "numbering restarts per group: {joined}");
+        assert!(joined.contains("2. why is auth flaky"), "{joined}");
+        // The discriminating assertion: group two's FIRST row restarts at 1.
+        // Continuous cross-group numbering (the bug this guards against)
+        // would render this row "3. run the migration" instead, since it is
+        // the third prompt overall.
+        assert!(
+            joined.contains("1. run the migration"),
+            "numbering restarts per group, not continues across them: {joined}"
+        );
         assert!(
             rows.iter().position(|r| r.contains("HM-54271")).unwrap()
                 < rows.iter().position(|r| r.contains("claude pB")).unwrap(),
             "group order is preserved: {joined}"
         );
+        // A blank separator sits between the two groups, and nowhere else —
+        // not before the first heading.
+        assert_eq!(
+            rows.first().map(String::as_str),
+            Some("HM-54271 Importer"),
+            "no leading blank before the first group: {joined}"
+        );
+        let heading2 = rows.iter().position(|r| r == "claude pB").unwrap();
+        assert_eq!(rows[heading2 - 1], "", "a blank line separates the groups: {joined}");
         assert!(!joined.contains("Last Prompts"), "the single heading is gone: {joined}");
     }
 
@@ -2556,6 +2612,13 @@ mod tests {
             (CONFIG_BASE_VAR, Some(cfg.as_os_str())),
         ]);
 
+        // The socket path is deliberately dead (`no-such.sock`), so
+        // `pane_index()` returns `None` and every group's label falls back to
+        // `{agent} {pane-suffix}` — the same fallback `pane_label` is unit
+        // tested against directly elsewhere. Derived rather than hardcoded so
+        // this test tracks that fallback's actual shape instead of guessing it.
+        let expected_label = pane_label("w1:p5", "claude", None);
+
         // Construction — not the first heartbeat — populates the block.
         let mut a = App::new();
         assert_eq!(a.note.text, "TAB BODY");
@@ -2564,16 +2627,28 @@ mod tests {
             vec!["why is auth flaky"],
             "the prompt block must be populated at construction, not up to 5s later"
         );
+        assert_eq!(
+            a.prompt_labels,
+            vec![expected_label.clone()],
+            "labels are resolved at construction too, index-aligned with prompts"
+        );
 
-        // Tab -> Global: the global note is not a tab and carries no prompts.
+        // Tab -> Global: the global note is not a tab and carries no prompts
+        // or labels — both vectors clear symmetrically.
         a.toggle_global();
         assert_eq!(a.active, ActiveNote::Global);
         assert!(a.prompts.is_empty(), "the global note carries no prompts");
+        assert!(a.prompt_labels.is_empty(), "the global note carries no labels either");
 
         // Global -> Tab: the block is back at once, again without a heartbeat.
         a.toggle_global();
         assert_eq!(a.active, ActiveNote::Tab);
         assert_eq!(a.prompts.len(), 1, "returning to the tab note refreshes the block immediately");
+        assert_eq!(
+            a.prompt_labels,
+            vec![expected_label],
+            "labels are refreshed and re-aligned on the way back too"
+        );
 
         restore_env(prev);
         let _ = std::fs::remove_dir_all(&dir);
