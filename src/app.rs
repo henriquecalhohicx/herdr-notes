@@ -1109,7 +1109,12 @@ fn draw_overlay(frame: &mut Frame, area: Rect, ov: &mut Overlay) {
                 let self_mark = if e.is_self { "*" } else { " " };
                 let name = if e.title.trim().is_empty() { "(untitled)" } else { &e.title };
                 let age = if e.updated == 0 { "—".to_string() } else { state::format_age(now.saturating_sub(e.updated)) };
-                let right = format!("{}  {age}", e.context);
+                // Counted per draw off the row's own text (only visible rows
+                // are drawn) rather than cached, so an in-overlay rename or
+                // delete can never leave a stale count behind.
+                let (done, total) = markdown::checkbox_counts(&e.text);
+                let progress = if total > 0 { format!("  {done}/{total}") } else { String::new() };
+                let right = format!("{}{progress}  {age}", e.context);
                 let text = format_row(marker, self_mark, name, &right, inner_width);
                 let base = if e.is_global {
                     Color::Cyan
@@ -1688,6 +1693,32 @@ mod tests {
         a.on_key(key(KeyCode::Char('Z')));
         a.on_key(key(KeyCode::Enter));
         assert_eq!(a.note.title, "Global Title", "global buffer title must not be overwritten by a tab-row rename");
+    }
+
+    #[test]
+    fn overlay_rows_show_todo_progress() {
+        let mut a = app("body");
+        let mut e = entry_with_tab("Busy Tab", state::TabStatus::Live, "w1:t1");
+        e.text = "[ ] one\n[x] two\n[x] three".into();
+        a.overlay = Some(Overlay::from_entries(vec![e]));
+        let screen = rendered(&mut a, 70, 14);
+        assert!(screen.contains("2/3"), "{screen}");
+    }
+
+    #[test]
+    fn overlay_rows_omit_progress_when_the_note_has_no_boxes() {
+        let mut a = app("body");
+        let mut e = entry_with_tab("Prose Tab", state::TabStatus::Live, "w1:t1");
+        e.text = "no tasks here".into();
+        a.overlay = Some(Overlay::from_entries(vec![e]));
+        let screen = rendered(&mut a, 70, 14);
+        assert!(!screen.contains("0/0"), "{screen}");
+    }
+
+    #[test]
+    fn overlay_row_with_progress_still_fits_the_box() {
+        let row = format_row(">", "*", "A Very Long Note Title Indeed", "spec-droid · claude  2/3  2h", 40);
+        assert_eq!(dwidth(&row), 40);
     }
 
     #[test]

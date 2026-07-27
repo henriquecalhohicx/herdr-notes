@@ -163,7 +163,6 @@ pub fn checkbox_lines(text: &str) -> Vec<(usize, bool)> {
 }
 
 /// `(done, total)` over every checkbox line — the overlay's progress column.
-#[allow(dead_code)]
 pub fn checkbox_counts(text: &str) -> (usize, usize) {
     let boxes = checkbox_lines(text);
     (boxes.iter().filter(|(_, done)| *done).count(), boxes.len())
