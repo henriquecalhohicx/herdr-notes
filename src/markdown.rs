@@ -12,10 +12,20 @@ const CODE: Color = Color::Yellow;
 const CHECK: Color = Color::Green;
 
 pub fn render_markdown(text: &str, width: usize) -> Vec<Line<'static>> {
+    render_markdown_mapped(text, width).0
+}
+
+/// `render_markdown` plus, for each rendered row, the `str::lines()` index of
+/// the source line that produced it. One source line can wrap to several rows,
+/// which all carry the same index; the synthetic blank row emitted for empty
+/// input carries `None`. Lets the preview map a screen row back to the note
+/// text — needed by the checkbox cursor.
+pub fn render_markdown_mapped(text: &str, width: usize) -> (Vec<Line<'static>>, Vec<Option<usize>>) {
     let width = width.max(8);
     let mut out = Vec::new();
+    let mut map: Vec<Option<usize>> = Vec::new();
     let mut in_code = false;
-    for raw in text.lines() {
+    for (src, raw) in text.lines().enumerate() {
         let line = raw.trim_end();
         if line.trim_start().starts_with("```") {
             in_code = !in_code;
@@ -23,18 +33,20 @@ pub fn render_markdown(text: &str, width: usize) -> Vec<Line<'static>> {
                 line.to_string(),
                 Style::default().fg(CODE).add_modifier(Modifier::DIM),
             )));
-            continue;
-        }
-        if in_code {
+        } else if in_code {
             wrap_into(&mut out, vec![(line.to_string(), Style::default().fg(CODE))], width, 0);
-            continue;
+        } else {
+            render_line(&mut out, line, width);
         }
-        render_line(&mut out, line, width);
+        // `out` only ever grows, so this fills exactly the rows this source
+        // line just added.
+        map.resize(out.len(), Some(src));
     }
     if out.is_empty() {
         out.push(Line::raw(""));
+        map.push(None);
     }
-    out
+    (out, map)
 }
 
 fn render_line(out: &mut Vec<Line<'static>>, line: &str, width: usize) {
@@ -115,9 +127,10 @@ fn render_line(out: &mut Vec<Line<'static>>, line: &str, width: usize) {
     wrap_into(out, spans, width, 0);
 }
 
-/// `- [ ] rest` / `- [x] rest` (also `*` bullets); a bare `- [ ]` counts too.
+/// `[ ] rest` / `[x] rest`, optionally behind a `- ` or `* ` bullet (the
+/// template writes them bare). A bare `[ ]` with no text counts too.
 fn checkbox(t: &str) -> Option<(bool, &str)> {
-    let rest = t.strip_prefix("- ").or_else(|| t.strip_prefix("* "))?;
+    let rest = t.strip_prefix("- ").or_else(|| t.strip_prefix("* ")).unwrap_or(t);
     let (done, rest) = if let Some(r) = rest.strip_prefix("[ ]") {
         (false, r)
     } else {
@@ -125,6 +138,54 @@ fn checkbox(t: &str) -> Option<(bool, &str)> {
         (true, r)
     };
     Some((done, rest.strip_prefix(' ').unwrap_or(rest)))
+}
+
+/// `(source line index, done)` for every checkbox line, in source order.
+/// Lines inside a fenced code block are code and are skipped, matching what
+/// `render_markdown` draws. Indices are `str::lines()` indices.
+pub fn checkbox_lines(text: &str) -> Vec<(usize, bool)> {
+    let mut out = Vec::new();
+    let mut in_code = false;
+    for (i, raw) in text.lines().enumerate() {
+        let line = raw.trim_end();
+        if line.trim_start().starts_with("```") {
+            in_code = !in_code;
+            continue;
+        }
+        if in_code {
+            continue;
+        }
+        if let Some((done, _)) = checkbox(line.trim_start()) {
+            out.push((i, done));
+        }
+    }
+    out
+}
+
+/// `(done, total)` over every checkbox line — the overlay's progress column.
+pub fn checkbox_counts(text: &str) -> (usize, usize) {
+    let boxes = checkbox_lines(text);
+    (boxes.iter().filter(|(_, done)| *done).count(), boxes.len())
+}
+
+/// `text` with the checkbox on `line_idx` flipped, or `None` when that line
+/// is not a checkbox. Splits on `'\n'` rather than `lines()` so a trailing
+/// newline survives the round-trip; the two index identically for every line
+/// `lines()` yields, so a `checkbox_lines` index is safe here.
+pub fn toggle_checkbox(text: &str, line_idx: usize) -> Option<String> {
+    if !checkbox_lines(text).iter().any(|(i, _)| *i == line_idx) {
+        return None;
+    }
+    let mut lines: Vec<String> = text.split('\n').map(String::from).collect();
+    let line = lines.get(line_idx)?;
+    let pos = line.find('[')?;
+    let flipped = match line.get(pos..pos + 3)? {
+        "[ ]" => "[x]",
+        "[x]" | "[X]" => "[ ]",
+        _ => return None,
+    };
+    lines[line_idx] = format!("{}{flipped}{}", &line[..pos], &line[pos + 3..]);
+    Some(lines.join("\n"))
 }
 
 /// `---` / `***` / `___` (3+ of the same marker, spaces allowed between).
@@ -287,6 +348,52 @@ mod tests {
     }
 
     #[test]
+    fn bare_checkboxes_parse_without_a_bullet() {
+        // The template uses bullet-less boxes; they must render AND count.
+        assert_eq!(texts("[ ] bare\n[x] done", 40), vec!["[ ] bare", "[x] done"]);
+        assert_eq!(checkbox_counts("[ ] bare\n[x] done"), (1, 2));
+        // Still works with the bullet forms.
+        assert_eq!(checkbox_counts("- [ ] a\n* [x] b"), (1, 2));
+        // A line that merely starts with a bracket is not a checkbox.
+        assert_eq!(checkbox_counts("[link](url)"), (0, 0));
+    }
+
+    #[test]
+    fn checkbox_lines_reports_source_indices_and_skips_fences() {
+        let md = "## Next\n[ ] alpha\n\n```\n[ ] not a task\n```\n- [x] beta";
+        assert_eq!(checkbox_lines(md), vec![(1, false), (6, true)]);
+        assert_eq!(checkbox_counts(md), (1, 2));
+    }
+
+    #[test]
+    fn checkbox_lines_finds_indented_boxes() {
+        assert_eq!(checkbox_lines("  [ ] indented\n    - [x] deep"), vec![(0, false), (1, true)]);
+    }
+
+    #[test]
+    fn toggle_checkbox_flips_only_the_target_line() {
+        let md = "[ ] one\n[ ] two";
+        assert_eq!(toggle_checkbox(md, 1).unwrap(), "[ ] one\n[x] two");
+        assert_eq!(toggle_checkbox("- [x] done", 0).unwrap(), "- [ ] done");
+        assert_eq!(toggle_checkbox("  [X] shouty", 0).unwrap(), "  [ ] shouty");
+    }
+
+    #[test]
+    fn toggle_checkbox_rejects_non_checkbox_lines() {
+        assert!(toggle_checkbox("plain text", 0).is_none());
+        assert!(toggle_checkbox("[ ] one", 9).is_none(), "out of range");
+        // A box inside a fence is code, not a task.
+        assert!(toggle_checkbox("```\n[ ] fenced\n```", 1).is_none());
+    }
+
+    #[test]
+    fn toggle_checkbox_preserves_a_trailing_blank_line() {
+        // `.lines()` drops the trailing empty element, `split('\n')` keeps it —
+        // the round-trip must not silently eat the note's final newline.
+        assert_eq!(toggle_checkbox("[ ] a\n", 0).unwrap(), "[x] a\n");
+    }
+
+    #[test]
     fn bullets_numbers_and_checkboxes() {
         assert_eq!(texts("- item\n* star\n+ plus", 40), vec!["• item", "• star", "• plus"]);
         assert_eq!(texts("1. first\n12) twelfth", 40), vec!["1. first", "12. twelfth"]);
@@ -358,5 +465,38 @@ mod tests {
     fn blank_lines_and_empty_input_survive() {
         assert_eq!(texts("a\n\nb", 40), vec!["a", "", "b"]);
         assert_eq!(texts("", 40), vec![""]);
+    }
+
+    #[test]
+    fn mapped_render_tags_every_row_with_its_source_line() {
+        let (lines, map) = render_markdown_mapped("# One\n\n[ ] two", 40);
+        assert_eq!(lines.len(), map.len(), "map is parallel to rows");
+        assert_eq!(map, vec![Some(0), Some(1), Some(2)]);
+    }
+
+    #[test]
+    fn wrapped_source_line_tags_all_of_its_rows() {
+        // Narrow width forces the one checkbox onto several rows; every one of
+        // them must point back at source line 0, or the cursor highlight would
+        // light up half an item.
+        let (lines, map) = render_markdown_mapped("[ ] alpha beta gamma delta", 12);
+        assert!(lines.len() > 1, "should wrap: {} rows", lines.len());
+        assert!(map.iter().all(|m| *m == Some(0)), "{map:?}");
+    }
+
+    #[test]
+    fn mapped_render_matches_plain_render() {
+        let md = "## Next\n[ ] a\n\n```\ncode\n```\n> quote";
+        let plain = render_markdown(md, 30);
+        let (mapped, map) = render_markdown_mapped(md, 30);
+        assert_eq!(plain.len(), mapped.len());
+        assert_eq!(map.len(), mapped.len());
+    }
+
+    #[test]
+    fn mapped_render_of_empty_input_has_an_unmapped_row() {
+        let (lines, map) = render_markdown_mapped("", 40);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(map, vec![None]);
     }
 }

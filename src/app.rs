@@ -17,16 +17,28 @@ use ratatui::widgets::{
 };
 use unicode_width::UnicodeWidthChar;
 
-use crate::markdown::render_markdown;
+use crate::markdown::{self, render_markdown, render_markdown_mapped};
 use crate::state::{self, METADATA_SOURCE, Mode, Note, PANE_LABEL};
+use crate::template;
 
 /// Debounce for the edit-mode autosave.
 const AUTOSAVE_AFTER: Duration = Duration::from_secs(2);
 /// Identity re-stamp interval (launcher stale threshold is 20s).
 const HEARTBEAT_EVERY: Duration = Duration::from_secs(5);
 
-/// Shown in preview when the note is empty; doubles as the quick-start help.
-const EMPTY_HELP: &str = "(empty note)\n\n  e or Enter        start writing\n  Esc               back to preview (saves)\n  Up/Dn PgUp/PgDn   scroll, g/G top/bottom\n  x                 clear the note (asks first)\n  q                 quit\n\nEverything autosaves and survives restarts.";
+/// Shown in preview when the note is empty: the skeleton `e` would seed,
+/// plus the quick-start help. Built from `template::DEFAULT` so the preview
+/// cannot advertise a template different from the one that gets written.
+fn empty_help() -> String {
+    format!(
+        "(empty note — press e to start with this template)\n\
+         (Status is one line on where this stands; e lands you on it)\n\n{}\n\
+         \n  e or Enter  start writing\
+         \n  l           all notes\
+         \n  q           quit\n\nEverything autosaves and survives restarts.",
+        template::DEFAULT
+    )
+}
 
 /// One row in the list overlay.
 struct OverlayEntry {
@@ -202,6 +214,15 @@ pub struct App {
     col: usize,
     edit_scroll: usize,
     preview_scroll: usize,
+    /// Ordinal into `markdown::checkbox_lines(&note.text)` — which checkbox
+    /// the preview cursor sits on. NOT a source line index: the text can
+    /// change under it, so it is re-resolved and re-clamped on every use.
+    box_cursor: Option<usize>,
+    /// One-shot request to scroll the cursor into view on the next draw.
+    /// Only set right after `move_box`/`toggle_box` place or move the cursor
+    /// — draw clears it once applied — so a cursor merely existing does not
+    /// fight manual scrolling (`Up`/`Dn`/`g`/`G`/PgUp/PgDn) on every frame.
+    follow_box: bool,
     confirm_clear: bool,
     dirty: bool,
     last_edit: Instant,
@@ -235,6 +256,8 @@ impl App {
             col: 0,
             edit_scroll: 0,
             preview_scroll: 0,
+            box_cursor: None,
+            follow_box: false,
             confirm_clear: false,
             dirty: false,
             last_edit: Instant::now(),
@@ -247,7 +270,7 @@ impl App {
             active: ActiveNote::default(),
         };
         if app.note.mode == Mode::Edit {
-            app.enter_edit();
+            app.enter_edit(false); // restore-from-disk: never seed
         }
         app
     }
@@ -272,7 +295,13 @@ impl App {
         self.active == ActiveNote::Tab
     }
 
-    fn save(&self) {
+    /// Takes `&mut self` because it stamps the timestamps back onto the live
+    /// note: `persist_at` writes them onto a CLONE, so without this the
+    /// header's age is frozen at whatever `load()` read at startup — a note
+    /// created this session would never show an age at all, and an older one
+    /// would keep ageing while you type into it, disagreeing by hours with
+    /// the overlay row for the same note (which re-reads from disk).
+    fn save(&mut self) {
         if !self.persist {
             return;
         }
@@ -281,7 +310,16 @@ impl App {
             ActiveNote::Tab => state::tab_env().unwrap_or_default(),
             ActiveNote::Global => String::new(),
         };
-        state::persist_at(&path, &self.note, &tab_id, state::unix_now());
+        let now = state::unix_now();
+        state::persist_at(&path, &self.note, &tab_id, now);
+        // Mirrors persist_at's own stamping rules exactly (created set once,
+        // updated every save). A blank note is DELETED rather than written and
+        // still gets stamped here — harmless: nothing reads the timestamps of
+        // a note with no file, and the next real save overwrites them anyway.
+        if self.note.created == 0 {
+            self.note.created = now;
+        }
+        self.note.updated = now;
     }
 
     /// Commit + save the current note, then swap the pane to the other one
@@ -305,7 +343,11 @@ impl App {
             };
         }
         self.note.mode = Mode::Preview;
+        // Everything per-DOCUMENT resets: a scroll offset and a checkbox
+        // ordinal both mean nothing in the other note. Anything added to this
+        // struct that describes a position INSIDE the note belongs here too.
         self.preview_scroll = 0;
+        self.clear_box_cursor();
         self.dirty = false;
     }
 
@@ -377,6 +419,10 @@ impl App {
             if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
                 self.note.text.clear();
                 self.preview_scroll = 0;
+                // A cursor ordinal outlives the text it indexed: benign only
+                // while `cursor_line()` returns None on empty text, and no
+                // longer benign the moment text comes back (`e` re-seeds).
+                self.clear_box_cursor();
                 self.save();
             }
             self.confirm_clear = false;
@@ -398,9 +444,12 @@ impl App {
                 self.save();
                 return true;
             }
-            KeyCode::Char('e') | KeyCode::Enter => self.enter_edit(),
+            KeyCode::Char('e') | KeyCode::Enter => self.enter_edit(true),
             KeyCode::Up => self.preview_scroll = self.preview_scroll.saturating_sub(1),
             KeyCode::Down => self.preview_scroll = self.preview_scroll.saturating_add(1),
+            KeyCode::Char('j') => self.move_box(1),
+            KeyCode::Char('k') => self.move_box(-1),
+            KeyCode::Char(' ') => self.toggle_box(),
             KeyCode::PageUp => self.preview_scroll = self.preview_scroll.saturating_sub(page),
             KeyCode::PageDown => self.preview_scroll = self.preview_scroll.saturating_add(page),
             // g/G because herdr `pane send-keys` rejects Home/End.
@@ -591,6 +640,7 @@ impl App {
                         if e.is_self && self.showing_tab_note() {
                             self.note.text.clear();
                             self.note.title.clear();
+                            self.clear_box_cursor();
                         }
                         ov.entries.remove(idx);
                     }
@@ -602,9 +652,86 @@ impl App {
         true
     }
 
-    fn enter_edit(&mut self) {
+    /// Source line of the selected checkbox, re-resolved against the current
+    /// text so a stale ordinal can never point at the wrong line.
+    fn cursor_line(&self) -> Option<usize> {
+        let boxes = markdown::checkbox_lines(&self.note.text);
+        boxes.get(self.box_cursor?).map(|(line, _)| *line)
+    }
+
+    /// Re-clamps the cursor ordinal against the checkboxes the note has NOW —
+    /// an edit may have deleted some — and drops it when there are none left.
+    /// The single home of that rule: `move_box` and `leave_edit` both used to
+    /// spell it out, and `leave_edit`'s `n - 1` was panic-safe only because
+    /// its `(_, 0)` arm happened to come first.
+    fn clamp_box_cursor(&mut self) {
+        let n = markdown::checkbox_lines(&self.note.text).len();
+        self.box_cursor = match self.box_cursor {
+            Some(c) if n > 0 => Some(c.min(n - 1)),
+            _ => None,
+        };
+    }
+
+    /// Drops the checkbox cursor and any pending scroll-follow. Both are
+    /// per-DOCUMENT state, so every path that swaps or wipes the buffer
+    /// (`toggle_global`, `x` clear, overlay self-delete) must call this.
+    fn clear_box_cursor(&mut self) {
+        self.box_cursor = None;
+        self.follow_box = false;
+    }
+
+    /// Steps the checkbox cursor. From no cursor, `j` lands on the first box
+    /// and `k` on the last. Clamps at both ends; clears when the note has no
+    /// checkboxes left.
+    fn move_box(&mut self, delta: isize) {
+        self.clamp_box_cursor();
+        let n = markdown::checkbox_lines(&self.note.text).len();
+        if n == 0 {
+            return; // clamp already dropped the cursor
+        }
+        self.box_cursor = Some(match self.box_cursor {
+            None if delta > 0 => 0,
+            None => n - 1,
+            Some(c) => c.saturating_add_signed(delta).min(n - 1),
+        });
+        self.follow_box = true;
+    }
+
+    /// Flips the selected checkbox straight in `note.text`. Preview mode never
+    /// touches `lines`, so `commit` has nothing to overwrite this with — the
+    /// existing debounce persists it.
+    fn toggle_box(&mut self) {
+        let Some(line) = self.cursor_line() else { return };
+        let Some(text) = markdown::toggle_checkbox(&self.note.text, line) else { return };
+        self.note.text = text;
+        self.touch();
+        self.follow_box = true;
+    }
+
+    /// `seed` gates the template: only the INTERACTIVE path (`e`/Enter) may
+    /// seed an empty note. Restoring a persisted `mode: "edit"` must not —
+    /// `herdr pane close` kills the pane with no signal, so a titled, bodyless
+    /// note autosaved mid-edit comes back as Edit, and an unconditional seed
+    /// would hand it a body the user never typed and autosave it 2s later.
+    fn enter_edit(&mut self, seed: bool) {
+        // Lazy seed: a tab you merely toggled Notes into and never edited
+        // still writes no file. `dirty` so the seed survives to the next
+        // autosave; `is_blank` deletes it again if it stays untouched.
+        let seeded = seed && self.note.text.trim().is_empty();
+        if seeded {
+            self.note.text = template::DEFAULT.to_string();
+            self.dirty = true;
+            self.last_edit = Instant::now();
+        }
         self.lines = self.note.text.split('\n').map(String::from).collect();
-        self.row = 0;
+        self.row = if seeded {
+            // Line 1: the blank line under `## Status`, so the first
+            // keystroke IS the status. The template ships no placeholder to
+            // replace — edit mode has no line-kill or selection to remove one.
+            1.min(self.lines.len().saturating_sub(1))
+        } else {
+            0
+        };
         self.col = 0;
         self.edit_scroll = 0;
         self.note.mode = Mode::Edit;
@@ -614,6 +741,8 @@ impl App {
         self.commit();
         self.note.mode = Mode::Preview;
         self.dirty = false;
+        // The edit may have deleted the box the cursor pointed at.
+        self.clamp_box_cursor();
         self.save();
     }
 
@@ -781,11 +910,39 @@ impl App {
                     Style::default().add_modifier(Modifier::DIM),
                 ));
             }
+            // Last, and ALL-OR-NOTHING: the header is a 1-row Paragraph with
+            // no wrap, so relying on the terminal to clip from the right
+            // renders a meaningless fragment ("2h ag", or a bare "2" that
+            // reads as a count). Measure what is already assembled in display
+            // COLUMNS (the title can hold CJK) and drop the whole token when
+            // it does not fit — same "pick a variant that fits" rule as the
+            // footer hints below.
+            if self.note.updated > 0 {
+                let age = state::format_age(state::unix_now().saturating_sub(self.note.updated));
+                let token = format!("  {age} ago");
+                let used: usize = title.iter().map(|s| dwidth(&s.content)).sum();
+                if used + dwidth(&token) <= usize::from(title_a.width) {
+                    title.push(Span::styled(token, Style::default().add_modifier(Modifier::DIM)));
+                }
+            }
         }
         frame.render_widget(Paragraph::new(Line::from(title)), title_a);
 
+        // The full hint line (69 columns) no longer fits a narrow right dock,
+        // and it ends in `q quit` — exactly what clipping would eat. The short
+        // form is 37 columns, so it clips too below 37; the floor for keeping
+        // `q quit` on screen just drops from 69 columns to 37.
+        const PREVIEW_HINTS: &str =
+            " e edit  j/k spc tick  r title  l list  Up/Dn scroll  x clear  q quit";
+        const PREVIEW_HINTS_SHORT: &str = " e edit  j/k spc tick  l list  q quit";
         let hints = match self.note.mode {
-            Mode::Preview => " e edit  r title  l list  Up/Dn scroll  x clear  q quit",
+            Mode::Preview => {
+                if usize::from(hint_a.width) >= PREVIEW_HINTS.chars().count() {
+                    PREVIEW_HINTS
+                } else {
+                    PREVIEW_HINTS_SHORT
+                }
+            }
             Mode::Edit => " Esc preview (saves)   Ctrl+S save",
         };
         frame.render_widget(
@@ -807,7 +964,7 @@ impl App {
         if self.note.text.trim().is_empty() {
             self.preview_scroll = 0;
             frame.render_widget(
-                Paragraph::new(EMPTY_HELP).style(Style::default().add_modifier(Modifier::DIM)),
+                Paragraph::new(empty_help()).style(Style::default().add_modifier(Modifier::DIM)),
                 area,
             );
             return None;
@@ -815,9 +972,35 @@ impl App {
         // The rightmost column is reserved for the overflow scrollbar so text
         // never sits underneath it.
         let text_w = usize::from(area.width).saturating_sub(1).max(1);
-        let lines = render_markdown(&self.note.text, text_w);
+        let (mut lines, map) = render_markdown_mapped(&self.note.text, text_w);
         let total = lines.len();
         let max = total.saturating_sub(usize::from(area.height));
+        if let Some(src) = self.cursor_line() {
+            // Highlight EVERY row of the selected item — a wrapped checkbox
+            // spans several and would otherwise look half-selected. This runs
+            // unconditionally whenever a cursor exists; only the scrolling
+            // below is one-shot.
+            for (i, line) in lines.iter_mut().enumerate() {
+                if map.get(i).copied().flatten() == Some(src) {
+                    line.style = line.style.add_modifier(Modifier::REVERSED);
+                }
+            }
+            // Scroll follows the cursor, mirroring the overlay's list clamp —
+            // but only on a fresh move/toggle (`follow_box`), not on every
+            // draw. Otherwise a cursor merely existing would fight manual
+            // scrolling (Up/Dn/g/G/PgUp/PgDn) on the very next frame.
+            if self.follow_box {
+                if let Some(first) = map.iter().position(|m| *m == Some(src)) {
+                    let h = usize::from(area.height).max(1);
+                    if first < self.preview_scroll {
+                        self.preview_scroll = first;
+                    } else if first >= self.preview_scroll + h {
+                        self.preview_scroll = first + 1 - h;
+                    }
+                }
+                self.follow_box = false;
+            }
+        }
         self.preview_scroll = clamp_scroll(self.preview_scroll, total, usize::from(area.height));
         let scroll = u16::try_from(self.preview_scroll).unwrap_or(u16::MAX);
         frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), area);
@@ -979,7 +1162,21 @@ fn draw_overlay(frame: &mut Frame, area: Rect, ov: &mut Overlay) {
                 let self_mark = if e.is_self { "*" } else { " " };
                 let name = if e.title.trim().is_empty() { "(untitled)" } else { &e.title };
                 let age = if e.updated == 0 { "—".to_string() } else { state::format_age(now.saturating_sub(e.updated)) };
-                let right = format!("{}  {age}", e.context);
+                // Counted per draw off the row's own text (only visible rows
+                // are drawn) rather than cached, so an in-overlay rename or
+                // delete can never leave a stale count behind.
+                let (done, total) = markdown::checkbox_counts(&e.text);
+                let progress = if total > 0 { format!("  {done}/{total}") } else { String::new() };
+                // Fit the right column to the columns it may actually have,
+                // dropping whole tokens (progress, then context) — otherwise
+                // it eats the title at real dock widths and can itself end
+                // mid-token.
+                let right = fit_right(
+                    &e.context,
+                    &progress,
+                    &age,
+                    right_budget(marker, self_mark, name, inner_width),
+                );
                 let text = format_row(marker, self_mark, name, &right, inner_width);
                 let base = if e.is_global {
                     Color::Cyan
@@ -1078,19 +1275,59 @@ fn truncate_w(s: &str, max: usize) -> String {
 
 /// One overlay row, padded to exactly `inner_width` display columns: a
 /// 1-space margin on each side, `{marker}{self_mark}{name}` on the left (name
-/// truncated to fit), `right` (context + age) pinned to the right edge, the
-/// gap between padded with spaces. Fits exactly within `inner_width` for any
+/// truncated to fit, but never below `NAME_MIN`), `right` (context, progress
+/// and age — already fitted by `fit_right`) pinned to the right edge, the
+/// gap between padded with spaces. An over-long `right` is still truncated
+/// here as a safety net. Fits exactly within `inner_width` for any
 /// input wide enough to hold the margins plus the `marker`+`self_mark`
 /// prefix; can only exceed `inner_width` when `inner_width` is too small to
 /// hold even that (a handful of columns) — never panics.
+/// Display columns the NAME keeps before the right-hand segment may claim any
+/// budget. The dashboard's job is to say which note is which, so the title
+/// never collapses: without a floor a 40-column right dock (inner width 34)
+/// left it ONE column once context + progress + age were in. Eight is the
+/// shortest stem that still tells titles apart ("Release…"), and it is small
+/// enough that the same 34-column row still fits `workspace · agent` + age
+/// alongside it — a bigger floor pushes the session context off entirely.
+const NAME_MIN: usize = 8;
+
+/// Columns `format_row` will grant the right-hand segment, after the two
+/// margins, the marker prefix, a 1-space gap and the name's floor. Exposed so
+/// the caller can choose WHICH right-hand tokens survive (see `fit_right`)
+/// instead of letting `format_row` truncate one mid-token.
+fn right_budget(marker: &str, self_mark: &str, name: &str, inner_width: usize) -> usize {
+    let prefix_w = dwidth(marker) + dwidth(self_mark);
+    inner_width
+        .saturating_sub(2) // the row's 1-space margins
+        .saturating_sub(prefix_w + 1) // marker/self mark + the gap before `right`
+        .saturating_sub(NAME_MIN.min(dwidth(name))) // the name's floor (never more than it needs)
+}
+
+/// The row's right-hand segment degraded to fit `budget`, in WHOLE tokens:
+/// context + progress + age, then without the progress count, then the age
+/// alone, then nothing. Truncating instead would leave a fragment that reads
+/// as a different value — `acme-app · claude  2` looks like a count or an age.
+fn fit_right(context: &str, progress: &str, age: &str, budget: usize) -> String {
+    [
+        format!("{context}{progress}  {age}"),
+        format!("{context}  {age}"),
+        age.to_string(),
+    ]
+    .into_iter()
+    .map(|s| s.trim_start().to_string())
+    .find(|s| dwidth(s) <= budget)
+    .unwrap_or_default()
+}
+
 fn format_row(marker: &str, self_mark: &str, name: &str, right: &str, inner_width: usize) -> String {
     let budget = inner_width.saturating_sub(2);
     let prefix_w = dwidth(marker) + dwidth(self_mark);
-    let gap_min = usize::from(dwidth(right) > 0);
-    // Reserve room for the prefix + minimum gap before the right segment gets
-    // any width, so left + gap + right can never exceed the budget.
-    let right = truncate_w(right, budget.saturating_sub(prefix_w + gap_min));
+    // The name's floor comes out of the budget BEFORE the right segment gets
+    // any of it (`right_budget`), which also reserves the prefix and the
+    // minimum gap — so left + gap + right can never exceed the budget.
+    let right = truncate_w(right, right_budget(marker, self_mark, name, inner_width));
     let right_w = dwidth(&right);
+    let gap_min = usize::from(right_w > 0);
     let name_budget = budget.saturating_sub(prefix_w + right_w + gap_min);
     let name = truncate_w(name, name_budget);
     let left = format!("{marker}{self_mark}{name}");
@@ -1138,6 +1375,22 @@ mod tests {
     }
 
     #[test]
+    fn header_shows_the_note_age() {
+        let mut a = app("body");
+        a.note.updated = state::unix_now().saturating_sub(2 * 60 * 60);
+        let screen = rendered(&mut a, 60, 8);
+        assert!(screen.contains("2h ago"), "{screen}");
+    }
+
+    #[test]
+    fn header_omits_age_for_a_note_with_no_timestamp() {
+        let mut a = app("body");
+        a.note.updated = 0; // a v1 file, before `updated` existed
+        let screen = rendered(&mut a, 60, 8);
+        assert!(!screen.contains("ago"), "{screen}");
+    }
+
+    #[test]
     fn edit_roundtrip_insert_newline_backspace() {
         let mut a = app("ab");
         a.on_key(key(KeyCode::Enter)); // enter edit mode
@@ -1157,6 +1410,65 @@ mod tests {
         a.on_key(key(KeyCode::Backspace)); // join lines
         a.on_key(key(KeyCode::Esc));
         assert_eq!(a.note.text, "abc");
+    }
+
+    #[test]
+    fn first_edit_seeds_the_template() {
+        let mut a = app("");
+        a.on_key(key(KeyCode::Char('e')));
+        assert_eq!(a.note.text, crate::template::DEFAULT);
+        // The Status section ships EMPTY: the cursor lands on the blank line
+        // directly under `## Status`, so the first keystroke IS the status.
+        // (A placeholder there would cost End + 29 Backspaces to remove —
+        // edit mode has no line-kill, word-delete or selection.)
+        assert_eq!(a.row, 1, "cursor on the blank line under ## Status");
+        assert_eq!(a.lines[0], "## Status");
+        assert_eq!(a.lines[a.row], "", "nothing to delete before typing");
+        assert_eq!(a.col, 0);
+        assert!(a.dirty, "the seed must reach disk on the next flush");
+    }
+
+    #[test]
+    fn restoring_edit_mode_from_disk_does_not_seed_the_template() {
+        // `herdr pane close` kills the pane with no signal, so a note
+        // autosaved while editing keeps `mode: "edit"` on disk. Re-opening it
+        // must NOT seed a body the user never typed (and never asked to save).
+        let a = App::with_note(
+            Note { text: String::new(), title: "Titled".into(), mode: Mode::Edit, ..Default::default() },
+            false,
+        );
+        assert_eq!(a.note.text, "", "restore must not seed the template");
+        assert!(!a.dirty, "and must not queue an autosave of a body nobody typed");
+    }
+
+    #[test]
+    fn edit_does_not_seed_over_existing_text() {
+        let mut a = app("already written");
+        a.on_key(key(KeyCode::Char('e')));
+        assert_eq!(a.note.text, "already written");
+    }
+
+    #[test]
+    fn entering_edit_on_existing_text_opens_at_the_top() {
+        // Landing on the template's blank status line belongs to the seed path
+        // only — a real note must still open at row 0, whatever it contains.
+        let mut a = app("first line\n<html>\nthird");
+        a.on_key(key(KeyCode::Char('e')));
+        assert_eq!(a.row, 0);
+        assert_eq!(a.col, 0);
+    }
+
+    #[test]
+    fn empty_preview_shows_the_template_skeleton() {
+        let mut a = app("");
+        let screen = rendered(&mut a, 60, 24);
+        assert!(screen.contains("## Status"), "{screen}");
+        assert!(screen.contains("## Next"), "{screen}");
+        assert!(!screen.contains("one line: where this stands"), "no placeholder inside the template: {screen}");
+        assert!(
+            screen.contains("one line on where this stands"),
+            "the help copy still says what the empty Status section is for: {screen}"
+        );
     }
 
     #[test]
@@ -1216,7 +1528,11 @@ mod tests {
         // Plain Ctrl+char stays a shortcut, never inserts.
         a.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
         a.on_key(key(KeyCode::Esc));
-        assert_eq!(a.note.text, "@");
+        // Entering edit on an empty note seeds the template and lands the
+        // cursor on the empty line under `## Status`, so the inserted char
+        // becomes the status. Built from DEFAULT so it can't drift from it.
+        let expected = crate::template::DEFAULT.replacen("## Status\n", "## Status\n@", 1);
+        assert_eq!(a.note.text, expected);
     }
 
     #[test]
@@ -1228,7 +1544,10 @@ mod tests {
         a.last_edit = Instant::now() - AUTOSAVE_AFTER;
         a.maybe_flush();
         assert!(!a.dirty);
-        assert_eq!(a.note.text, "z", "flush committed the edit buffer");
+        // Entering edit on an empty note seeds the template first, so the
+        // typed char lands on the empty line under `## Status`.
+        let expected = crate::template::DEFAULT.replacen("## Status\n", "## Status\nz", 1);
+        assert_eq!(a.note.text, expected, "flush committed the edit buffer");
     }
 
     #[test]
@@ -1503,6 +1822,32 @@ mod tests {
     }
 
     #[test]
+    fn overlay_rows_show_todo_progress() {
+        let mut a = app("body");
+        let mut e = entry_with_tab("Busy Tab", state::TabStatus::Live, "w1:t1");
+        e.text = "[ ] one\n[x] two\n[x] three".into();
+        a.overlay = Some(Overlay::from_entries(vec![e]));
+        let screen = rendered(&mut a, 70, 14);
+        assert!(screen.contains("2/3"), "{screen}");
+    }
+
+    #[test]
+    fn overlay_rows_omit_progress_when_the_note_has_no_boxes() {
+        let mut a = app("body");
+        let mut e = entry_with_tab("Prose Tab", state::TabStatus::Live, "w1:t1");
+        e.text = "no tasks here".into();
+        a.overlay = Some(Overlay::from_entries(vec![e]));
+        let screen = rendered(&mut a, 70, 14);
+        assert!(!screen.contains("0/0"), "{screen}");
+    }
+
+    #[test]
+    fn overlay_row_with_progress_still_fits_the_box() {
+        let row = format_row(">", "*", "A Very Long Note Title Indeed", "spec-droid · claude  2/3  2h", 40);
+        assert_eq!(dwidth(&row), 40);
+    }
+
+    #[test]
     fn recompute_visible_clamps_selection_when_filter_narrows_below_it() {
         let mut ov = Overlay::from_entries(vec![
             entry("Alpha", state::TabStatus::Closed),
@@ -1754,5 +2099,290 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn j_k_walk_the_checkbox_cursor_and_clamp() {
+        let mut a = app("## Next\n[ ] one\ntext\n[ ] two");
+        assert_eq!(a.box_cursor, None, "no cursor until you ask for one");
+        a.on_key(key(KeyCode::Char('j')));
+        assert_eq!(a.box_cursor, Some(0));
+        a.on_key(key(KeyCode::Char('j')));
+        assert_eq!(a.box_cursor, Some(1));
+        a.on_key(key(KeyCode::Char('j')));
+        assert_eq!(a.box_cursor, Some(1), "clamps at the last box");
+        a.on_key(key(KeyCode::Char('k')));
+        assert_eq!(a.box_cursor, Some(0));
+        a.on_key(key(KeyCode::Char('k')));
+        assert_eq!(a.box_cursor, Some(0), "clamps at the first box");
+    }
+
+    #[test]
+    fn k_from_no_cursor_starts_at_the_last_box() {
+        let mut a = app("[ ] one\n[ ] two");
+        a.on_key(key(KeyCode::Char('k')));
+        assert_eq!(a.box_cursor, Some(1));
+    }
+
+    #[test]
+    fn space_toggles_the_selected_box() {
+        let mut a = app("[ ] one\n[ ] two");
+        a.on_key(key(KeyCode::Char('j')));
+        a.on_key(key(KeyCode::Char('j')));
+        a.on_key(key(KeyCode::Char(' ')));
+        assert_eq!(a.note.text, "[ ] one\n[x] two");
+        assert!(a.dirty, "the toggle must reach disk on the next flush");
+        a.on_key(key(KeyCode::Char(' ')));
+        assert_eq!(a.note.text, "[ ] one\n[ ] two", "toggles back");
+    }
+
+    #[test]
+    fn space_with_no_cursor_is_a_noop() {
+        let mut a = app("[ ] one");
+        a.on_key(key(KeyCode::Char(' ')));
+        assert_eq!(a.note.text, "[ ] one");
+        assert!(!a.dirty);
+    }
+
+    #[test]
+    fn checkbox_keys_are_noops_without_checkboxes() {
+        let mut a = app("just prose\nmore prose");
+        for k in ['j', 'k', ' '] {
+            a.on_key(key(KeyCode::Char(k)));
+        }
+        assert_eq!(a.box_cursor, None);
+        assert_eq!(a.note.text, "just prose\nmore prose");
+    }
+
+    #[test]
+    fn cursor_clamps_when_an_edit_removes_checkboxes() {
+        let mut a = app("[ ] one\n[ ] two");
+        a.on_key(key(KeyCode::Char('j')));
+        a.on_key(key(KeyCode::Char('j')));
+        assert_eq!(a.box_cursor, Some(1));
+        a.note.text = "[ ] one".into(); // an edit deleted the second box
+        a.on_key(key(KeyCode::Char('j')));
+        assert_eq!(a.box_cursor, Some(0), "clamped to the surviving box");
+        a.note.text = "no boxes left".into();
+        a.on_key(key(KeyCode::Char('j')));
+        assert_eq!(a.box_cursor, None);
+    }
+
+    #[test]
+    fn leaving_edit_drops_a_cursor_with_nothing_to_point_at() {
+        let mut a = app("[ ] one");
+        a.on_key(key(KeyCode::Char('j')));
+        assert_eq!(a.box_cursor, Some(0));
+        a.on_key(key(KeyCode::Char('e')));
+        a.lines = vec!["prose only".into()];
+        a.on_key(key(KeyCode::Esc));
+        assert_eq!(a.box_cursor, None);
+    }
+
+    #[test]
+    fn cursor_scrolls_itself_into_view() {
+        // 30 boxes in a 10-row body: the last one is far below the fold.
+        let text: String = (0..30).map(|i| format!("[ ] item {i}\n")).collect();
+        let mut a = app(&text);
+        for _ in 0..30 {
+            a.on_key(key(KeyCode::Char('j')));
+        }
+        let _ = rendered(&mut a, 40, 12); // 12 rows - header - hint = 10 body rows
+        // Cursor clamps to the last box (index 29). Every line here is a
+        // single unwrapped checkbox row, so its rendered row equals its
+        // source line (29) — the follow must land it inside the visible
+        // window, not merely produce some non-zero scroll.
+        assert!(
+            a.preview_scroll <= 29 && 29 < a.preview_scroll + a.body_height,
+            "cursor's row (29) must be inside the visible window [{}, {}): scroll={}",
+            a.preview_scroll,
+            a.preview_scroll + a.body_height,
+            a.preview_scroll
+        );
+        // The offset is also exactly derivable: first=29, h=10 (12 rows minus
+        // the 1-row header and 1-row hint) -> scroll = 29 + 1 - 10 = 20.
+        assert_eq!(a.preview_scroll, 20, "draw must scroll the cursor into view");
+    }
+
+    #[test]
+    fn manual_scrolling_survives_a_live_checkbox_cursor() {
+        // The follow is one-shot: it must not drag the viewport back to the
+        // cursor on every frame, or Up/Dn/g/G become unusable after one `j`.
+        let text: String = (0..30)
+            .map(|i| format!("[ ] item {i}\n"))
+            .chain((0..30).map(|i| format!("prose {i}\n")))
+            .collect();
+        let mut a = app(&text);
+        a.on_key(key(KeyCode::Char('j'))); // cursor on the first box
+        let _ = rendered(&mut a, 40, 12);
+        a.on_key(key(KeyCode::Char('G'))); // jump to the bottom
+        let after = rendered(&mut a, 40, 12);
+        assert!(a.preview_scroll > 0, "G must not be undone by the follow: {after}");
+        assert!(a.box_cursor.is_some(), "scrolling away does not drop the cursor");
+    }
+
+    #[test]
+    fn preview_footer_falls_back_to_the_short_form_when_narrow() {
+        let mut a = app("body");
+        assert!(rendered(&mut a, 90, 8).contains("Up/Dn scroll"), "wide pane shows the full hints");
+        let narrow = rendered(&mut a, 40, 8);
+        assert!(narrow.contains("j/k spc tick"), "the new binding survives truncation: {narrow}");
+        assert!(narrow.contains("q quit"), "quit must never be the thing that gets clipped: {narrow}");
+    }
+
+    // ----- per-document state must not survive a document swap or a wipe ---
+
+    #[test]
+    fn toggle_global_drops_the_checkbox_cursor() {
+        // `box_cursor` is an ordinal into THIS document's checkboxes. Carried
+        // across the swap it highlights an arbitrary box in the other note —
+        // one that `space` (a pager habit) would then silently tick.
+        let mut a = app("[ ] one\n[ ] two\n[ ] three");
+        a.on_key(key(KeyCode::Char('j')));
+        a.on_key(key(KeyCode::Char('j')));
+        assert_eq!(a.box_cursor, Some(1));
+        a.toggle_global();
+        assert_eq!(a.box_cursor, None, "the cursor is per-document, like preview_scroll");
+        assert!(!a.follow_box, "and so is its pending scroll-follow");
+    }
+
+    #[test]
+    fn clearing_the_note_drops_the_checkbox_cursor() {
+        let mut a = app("[ ] one\n[ ] two");
+        a.on_key(key(KeyCode::Char('j')));
+        assert_eq!(a.box_cursor, Some(0));
+        a.on_key(key(KeyCode::Char('x')));
+        a.on_key(key(KeyCode::Char('y')));
+        assert_eq!(a.note.text, "");
+        assert_eq!(a.box_cursor, None, "a stale ordinal must not come back when text does");
+        assert!(!a.follow_box);
+    }
+
+    #[test]
+    fn overlay_self_delete_drops_the_checkbox_cursor() {
+        let mut a = app("[ ] one\n[ ] two");
+        a.on_key(key(KeyCode::Char('j')));
+        assert_eq!(a.box_cursor, Some(0));
+        a.overlay = Some(Overlay::from_entries(vec![
+            OverlayEntry { is_self: true, ..entry("X", state::TabStatus::Closed) },
+        ]));
+        a.on_key(key(KeyCode::Char('d')));
+        a.on_key(key(KeyCode::Char('y')));
+        assert_eq!(a.note.text, "");
+        assert_eq!(a.box_cursor, None, "clearing the buffer clears its cursor");
+        assert!(!a.follow_box);
+    }
+
+    #[test]
+    fn seeding_after_a_clear_does_not_resurrect_a_stale_cursor() {
+        // x -> e (seeds boxes again) -> Esc re-clamps: a leftover ordinal
+        // would hand the user a cursor they never asked for.
+        let mut a = app("[ ] one\n[ ] two");
+        a.on_key(key(KeyCode::Char('j')));
+        a.on_key(key(KeyCode::Char('x')));
+        a.on_key(key(KeyCode::Char('y')));
+        a.on_key(key(KeyCode::Char('e'))); // seeds the template (has one box)
+        a.on_key(key(KeyCode::Esc));
+        assert_eq!(a.box_cursor, None, "no cursor until the user asks for one");
+    }
+
+    #[test]
+    fn save_stamps_updated_so_the_header_age_refreshes() {
+        // persist_at stamps a CLONE; without mirroring it back, a note created
+        // this session never shows an age at all, and an older one keeps
+        // ageing while you type into it (the overlay, which re-reads from
+        // disk, then disagrees with the header by hours).
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("notes-stamp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let prev_state = std::env::var_os("HERDR_PLUGIN_STATE_DIR");
+        let prev_tab = std::env::var_os("HERDR_TAB_ID");
+        // SAFETY: serialized by ENV_LOCK; restored below.
+        unsafe {
+            std::env::set_var("HERDR_PLUGIN_STATE_DIR", &dir);
+            std::env::remove_var("HERDR_TAB_ID");
+        }
+
+        let mut a = App::with_note(Note { text: "fresh".into(), ..Default::default() }, true);
+        assert_eq!(a.note.updated, 0, "a brand-new note starts unstamped");
+        a.finalize();
+        assert!(a.note.updated > 0, "save must stamp the live note, not only the clone it writes");
+        assert!(a.note.created > 0, "created is stamped on the first write too");
+        assert_eq!(a.note.updated, state::read_note(&dir.join("note.json")).updated,
+            "in-memory and on-disk timestamps must agree");
+        let screen = rendered(&mut a, 60, 8);
+        assert!(screen.contains("just now ago"), "the header shows an age right after the first save: {screen}");
+
+        unsafe {
+            match prev_state {
+                Some(v) => std::env::set_var("HERDR_PLUGIN_STATE_DIR", v),
+                None => std::env::remove_var("HERDR_PLUGIN_STATE_DIR"),
+            }
+            if let Some(v) = prev_tab {
+                std::env::set_var("HERDR_TAB_ID", v);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn header_drops_the_age_whole_rather_than_clipping_it() {
+        // The header is a 1-row Paragraph with no wrap, so a too-long age is
+        // cell-truncated: "2h ago" renders as a bare "2" or "2h ag".
+        let mut a = app("body");
+        a.note.title = "Sprint Notes".into(); // no digits, so "2h" can only come from the age
+        a.note.updated = state::unix_now().saturating_sub(2 * 60 * 60);
+        for w in 16..=44u16 {
+            let screen = rendered(&mut a, w, 8);
+            let header = screen.lines().next().unwrap().to_string();
+            let whole = header.contains("2h ago");
+            assert!(whole || !header.contains("2h"), "partial age at width {w}: {header:?}");
+            assert!(whole || !header.contains("ag"), "partial age at width {w}: {header:?}");
+        }
+        assert!(
+            rendered(&mut a, 44, 8).lines().next().unwrap().contains("2h ago"),
+            "a wide enough header still shows the age"
+        );
+    }
+
+    // ----- overlay row layout ---------------------------------------------
+
+    #[test]
+    fn fit_right_drops_progress_then_context_instead_of_truncating() {
+        let ctx = "acme-app · claude"; // 17 columns
+        assert_eq!(fit_right(ctx, "  2/3", "2h", 40), "acme-app · claude  2/3  2h");
+        assert_eq!(fit_right(ctx, "  2/3", "2h", 21), "acme-app · claude  2h", "progress goes first");
+        assert_eq!(fit_right(ctx, "  2/3", "2h", 10), "2h", "context goes second");
+        assert_eq!(fit_right(ctx, "  2/3", "2h", 1), "", "nothing fits -> nothing shown");
+        assert_eq!(fit_right("", "", "2h", 10), "2h", "no context, no stray padding");
+    }
+
+    #[test]
+    fn format_row_keeps_a_usable_name_at_narrow_widths() {
+        // A 40-column right dock gives the overlay box inner_width 34; the old
+        // budget order left the title 1 column there (and 0 below it).
+        for inner in [24usize, 28, 30, 32, 34] {
+            let row = format_row(">", "*", "Release Notes", "acme-app · claude  2/3  2h", inner);
+            assert_eq!(dwidth(&row), inner, "row must still fill exactly: {row:?}");
+            assert!(
+                row.contains("Releas"),
+                "the name must stay readable at inner_width {inner}: {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn overlay_row_shows_both_a_name_and_context_at_a_40_column_dock() {
+        let mut a = app("body");
+        let mut e = entry_with_tab("Release Notes", state::TabStatus::Live, "w1:t1");
+        e.text = "[ ] one\n[x] two\n[x] three".into();
+        e.context = "acme-app · claude".into();
+        e.updated = state::unix_now().saturating_sub(2 * 60 * 60);
+        a.overlay = Some(Overlay::from_entries(vec![e]));
+        let screen = rendered(&mut a, 40, 14);
+        assert!(screen.contains("Release"), "the name must not collapse to a column or two: {screen}");
+        assert!(screen.contains("acme-app"), "session context still fits: {screen}");
+        assert!(!screen.contains("2/3"), "the progress count is the first thing dropped: {screen}");
     }
 }
