@@ -9,6 +9,7 @@ mod app;
 mod ipc;
 mod launch;
 mod markdown;
+mod prompts;
 mod state;
 mod template;
 
