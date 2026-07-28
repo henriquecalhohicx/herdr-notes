@@ -11,22 +11,25 @@ const ACCENT: Color = Color::Cyan;
 const CODE: Color = Color::Yellow;
 const CHECK: Color = Color::Green;
 
-/// One configured issue key found while rendering: the key text and the
-/// rendered row its first character landed on. Document order == the order
-/// `n`/`N` walk.
+/// One openable target found while rendering: its text, what kind of target it
+/// is, and the rendered row its first character landed on. Document order ==
+/// the order `n`/`N` walk.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TicketHit {
-    pub key: String,
+pub struct LinkHit {
+    pub text: String,
+    pub kind: LinkKind,
     pub row: usize,
 }
 
-/// Per-render ticket state: what to match, which hit is cursored, and the hits
+/// Per-render link state: what to match, which hit is cursored, and the hits
 /// found so far. `hits.len()` doubles as the ordinal of the next hit, which is
 /// why detection and highlight can never disagree — one pass assigns both.
-struct TicketCtx<'a> {
+/// `enabled` is false for the link-free entry points.
+struct LinkCtx<'a> {
     cfg: &'a crate::tickets::Config,
     cursor: Option<usize>,
-    hits: Vec<TicketHit>,
+    hits: Vec<LinkHit>,
+    enabled: bool,
 }
 
 pub fn render_markdown(text: &str, width: usize) -> Vec<Line<'static>> {
@@ -40,22 +43,32 @@ pub fn render_markdown(text: &str, width: usize) -> Vec<Line<'static>> {
 /// text — needed by the checkbox cursor.
 pub fn render_markdown_mapped(text: &str, width: usize) -> (Vec<Line<'static>>, Vec<Option<usize>>) {
     let cfg = crate::tickets::Config::default();
-    let (lines, map, _) = render_markdown_tickets(text, width, &cfg, None);
+    let (lines, map, _) = render_inner(text, width, &cfg, None, false);
     (lines, map)
 }
 
-/// `render_markdown_mapped` plus ticket links: keys configured in `cfg` are
-/// underlined (the `cursor`-th one also REVERSED) and returned as hits.
-pub fn render_markdown_tickets(
+/// `render_markdown_mapped` plus links: configured issue keys and bare http(s)
+/// URLs are underlined (the `cursor`-th one also REVERSED) and returned as hits.
+pub fn render_markdown_links(
     text: &str,
     width: usize,
     cfg: &crate::tickets::Config,
     cursor: Option<usize>,
-) -> (Vec<Line<'static>>, Vec<Option<usize>>, Vec<TicketHit>) {
+) -> (Vec<Line<'static>>, Vec<Option<usize>>, Vec<LinkHit>) {
+    render_inner(text, width, cfg, cursor, true)
+}
+
+fn render_inner(
+    text: &str,
+    width: usize,
+    cfg: &crate::tickets::Config,
+    cursor: Option<usize>,
+    enabled: bool,
+) -> (Vec<Line<'static>>, Vec<Option<usize>>, Vec<LinkHit>) {
     let width = width.max(8);
     let mut out = Vec::new();
     let mut map: Vec<Option<usize>> = Vec::new();
-    let mut ctx = TicketCtx { cfg, cursor, hits: Vec::new() };
+    let mut ctx = LinkCtx { cfg, cursor, hits: Vec::new(), enabled };
     let mut in_code = false;
     for (src, raw) in text.lines().enumerate() {
         let line = raw.trim_end();
@@ -83,7 +96,7 @@ pub fn render_markdown_tickets(
     (out, map, ctx.hits)
 }
 
-fn render_line(out: &mut Vec<Line<'static>>, ctx: &mut TicketCtx<'_>, line: &str, width: usize) {
+fn render_line(out: &mut Vec<Line<'static>>, ctx: &mut LinkCtx<'_>, line: &str, width: usize) {
     let trimmed = line.trim_start();
     if trimmed.is_empty() {
         out.push(Line::raw(""));
@@ -269,7 +282,6 @@ fn find_ticket_ranges(s: &str, cfg: &crate::tickets::Config) -> Vec<std::ops::Ra
 /// What an openable target IS: an issue key that resolves through the config,
 /// or a URL that is already the target.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)] // Will be used in Task 2 (wiring through render/cursor)
 pub enum LinkKind {
     Ticket,
     Url,
@@ -281,7 +293,6 @@ pub enum LinkKind {
 /// The crate's ONE link scan. Anything that needs to know where the links are
 /// goes through here, for the same reason the checkbox parser is single-homed:
 /// a second scan drifts.
-#[allow(dead_code)] // Will be used in Task 2 (wiring through render/cursor)
 pub fn find_links(
     s: &str,
     cfg: &crate::tickets::Config,
@@ -306,16 +317,22 @@ pub fn find_links(
 }
 
 /// Byte ranges of bare `http://` / `https://` URLs. The scheme is matched
-/// case-insensitively, the URL runs to the next whitespace, and at least one
-/// non-whitespace character must follow `//` — a bare scheme is not a link.
-#[allow(dead_code)] // Used by find_links, allowed to warn during development
+/// case-insensitively, needs a non-alphanumeric boundary on its LEFT (a match
+/// may start at offset 0, or the preceding byte must not be ASCII
+/// alphanumeric — mirrors the ticket key boundary below), the URL runs to the
+/// next whitespace, and at least one non-whitespace character must follow
+/// `//` — a bare scheme is not a link.
 fn find_url_ranges(s: &str) -> Vec<std::ops::Range<usize>> {
     const SCHEMES: [&str; 2] = ["https://", "http://"];
+    let bytes = s.as_bytes();
     let mut out: Vec<std::ops::Range<usize>> = Vec::new();
     let mut resume = 0usize;
     for (i, _) in s.char_indices() {
         if i < resume {
             continue;
+        }
+        if i > 0 && bytes[i - 1].is_ascii_alphanumeric() {
+            continue; // glued to a preceding word: `xhttps://` is not a link
         }
         let rest = &s[i..];
         let Some(scheme) = SCHEMES
@@ -343,7 +360,6 @@ fn find_url_ranges(s: &str) -> Vec<std::ops::Range<usize>> {
 /// Trims trailing sentence punctuation from a URL, and a trailing `)`/`]`/`}`
 /// only when the URL holds no matching opener — so `(see https://x/y)` gives
 /// the bracket back to the prose while `https://x/a_(b)` keeps it.
-#[allow(dead_code)] // Used by find_url_ranges, allowed to warn during development
 fn trim_url_end(s: &str, start: usize, mut end: usize) -> usize {
     let bytes = s.as_bytes();
     while end > start {
@@ -359,10 +375,6 @@ fn trim_url_end(s: &str, start: usize, mut end: usize) -> usize {
             b'}' => b'{',
             _ => break,
         };
-        // Ensure we can safely slice at end - 1 (it must be a char boundary)
-        if !s.is_char_boundary(end - 1) {
-            break;
-        }
         let inner = &s[start..end - 1];
         let opens = inner.bytes().filter(|b| *b == opener).count();
         let closes = inner.bytes().filter(|b| *b == last).count();
@@ -439,60 +451,60 @@ fn find_double_star(chars: &[char], from: usize) -> Option<usize> {
     (from..chars.len().saturating_sub(1)).find(|&j| chars[j] == '*' && chars[j + 1] == '*')
 }
 
-/// `wrap_into` with the ticket pass in front of it: keys get their own styled
-/// span, and each one's rendered row is recorded as a hit. Bypassed entirely
-/// when no prefixes are configured, so the feature costs nothing when unused.
+/// `wrap_into` with the link pass in front of it: matched targets get their
+/// own styled span, and each one's rendered row is recorded as a hit.
+/// Bypassed entirely when `ctx` is disabled, so the link-free entry points
+/// (`render_markdown`/`render_markdown_mapped`) cost nothing extra.
 fn emit(
     out: &mut Vec<Line<'static>>,
-    ctx: &mut TicketCtx<'_>,
+    ctx: &mut LinkCtx<'_>,
     spans: Vec<(String, Style)>,
     width: usize,
     hang: usize,
 ) {
-    if ctx.cfg.is_empty() {
+    if !ctx.enabled {
         wrap_into(out, spans, width, hang);
         return;
     }
-    let (spans, marks) = style_tickets(spans, ctx);
+    let (spans, marks) = style_links(spans, ctx);
     let base = out.len();
-    let offsets: Vec<usize> = marks.iter().map(|(off, _)| *off).collect();
+    let offsets: Vec<usize> = marks.iter().map(|(off, _, _)| *off).collect();
     let rows = wrap_into_marked(out, spans, width, hang, &offsets);
-    for ((_, key), row) in marks.into_iter().zip(rows) {
-        ctx.hits.push(TicketHit { key, row: base + row });
+    for ((_, text, kind), row) in marks.into_iter().zip(rows) {
+        ctx.hits.push(LinkHit { text, kind, row: base + row });
     }
 }
 
-/// Splits every configured key out of `spans` into its own span — underlined,
-/// plus REVERSED when its ordinal is the cursored one — keeping whatever style
-/// the surrounding text already had (bold, code, dim quote). Returns the
-/// rebuilt spans and, per key, its char offset into the flattened sequence and
-/// its text. Char offsets rather than byte offsets because `wrap_into` works in
-/// chars.
-#[allow(clippy::type_complexity)]
-fn style_tickets(
-    spans: Vec<(String, Style)>,
-    ctx: &TicketCtx<'_>,
-) -> (Vec<(String, Style)>, Vec<(usize, String)>) {
+/// Per-mark record from `style_links`: char offset into the flattened span
+/// sequence, the matched text, and its kind. Char offsets rather than byte
+/// offsets because `wrap_into` works in chars.
+type Marks = Vec<(usize, String, LinkKind)>;
+
+/// Splits every link out of `spans` into its own span — underlined, plus
+/// REVERSED when its ordinal is the cursored one — keeping whatever style the
+/// surrounding text already had (bold, code, dim quote). Returns the rebuilt
+/// spans and the marks found.
+fn style_links(spans: Vec<(String, Style)>, ctx: &LinkCtx<'_>) -> (Vec<(String, Style)>, Marks) {
     let mut out: Vec<(String, Style)> = Vec::new();
-    let mut marks: Vec<(usize, String)> = Vec::new();
+    let mut marks: Marks = Vec::new();
     let mut chars = 0usize;
     for (text, style) in spans {
         let mut last = 0usize;
-        for range in find_ticket_ranges(&text, ctx.cfg) {
+        for (range, kind) in find_links(&text, ctx.cfg) {
             let head = &text[last..range.start];
             if !head.is_empty() {
                 chars += head.chars().count();
                 out.push((head.to_string(), style));
             }
-            let key = text[range.clone()].to_string();
+            let hit_text = text[range.clone()].to_string();
             let ordinal = ctx.hits.len() + marks.len();
             let mut st = style.add_modifier(Modifier::UNDERLINED);
             if ctx.cursor == Some(ordinal) {
                 st = st.add_modifier(Modifier::REVERSED);
             }
-            marks.push((chars, key.clone()));
-            chars += key.chars().count();
-            out.push((key, st));
+            marks.push((chars, hit_text.clone(), kind));
+            chars += hit_text.chars().count();
+            out.push((hit_text, st));
             last = range.end;
         }
         let tail = &text[last..];
@@ -812,6 +824,12 @@ mod tests {
     }
 
     #[test]
+    fn a_scheme_glued_to_a_word_is_not_a_url() {
+        assert!(links("xhttps://example.test/a").is_empty());
+        assert_eq!(links("(https://example.test/a")[0].0, "https://example.test/a");
+    }
+
+    #[test]
     fn trailing_sentence_punctuation_is_not_part_of_the_url() {
         assert_eq!(links("go to https://example.test/x.")[0].0, "https://example.test/x");
         assert_eq!(links("go to https://example.test/x, then")[0].0, "https://example.test/x");
@@ -905,8 +923,8 @@ mod tests {
     #[test]
     fn ticket_keys_render_as_their_own_underlined_span() {
         let (lines, _, hits) =
-            render_markdown_tickets("To estimate HM-54561 today", 40, &cfg(), None);
-        assert_eq!(hits, vec![TicketHit { key: "HM-54561".into(), row: 0 }]);
+            render_markdown_links("To estimate HM-54561 today", 40, &cfg(), None);
+        assert_eq!(hits, vec![LinkHit { text: "HM-54561".into(), kind: LinkKind::Ticket, row: 0 }]);
         let st = hit_style(&lines, "HM-54561");
         assert!(st.add_modifier.contains(Modifier::UNDERLINED));
         assert!(!st.add_modifier.contains(Modifier::REVERSED));
@@ -915,7 +933,7 @@ mod tests {
     #[test]
     fn the_cursored_hit_is_reversed_and_only_it() {
         let (lines, _, hits) =
-            render_markdown_tickets("HM-1 and CR-2", 40, &cfg(), Some(1));
+            render_markdown_links("HM-1 and CR-2", 40, &cfg(), Some(1));
         assert_eq!(hits.len(), 2);
         assert!(!hit_style(&lines, "HM-1").add_modifier.contains(Modifier::REVERSED));
         assert!(hit_style(&lines, "CR-2").add_modifier.contains(Modifier::REVERSED));
@@ -924,15 +942,15 @@ mod tests {
     #[test]
     fn hits_carry_the_row_they_landed_on() {
         let text = "# Head\n\n- first HM-1\n- second CR-2";
-        let (_, _, hits) = render_markdown_tickets(text, 40, &cfg(), None);
+        let (_, _, hits) = render_markdown_links(text, 40, &cfg(), None);
         let rows: Vec<usize> = hits.iter().map(|h| h.row).collect();
-        assert_eq!(hits.iter().map(|h| h.key.as_str()).collect::<Vec<_>>(), ["HM-1", "CR-2"]);
+        assert_eq!(hits.iter().map(|h| h.text.as_str()).collect::<Vec<_>>(), ["HM-1", "CR-2"]);
         assert!(rows[0] < rows[1], "rows ascend with document order: {rows:?}");
     }
 
     #[test]
     fn a_key_inside_bold_is_one_hit_and_stays_bold() {
-        let (lines, _, hits) = render_markdown_tickets("**HM-9** done", 40, &cfg(), None);
+        let (lines, _, hits) = render_markdown_links("**HM-9** done", 40, &cfg(), None);
         assert_eq!(hits.len(), 1, "markdown markers must not split the key");
         let st = hit_style(&lines, "HM-9");
         assert!(st.add_modifier.contains(Modifier::BOLD));
@@ -942,7 +960,7 @@ mod tests {
     #[test]
     fn fenced_code_is_not_linkified() {
         let text = "```\nHM-1\n```";
-        let (_, _, hits) = render_markdown_tickets(text, 40, &cfg(), None);
+        let (_, _, hits) = render_markdown_links(text, 40, &cfg(), None);
         assert!(hits.is_empty(), "fenced code is code, like checkbox_lines treats it");
     }
 
@@ -951,7 +969,7 @@ mod tests {
         // Width 10 forces the key onto its own continuation row; the char-level
         // wrap must carry the underline across.
         let (lines, _, hits) =
-            render_markdown_tickets("aaaa bbbb cccc HM-12345", 10, &cfg(), None);
+            render_markdown_links("aaaa bbbb cccc HM-12345", 10, &cfg(), None);
         assert_eq!(hits.len(), 1);
         let underlined: usize = lines
             .iter()
@@ -967,24 +985,47 @@ mod tests {
     fn a_key_inside_inline_code_is_still_one_hit() {
         // The pass runs over the assembled span list, code spans included, so
         // nav and styling agree on a backticked key.
-        let (lines, _, hits) = render_markdown_tickets("see `HM-8` please", 40, &cfg(), None);
+        let (lines, _, hits) = render_markdown_links("see `HM-8` please", 40, &cfg(), None);
         assert_eq!(hits.len(), 1);
         assert!(hit_style(&lines, "HM-8").add_modifier.contains(Modifier::UNDERLINED));
     }
 
     #[test]
-    fn an_empty_config_changes_nothing() {
-        let empty = crate::tickets::Config::default();
-        let (lines, map, hits) = render_markdown_tickets("HM-1 here", 40, &empty, None);
-        assert!(hits.is_empty());
-        let (base_lines, base_map) = render_markdown_mapped("HM-1 here", 40);
-        assert_eq!(lines.len(), base_lines.len());
-        assert_eq!(map, base_map);
+    fn the_mapped_entry_point_stays_link_free() {
+        // The overlay's read-only preview renders through here; no cursor can
+        // be plumbed there, so it must never underline anything.
+        let (lines, map) = render_markdown_mapped("HM-1 https://example.test/x", 40);
+        assert_eq!(map.len(), lines.len());
         assert!(
             !lines
                 .iter()
                 .flat_map(|l| l.spans.iter())
                 .any(|s| s.style.add_modifier.contains(Modifier::UNDERLINED))
         );
+    }
+
+    #[test]
+    fn an_empty_config_still_finds_urls() {
+        let empty = crate::tickets::Config::default();
+        let (lines, _, hits) =
+            render_markdown_links("HM-1 https://example.test/x", 40, &empty, None);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].kind, LinkKind::Url);
+        assert_eq!(hits[0].text, "https://example.test/x");
+        assert!(hit_style(&lines, "https://example.test/x").add_modifier.contains(Modifier::UNDERLINED));
+    }
+
+    #[test]
+    fn a_url_split_by_wrap_keeps_its_style_on_every_row() {
+        let (lines, _, hits) =
+            render_markdown_links("aaaa bbbb https://example.test/xyz", 14, &cfg(), None);
+        assert_eq!(hits.len(), 1);
+        let underlined: usize = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .filter(|s| s.style.add_modifier.contains(Modifier::UNDERLINED))
+            .map(|s| s.content.chars().count())
+            .sum();
+        assert_eq!(underlined, "https://example.test/xyz".chars().count());
     }
 }

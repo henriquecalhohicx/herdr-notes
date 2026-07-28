@@ -400,17 +400,17 @@ pub struct App {
     /// Prefix→URL templates for issue keys, loaded ONCE (see `App::new`).
     /// Default-empty in `with_note`, so unit tests never read the store dir.
     tickets: crate::tickets::Config,
-    /// Ticket keys found by the last preview draw, in document order. The draw
-    /// is the single scan that both styles the keys and lists them, so nav and
-    /// highlight cannot disagree. The loop always draws before reading a key,
-    /// so this is never consulted stale.
-    ticket_hits: Vec<markdown::TicketHit>,
-    /// Ordinal into `ticket_hits` — which key `o` would open. Mutually
+    /// Links (ticket keys and URLs) found by the last preview draw, in
+    /// document order. The draw is the single scan that both styles the
+    /// targets and lists them, so nav and highlight cannot disagree. The loop
+    /// always draws before reading a target, so this is never consulted stale.
+    link_hits: Vec<markdown::LinkHit>,
+    /// Ordinal into `link_hits` — which target `o` would open. Mutually
     /// exclusive with `box_cursor`: one cursor at a time keeps `esc` and
     /// `space` unambiguous.
-    ticket_cursor: Option<usize>,
+    link_cursor: Option<usize>,
     /// One-shot scroll-follow, same contract as `follow_box`.
-    follow_ticket: bool,
+    follow_link: bool,
     /// Browser launches still running, reaped on the heartbeat so unix does not
     /// accumulate a zombie per `o`.
     open_children: Vec<std::process::Child>,
@@ -481,9 +481,9 @@ impl App {
             box_cursor: None,
             follow_box: false,
             tickets: crate::tickets::Config::default(),
-            ticket_hits: Vec::new(),
-            ticket_cursor: None,
-            follow_ticket: false,
+            link_hits: Vec::new(),
+            link_cursor: None,
+            follow_link: false,
             open_children: Vec::new(),
             prompts: Vec::new(),
             prompt_labels: Vec::new(),
@@ -572,12 +572,12 @@ impl App {
         }
         self.note.mode = Mode::Preview;
         // Everything per-DOCUMENT resets: a scroll offset, a checkbox ordinal
-        // and a ticket ordinal all mean nothing in the other note. Anything
+        // and a link ordinal all mean nothing in the other note. Anything
         // added to this struct that describes a position INSIDE the note
         // belongs here too.
         self.preview_scroll = 0;
         self.clear_cursors();
-        self.ticket_hits.clear();
+        self.link_hits.clear();
         self.dirty = false;
         // The prompt block belongs to the TAB note only, so it has to be
         // dropped going out and rebuilt coming back — immediately, not on the
@@ -908,24 +908,24 @@ impl App {
             KeyCode::Up => self.preview_scroll = self.preview_scroll.saturating_sub(1),
             KeyCode::Down => self.preview_scroll = self.preview_scroll.saturating_add(1),
             KeyCode::Char('j') => {
-                self.clear_ticket_cursor();
+                self.clear_link_cursor();
                 self.move_box(1)
             }
             KeyCode::Char('k') => {
-                self.clear_ticket_cursor();
+                self.clear_link_cursor();
                 self.move_box(-1)
             }
             KeyCode::Char(' ') => {
-                self.clear_ticket_cursor();
+                self.clear_link_cursor();
                 self.toggle_box()
             }
-            KeyCode::Char('n') => self.move_ticket(1),
-            KeyCode::Char('N') => self.move_ticket(-1),
+            KeyCode::Char('n') => self.move_link(1),
+            KeyCode::Char('N') => self.move_link(-1),
             KeyCode::Char('o') => self.open_ticket(),
             // The only way out of either preview cursor. Without it the
             // highlight is a mode you can enter and not leave — the other
             // exits are all side effects (swap documents, `x` clear, edit the
-            // last box/ticket away). Esc is otherwise unbound here and still
+            // last box/link away). Esc is otherwise unbound here and still
             // must never quit the TUI.
             KeyCode::Esc => self.clear_cursors(),
             KeyCode::PageUp => self.preview_scroll = self.preview_scroll.saturating_sub(page),
@@ -1167,27 +1167,27 @@ impl App {
     /// Drops the checkbox cursor and any pending scroll-follow. Both are
     /// per-DOCUMENT state, so every path that swaps or wipes the buffer
     /// (`toggle_global`, `x` clear, overlay self-delete) must call
-    /// `clear_cursors`, not this directly — a cursor added later (the ticket
+    /// `clear_cursors`, not this directly — a cursor added later (the link
     /// one did) would otherwise survive a swap this function alone cannot see.
     fn clear_box_cursor(&mut self) {
         self.box_cursor = None;
         self.follow_box = false;
     }
 
-    /// Re-clamps the ticket ordinal against the hits the last draw found, and
+    /// Re-clamps the link ordinal against the hits the last draw found, and
     /// drops it when there are none. Called from the draw, since the hit list
-    /// is a draw product and an edit can delete a key.
-    fn clamp_ticket_cursor(&mut self) {
-        let n = self.ticket_hits.len();
-        self.ticket_cursor = match self.ticket_cursor {
+    /// is a draw product and an edit can delete a target.
+    fn clamp_link_cursor(&mut self) {
+        let n = self.link_hits.len();
+        self.link_cursor = match self.link_cursor {
             Some(c) if n > 0 => Some(c.min(n - 1)),
             _ => None,
         };
     }
 
-    fn clear_ticket_cursor(&mut self) {
-        self.ticket_cursor = None;
-        self.follow_ticket = false;
+    fn clear_link_cursor(&mut self) {
+        self.link_cursor = None;
+        self.follow_link = false;
     }
 
     /// Drops BOTH preview cursors. Every path that swaps or wipes the buffer
@@ -1196,35 +1196,38 @@ impl App {
     /// crate (see the `toggle_global` / `global.json` gotchas).
     fn clear_cursors(&mut self) {
         self.clear_box_cursor();
-        self.clear_ticket_cursor();
+        self.clear_link_cursor();
     }
 
-    /// Steps the ticket cursor over the last draw's hits. From no cursor, `n`
-    /// lands on the first key and `N` on the last. Clamps at both ends; does
-    /// nothing when the note has no configured keys.
-    fn move_ticket(&mut self, delta: isize) {
-        self.clamp_ticket_cursor();
-        let n = self.ticket_hits.len();
+    /// Steps the link cursor over the last draw's hits. From no cursor, `n`
+    /// lands on the first target and `N` on the last. Clamps at both ends;
+    /// does nothing when the note has no links.
+    fn move_link(&mut self, delta: isize) {
+        self.clamp_link_cursor();
+        let n = self.link_hits.len();
         if n == 0 {
             return; // clamp already dropped the cursor
         }
         self.clear_box_cursor(); // one cursor at a time
-        self.ticket_cursor = Some(match self.ticket_cursor {
+        self.link_cursor = Some(match self.link_cursor {
             None if delta > 0 => 0,
             None => n - 1,
             Some(c) => c.saturating_add_signed(delta).min(n - 1),
         });
-        self.follow_ticket = true;
+        self.follow_link = true;
     }
 
     /// The URL `o` would open right now, or `None`. Separate from `open_ticket`
     /// so the resolution is testable without launching a browser.
     fn pending_open(&self) -> Option<String> {
-        let key = self.ticket_cursor.and_then(|c| self.ticket_hits.get(c)).map(|h| h.key.clone())?;
-        crate::tickets::ticket_url(&self.tickets, &key)
+        let hit = self.link_cursor.and_then(|c| self.link_hits.get(c))?;
+        match hit.kind {
+            markdown::LinkKind::Ticket => crate::tickets::ticket_url(&self.tickets, &hit.text),
+            markdown::LinkKind::Url => Some(hit.text.clone()),
+        }
     }
 
-    /// Opens the cursored ticket. Silent no-op when there is no cursor, no
+    /// Opens the cursored link. Silent no-op when there is no cursor, no
     /// mapping, or the spawn fails — nothing may print from the TUI.
     fn open_ticket(&mut self) {
         let Some(url) = self.pending_open() else { return };
@@ -1505,7 +1508,7 @@ impl App {
         const PREVIEW_HINTS_TICKET_SHORT: &str = " n/N ticket  o open  esc drop  q quit";
         let hints = match self.note.mode {
             Mode::Preview => {
-                let (full, short) = if self.ticket_cursor.is_some() {
+                let (full, short) = if self.link_cursor.is_some() {
                     (PREVIEW_HINTS_TICKET, PREVIEW_HINTS_TICKET_SHORT)
                 } else if self.box_cursor.is_some() {
                     (PREVIEW_HINTS_CURSOR, PREVIEW_HINTS_CURSOR_SHORT)
@@ -1565,8 +1568,8 @@ impl App {
         // what `map` contains.
         let (mut lines, map): (Vec<Line<'static>>, Vec<Option<usize>>) =
             if self.note.text.trim().is_empty() {
-                // No text, so no keys — and no stale hits left behind for `o`.
-                self.ticket_hits.clear();
+                // No text, so no links — and no stale hits left behind for `o`.
+                self.link_hits.clear();
                 let mut lines = block;
                 lines.extend(empty_help().lines().map(|l| {
                     Line::from(Span::styled(l.to_string(), Style::default().add_modifier(Modifier::DIM)))
@@ -1574,11 +1577,11 @@ impl App {
                 let map = vec![None; lines.len()];
                 (lines, map)
             } else {
-                let (mut lines, mut map, mut hits) = markdown::render_markdown_tickets(
+                let (mut lines, mut map, mut hits) = markdown::render_markdown_links(
                     &self.note.text,
                     text_w,
                     &self.tickets,
-                    self.ticket_cursor,
+                    self.link_cursor,
                 );
                 // The block's rows map to NO source line, so the checkbox cursor can
                 // never land on one and the highlight/scroll-follow keep pointing at
@@ -1592,17 +1595,17 @@ impl App {
                     merged_map.append(&mut map);
                     map = merged_map;
                     // Hit rows index the FINAL list, so they shift with it —
-                    // the block is never scanned for tickets, only prepended.
+                    // the block is never scanned for links, only prepended.
                     for hit in &mut hits {
                         hit.row += n;
                     }
                 }
-                self.ticket_hits = hits;
+                self.link_hits = hits;
                 (lines, map)
             };
-        // The hit list is a draw product; an edit may have deleted the key the
-        // ordinal pointed at.
-        self.clamp_ticket_cursor();
+        // The hit list is a draw product; an edit may have deleted the target
+        // the ordinal pointed at.
+        self.clamp_link_cursor();
         let total = lines.len();
         let max = total.saturating_sub(usize::from(area.height));
         if let Some(src) = self.cursor_line() {
@@ -1633,11 +1636,9 @@ impl App {
         }
         // Same one-shot contract as `follow_box`: only right after `n`/`N`
         // moved the cursor, never merely because a cursor exists — otherwise
-        // every other scroll key looks broken while a ticket is selected.
-        if self.follow_ticket {
-            if let Some(row) =
-                self.ticket_cursor.and_then(|c| self.ticket_hits.get(c)).map(|h| h.row)
-            {
+        // every other scroll key looks broken while a link is selected.
+        if self.follow_link {
+            if let Some(row) = self.link_cursor.and_then(|c| self.link_hits.get(c)).map(|h| h.row) {
                 let h = usize::from(area.height).max(1);
                 if row < self.preview_scroll {
                     self.preview_scroll = row;
@@ -1645,7 +1646,7 @@ impl App {
                     self.preview_scroll = row + 1 - h;
                 }
             }
-            self.follow_ticket = false;
+            self.follow_link = false;
         }
         self.preview_scroll = clamp_scroll(self.preview_scroll, total, usize::from(area.height));
         let scroll = u16::try_from(self.preview_scroll).unwrap_or(u16::MAX);
@@ -4476,10 +4477,10 @@ mod tests {
         let mut a = ticket_app("first HM-1\nsecond HM-2\n");
         rendered(&mut a, 40, 10);
         a.on_key(key(KeyCode::Char('n')));
-        assert_eq!(a.ticket_cursor, Some(0));
+        assert_eq!(a.link_cursor, Some(0));
         a.toggle_global();
-        assert_eq!(a.ticket_cursor, None, "the cursor is per-document, like preview_scroll");
-        assert!(!a.follow_ticket, "and so is its pending scroll-follow");
+        assert_eq!(a.link_cursor, None, "the cursor is per-document, like preview_scroll");
+        assert!(!a.follow_link, "and so is its pending scroll-follow");
     }
 
     #[test]
@@ -4514,15 +4515,15 @@ mod tests {
         let mut a = ticket_app("first HM-1\nsecond HM-2\n");
         rendered(&mut a, 40, 10);
         a.on_key(key(KeyCode::Char('n')));
-        assert_eq!(a.ticket_cursor, Some(0));
+        assert_eq!(a.link_cursor, Some(0));
         a.overlay = Some(Overlay::from_entries(vec![
             OverlayEntry { is_self: true, ..entry("X", state::TabStatus::Closed) },
         ]));
         a.on_key(key(KeyCode::Char('d')));
         a.on_key(key(KeyCode::Char('y')));
         assert_eq!(a.note.text, "");
-        assert_eq!(a.ticket_cursor, None, "clearing the buffer clears its cursor");
-        assert!(!a.follow_ticket);
+        assert_eq!(a.link_cursor, None, "clearing the buffer clears its cursor");
+        assert!(!a.follow_link);
     }
 
     #[test]
@@ -4652,31 +4653,31 @@ mod tests {
     fn n_and_n_upper_walk_the_ticket_cursor_and_clamp() {
         let mut a = ticket_app("first HM-1\nsecond HM-2\n");
         rendered(&mut a, 40, 10);
-        assert_eq!(a.ticket_cursor, None, "no cursor until you ask for one");
+        assert_eq!(a.link_cursor, None, "no cursor until you ask for one");
         a.on_key(key(KeyCode::Char('n')));
-        assert_eq!(a.ticket_cursor, Some(0));
+        assert_eq!(a.link_cursor, Some(0));
         a.on_key(key(KeyCode::Char('n')));
-        assert_eq!(a.ticket_cursor, Some(1));
+        assert_eq!(a.link_cursor, Some(1));
         a.on_key(key(KeyCode::Char('n')));
-        assert_eq!(a.ticket_cursor, Some(1), "clamps at the last ticket");
+        assert_eq!(a.link_cursor, Some(1), "clamps at the last ticket");
         a.on_key(key(KeyCode::Char('N')));
-        assert_eq!(a.ticket_cursor, Some(0));
+        assert_eq!(a.link_cursor, Some(0));
         a.on_key(key(KeyCode::Char('N')));
-        assert_eq!(a.ticket_cursor, Some(0), "clamps at the first ticket");
+        assert_eq!(a.link_cursor, Some(0), "clamps at the first ticket");
     }
 
     #[test]
     fn n_upper_with_no_cursor_lands_on_the_last_hit() {
-        // From `None`, `move_ticket`'s `None => n - 1` arm is only reachable
+        // From `None`, `move_link`'s `None => n - 1` arm is only reachable
         // when `N` (delta < 0) is the FIRST key pressed — every other test in
         // this module presses `n` first, so that arm would go unexercised
         // (and a `None => 0` typo there would still pass the suite) without
         // this one starting cold on `N`.
         let mut a = ticket_app("first HM-1\nsecond HM-2\n");
         rendered(&mut a, 40, 10);
-        assert_eq!(a.ticket_cursor, None, "no cursor until you ask for one");
+        assert_eq!(a.link_cursor, None, "no cursor until you ask for one");
         a.on_key(key(KeyCode::Char('N')));
-        assert_eq!(a.ticket_cursor, Some(1), "N from no cursor lands on the last hit");
+        assert_eq!(a.link_cursor, Some(1), "N from no cursor lands on the last hit");
     }
 
     #[test]
@@ -4684,8 +4685,8 @@ mod tests {
         let mut a = app("HM-1 here"); // no config injected
         rendered(&mut a, 40, 10);
         a.on_key(key(KeyCode::Char('n')));
-        assert_eq!(a.ticket_cursor, None);
-        assert!(a.ticket_hits.is_empty());
+        assert_eq!(a.link_cursor, None);
+        assert!(a.link_hits.is_empty());
     }
 
     #[test]
@@ -4695,11 +4696,11 @@ mod tests {
         a.on_key(key(KeyCode::Char('j')));
         assert_eq!(a.box_cursor, Some(0));
         a.on_key(key(KeyCode::Char('n')));
-        assert_eq!(a.ticket_cursor, Some(0));
+        assert_eq!(a.link_cursor, Some(0));
         assert_eq!(a.box_cursor, None, "n drops the checkbox cursor");
         a.on_key(key(KeyCode::Char('j')));
         assert_eq!(a.box_cursor, Some(0));
-        assert_eq!(a.ticket_cursor, None, "j drops the ticket cursor");
+        assert_eq!(a.link_cursor, None, "j drops the ticket cursor");
     }
 
     #[test]
@@ -4708,8 +4709,8 @@ mod tests {
         rendered(&mut a, 40, 10);
         a.on_key(key(KeyCode::Char('n')));
         a.on_key(key(KeyCode::Esc));
-        assert_eq!(a.ticket_cursor, None);
-        assert!(!a.follow_ticket, "and the pending scroll-follow with it");
+        assert_eq!(a.link_cursor, None);
+        assert!(!a.follow_link, "and the pending scroll-follow with it");
         assert_eq!(a.box_cursor, None);
     }
 
@@ -4719,10 +4720,10 @@ mod tests {
         let mut a = ticket_app("HM-1\n");
         rendered(&mut a, 40, 10);
         a.on_key(key(KeyCode::Char('n')));
-        assert_eq!(a.ticket_cursor, Some(0));
+        assert_eq!(a.link_cursor, Some(0));
         a.on_key(key(KeyCode::Char('x')));
         a.on_key(key(KeyCode::Char('y')));
-        assert_eq!(a.ticket_cursor, None);
+        assert_eq!(a.link_cursor, None);
     }
 
     #[test]
@@ -4731,13 +4732,13 @@ mod tests {
         rendered(&mut a, 40, 10);
         a.on_key(key(KeyCode::Char('n')));
         a.on_key(key(KeyCode::Char('n')));
-        assert_eq!(a.ticket_cursor, Some(1));
+        assert_eq!(a.link_cursor, Some(1));
         a.note.text = "HM-1 only\n".to_string();
         rendered(&mut a, 40, 10);
-        assert_eq!(a.ticket_cursor, Some(0), "clamped to the surviving ticket");
+        assert_eq!(a.link_cursor, Some(0), "clamped to the surviving ticket");
         a.note.text = "nothing here\n".to_string();
         rendered(&mut a, 40, 10);
-        assert_eq!(a.ticket_cursor, None);
+        assert_eq!(a.link_cursor, None);
     }
 
     #[test]
@@ -4746,23 +4747,23 @@ mod tests {
         // past the prompt block the same way `map` is.
         let mut a = ticket_app("HM-1 here\n");
         rendered(&mut a, 40, 20);
-        let without = a.ticket_hits[0].row;
+        let without = a.link_hits[0].row;
         a.prompts = vec![crate::prompts::PromptGroup {
             pane: "w1:p5".into(),
             prompts: vec![prompt(1, "look at HM-1")],
         }];
         a.prompt_labels = vec!["claude p5".into()];
         rendered(&mut a, 40, 20);
-        assert_eq!(a.ticket_hits.len(), 1, "the block is not scanned for tickets");
-        assert!(a.ticket_hits[0].row > without, "row shifted past the block");
+        assert_eq!(a.link_hits.len(), 1, "the block is not scanned for tickets");
+        assert!(a.link_hits[0].row > without, "row shifted past the block");
     }
 
     #[test]
     fn an_empty_note_has_no_hits() {
         let mut a = ticket_app("");
         rendered(&mut a, 40, 10);
-        assert!(a.ticket_hits.is_empty());
-        assert_eq!(a.ticket_cursor, None);
+        assert!(a.link_hits.is_empty());
+        assert_eq!(a.link_cursor, None);
     }
 
     #[test]
@@ -4773,7 +4774,7 @@ mod tests {
         a.on_key(key(KeyCode::Char('n')));
         rendered(&mut a, 40, 10);
         assert!(a.preview_scroll > 0, "scrolled to the only ticket");
-        assert!(!a.follow_ticket, "one-shot: cleared after the draw");
+        assert!(!a.follow_link, "one-shot: cleared after the draw");
         let settled = a.preview_scroll;
         a.on_key(key(KeyCode::Char('g')));
         rendered(&mut a, 40, 10);
@@ -4808,9 +4809,9 @@ mod tests {
         rendered(&mut a, 40, 10);
         a.on_key(key(KeyCode::Char('n')));
         a.on_key(key(KeyCode::Char('n')));
-        assert_eq!(a.ticket_cursor, Some(1));
-        assert_eq!(a.ticket_hits[1].key, "HM-2");
-        assert!(a.ticket_hits[0].row < a.ticket_hits[1].row);
+        assert_eq!(a.link_cursor, Some(1));
+        assert_eq!(a.link_hits[1].text, "HM-2");
+        assert!(a.link_hits[0].row < a.link_hits[1].row);
     }
 
     // ----- o opens the cursored ticket in the browser ----------------------
@@ -4842,5 +4843,24 @@ mod tests {
             a.pending_open().as_deref(),
             Some("https://example.test/browse/HM-2")
         );
+    }
+
+    #[test]
+    fn a_url_in_the_note_is_navigable_and_opens_itself() {
+        let mut a = ticket_app("read https://example.test/doc later\n");
+        rendered(&mut a, 40, 10);
+        assert_eq!(a.link_hits.len(), 1);
+        a.on_key(key(KeyCode::Char('n')));
+        assert_eq!(a.pending_open().as_deref(), Some("https://example.test/doc"));
+    }
+
+    #[test]
+    fn one_cursor_walks_tickets_and_urls_in_document_order() {
+        let mut a = ticket_app("HM-1 then https://example.test/x\n");
+        rendered(&mut a, 60, 10);
+        a.on_key(key(KeyCode::Char('n')));
+        assert_eq!(a.pending_open().as_deref(), Some("https://example.test/browse/HM-1"));
+        a.on_key(key(KeyCode::Char('n')));
+        assert_eq!(a.pending_open().as_deref(), Some("https://example.test/x"));
     }
 }

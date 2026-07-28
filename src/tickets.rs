@@ -55,6 +55,10 @@ impl Config {
         self.map.contains_key(prefix)
     }
 
+    /// Test-only now: Task 2 dropped the last production call (`markdown`'s
+    /// `emit` used to skip the link pass on an empty config; URLs need no
+    /// config, so that fast path now gates on `LinkCtx::enabled` instead).
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
