@@ -383,10 +383,14 @@ pub struct App {
     /// Heading per group, index-aligned with `prompts`. Resolved from one
     /// `pane.list` call at refresh time so the draw path stays I/O-free.
     prompt_labels: Vec<String>,
-    /// Cwds where `git rev-parse` has already been tried and failed. Without
-    /// this, a tab that is not a repo would spawn git on every heartbeat for
-    /// the life of the pane.
-    git_tried: std::collections::HashSet<String>,
+    /// Branch lookups already made, keyed by cwd: `Some(branch)` cached from a
+    /// success, `None` cached from a failure. Caching the SUCCESS matters under
+    /// re-derive — the chain runs every heartbeat, and a pane that later loses
+    /// its label must still be able to fall back to the branch it found the
+    /// first time. Caching the FAILURE is what bounds the spawn: without it a
+    /// tab that is not a repo would spawn `git` every 5 seconds for the life of
+    /// the pane. See `git_branch` for what a hang costs.
+    git_tried: std::collections::HashMap<String, Option<String>>,
     confirm_clear: bool,
     dirty: bool,
     last_edit: Instant,
@@ -432,7 +436,7 @@ impl App {
             follow_box: false,
             prompts: Vec::new(),
             prompt_labels: Vec::new(),
-            git_tried: std::collections::HashSet::new(),
+            git_tried: std::collections::HashMap::new(),
             confirm_clear: false,
             dirty: false,
             last_edit: Instant::now(),
@@ -648,17 +652,14 @@ impl App {
             .map(|p| p.text.clone())
     }
 
-    /// `git rev-parse --abbrev-ref HEAD` in `cwd`, at most once per cwd for
-    /// the life of this process. On Windows the child is spawned with
-    /// CREATE_NO_WINDOW so a console never flashes over the TUI.
-    ///
-    /// A successful call records the cwd as tried too — including a detached
-    /// HEAD, which comes back as `Some("HEAD")` here and is only rejected
-    /// later, by `pick_title`. So a pane whose cwd is on a detached HEAD the
-    /// first time this runs gets the branch source permanently disabled for
-    /// the rest of the pane's life, even if a real branch is checked out
-    /// afterwards. That is the intended shape of "at most once per cwd", not
-    /// an oversight.
+    /// `git rev-parse --abbrev-ref HEAD` in `cwd`, cached in `git_tried` so
+    /// the subprocess runs at most once per cwd for the life of this process
+    /// — both a success AND a failure are cached, and a repeat call for the
+    /// same cwd returns the cached answer instead of spawning again. A
+    /// detached HEAD comes back as `Some("HEAD")` here and is rejected
+    /// downstream, by `pick_title` — not here — every time it is asked, cache
+    /// hit or not. On Windows the child is spawned with CREATE_NO_WINDOW so a
+    /// console never flashes over the TUI.
     ///
     /// `cmd.output()` is a BLOCKING wait with no timeout, run on the event-loop
     /// thread from inside `heartbeat()`. The once-per-cwd bound is what keeps
@@ -672,8 +673,8 @@ impl App {
     /// process is the ceiling that keeps that chain from being reachable
     /// repeatedly — anyone loosening it needs to add a timeout first.
     fn git_branch(&mut self, cwd: &str) -> Option<String> {
-        if !self.git_tried.insert(cwd.to_string()) {
-            return None;
+        if let Some(cached) = self.git_tried.get(cwd) {
+            return cached.clone();
         }
         let mut cmd = std::process::Command::new("git");
         cmd.args(["rev-parse", "--abbrev-ref", "HEAD"]).current_dir(cwd);
@@ -682,42 +683,48 @@ impl App {
             use std::os::windows::process::CommandExt;
             cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         }
-        let out = cmd.output().ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let branch = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        (!branch.is_empty()).then_some(branch)
+        let branch = cmd
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .filter(|b| !b.is_empty());
+        self.git_tried.insert(cwd.to_string(), branch.clone());
+        branch
     }
 
-    /// Whether this note is a candidate for auto-titling at all — every guard
-    /// that can be answered without touching the socket. Split out of
-    /// `maybe_autotitle` so `heartbeat` can ask it BEFORE deciding whether a
-    /// `pane.list` round-trip is worth making.
-    /// A note with NOTHING in it is excluded, through the exact predicate the
-    /// delete-on-save rule uses (`state::is_blank`, checked by `persist_at`)
-    /// rather than a second emptiness test — so the two stay in lockstep by
-    /// construction. Deriving a title into an empty note makes it non-blank,
-    /// which stops the delete rule firing: a tab you only toggled Notes into
-    /// would leave a `{"text":"","title":"main"}` orphan forever (tab ids are
-    /// never reused), the `l` dashboard would fill with identical empty rows,
-    /// prompt capture's gate 4 ("a note file exists for this tab") would arm
-    /// permanently, and an overlay self-delete would be undone by the very
-    /// next heartbeat re-deriving the title. `is_blank` also matches the
-    /// pristine seed template, which is wanted here: seeded-but-untyped stays
-    /// deletable.
+    /// Whether a title should be derived on this beat. `title_auto` is the
+    /// freeze switch — only typing a title with `r` clears it. There is
+    /// deliberately no "title is empty" condition: an auto title TRACKS its
+    /// source, so renaming a pane updates the note within one heartbeat even
+    /// if the branch name had already landed.
+    ///
+    /// A note with NOTHING in it is still excluded, through the exact
+    /// predicate the delete-on-save rule uses (`state::is_blank`, checked by
+    /// `persist_at`) rather than a second emptiness test — so the two stay in
+    /// lockstep by construction. Deriving a title into an empty note makes it
+    /// non-blank, which stops the delete rule firing: a tab you only toggled
+    /// Notes into would leave a `{"text":"","title":"main"}` orphan forever
+    /// (tab ids are never reused), the `l` dashboard would fill with
+    /// identical empty rows, prompt capture's gate 4 ("a note file exists for
+    /// this tab") would arm permanently, and an overlay self-delete would be
+    /// undone by the very next heartbeat re-deriving the title. `is_blank`
+    /// also matches the pristine seed template, which is wanted here:
+    /// seeded-but-untyped stays deletable.
     fn autotitle_wanted(&self) -> bool {
         self.persist
             && self.showing_tab_note()
             && self.note.title_auto
-            && self.note.title.trim().is_empty()
             && !state::is_blank(&self.note)
     }
 
-    /// Derive a title for an untitled, auto-titled note. Runs on the
-    /// heartbeat; stops for good once a title is set, because `title` is then
-    /// non-empty. `title_auto` stays true — it records that the title was
-    /// derived, not that one is still pending.
+    /// Derive a title for an auto-titled note, and keep re-deriving it on
+    /// every beat `autotitle_wanted` allows — renaming a pane's title (or its
+    /// branch, or its prompts) updates the note within one heartbeat rather
+    /// than freezing at whatever the first successful derivation found.
+    /// `title_auto` stays true throughout — it records that the title is
+    /// derived, not that one is still pending — and only typing a title with
+    /// `r` clears it, which is the sole way to stop this from running again.
     ///
     /// `index` is a `pane.list` snapshot the caller already holds (the
     /// heartbeat shares one with the prompt labels); `None` is the offline
@@ -741,7 +748,14 @@ impl App {
         let source1 = agent_pane.and_then(PaneInfo::nice_title);
         let branch = if source1.is_none() { cwd.and_then(|c| self.git_branch(&c)) } else { None };
         let oldest = self.oldest_prompt_text();
-        if let Some(title) = pick_title(agent_pane, branch.as_deref(), oldest.as_deref()) {
+        // Only write — and only `touch()` — when the derived value actually
+        // differs from what is already there. Without this, every heartbeat
+        // would dirty the note, the 2s autosave would fire forever, `updated`
+        // would keep bumping and the header age would reset to `just now` on
+        // a loop, even when nothing about the source has changed.
+        if let Some(title) = pick_title(agent_pane, branch.as_deref(), oldest.as_deref())
+            && title != self.note.title
+        {
             self.note.title = title;
             self.touch();
         }
@@ -2426,6 +2440,51 @@ mod tests {
     }
 
     #[test]
+    fn autotitle_wanted_no_longer_requires_an_empty_title() {
+        // An auto title tracks its source; only typing one freezes it.
+        let mut a = app("a real body");
+        a.persist = true;
+        a.note.title = "20260728-team-solutions".into();
+        a.note.title_auto = true;
+        assert!(a.autotitle_wanted(), "a derived title is still derivable");
+        a.note.title_auto = false;
+        assert!(!a.autotitle_wanted(), "a typed title is frozen");
+    }
+
+    #[test]
+    fn autotitle_wanted_still_refuses_a_blank_note() {
+        // Phase C's rule: deriving into a blank note would defeat the
+        // delete-on-save rule and leave an orphan file forever.
+        let mut a = app("");
+        a.persist = true;
+        a.note.title_auto = true;
+        assert!(!a.autotitle_wanted());
+    }
+
+    #[test]
+    fn git_branch_caches_a_success_and_reuses_it() {
+        // Under re-derive the chain runs repeatedly. Without caching, a pane
+        // that loses its label would fall PAST the branch to the prompt text,
+        // because that cwd's one attempt was already spent.
+        let mut a = app("body");
+        let cwd = std::env::current_dir().unwrap().display().to_string();
+        let first = a.git_branch(&cwd);
+        assert!(a.git_tried.contains_key(&cwd), "the attempt is remembered");
+        assert_eq!(a.git_branch(&cwd), first, "second call returns the cached answer");
+        assert_eq!(a.git_tried.len(), 1, "still one entry, still one spawn");
+    }
+
+    #[test]
+    fn git_branch_still_caches_a_failure_as_none() {
+        let mut a = app("body");
+        let cwd = "C:\\definitely\\not\\a\\repo\\anywhere";
+        assert_eq!(a.git_branch(cwd), None);
+        assert_eq!(a.git_tried.get(cwd), Some(&None), "the failure is cached, not retried");
+        assert_eq!(a.git_branch(cwd), None);
+        assert_eq!(a.git_tried.len(), 1);
+    }
+
+    #[test]
     fn maybe_autotitle_derives_from_the_oldest_prompt_and_is_gated_by_title_state_and_active_note() {
         // The `app()` helper builds with `persist = false`, so
         // `maybe_autotitle`'s FIRST guard (`if !self.persist`) returns before
@@ -2520,6 +2579,100 @@ mod tests {
         a.maybe_autotitle(None);
         assert!(a.note.title.trim().is_empty(), "the global note is never auto-titled from tab sources");
         assert!(!a.dirty);
+
+        restore_env(prev);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn maybe_autotitle_re_derives_on_change_and_leaves_the_note_alone_otherwise() {
+        // Same harness as
+        // `maybe_autotitle_derives_from_the_oldest_prompt_and_is_gated_by_title_state_and_active_note`:
+        // temp store, HERDR_* under ENV_LOCK, dead socket so only the prompt
+        // source is reachable.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("notes-autotitle-rederive-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config-base");
+        std::fs::create_dir_all(&cfg).unwrap();
+
+        state::persist_at(
+            &dir.join("w1_t1.json"),
+            &Note { text: "a real body".into(), ..Default::default() },
+            "w1:t1",
+            100,
+        );
+        let key = state::id_key("w1:t1").unwrap();
+        let older_pane_key = state::id_key("w1:p5").unwrap();
+        let older_file = crate::prompts::prompts_file(&dir, &key, &older_pane_key);
+        crate::prompts::append_at(
+            &older_file,
+            crate::prompts::Prompt {
+                ts: 7,
+                pane: "w1:p5".into(),
+                agent: "claude".into(),
+                text: "why is auth flaky".into(),
+            },
+        );
+
+        let sock = dir.join("no-such.sock");
+        let prev = swap_env(&[
+            ("HERDR_PLUGIN_STATE_DIR", Some(dir.as_os_str())),
+            ("HERDR_TAB_ID", Some(std::ffi::OsStr::new("w1:t1"))),
+            ("HERDR_PANE_ID", None),
+            ("HERDR_SOCKET_PATH", Some(sock.as_os_str())),
+            (CONFIG_BASE_VAR, Some(cfg.as_os_str())),
+        ]);
+
+        let mut a = App::new();
+        assert!(a.note.title.trim().is_empty(), "fixture loads untitled");
+        assert!(a.note.title_auto, "fixture loads auto");
+
+        // 1. First beat derives from the oldest prompt and sets `dirty`.
+        a.load_prompts();
+        a.maybe_autotitle(None);
+        assert_eq!(a.note.title, "why is auth flaky");
+        assert!(a.dirty, "a derived title must autosave");
+
+        // 2. Clear `dirty`, beat again with nothing changed: the title is the
+        // same and `dirty` must STAY false — otherwise every heartbeat
+        // dirties the note, the 2s autosave fires forever, `updated` keeps
+        // bumping and the header age resets to `just now` on a loop.
+        a.dirty = false;
+        a.load_prompts();
+        a.maybe_autotitle(None);
+        assert_eq!(a.note.title, "why is auth flaky", "unchanged source -> unchanged title");
+        assert!(!a.dirty, "no change means no new dirty flag");
+
+        // 3. Append a NEWER prompt whose text differs, in a DIFFERENT pane's
+        // file, and confirm the title does NOT change: the oldest surviving
+        // prompt overall is still ts=7 in the older file, so source 4's
+        // answer is unchanged.
+        let newer_pane_key = state::id_key("w1:p6").unwrap();
+        let newer_file = crate::prompts::prompts_file(&dir, &key, &newer_pane_key);
+        crate::prompts::append_at(
+            &newer_file,
+            crate::prompts::Prompt {
+                ts: 50,
+                pane: "w1:p6".into(),
+                agent: "claude".into(),
+                text: "add the rate limiter".into(),
+            },
+        );
+        a.dirty = false;
+        a.load_prompts();
+        a.maybe_autotitle(None);
+        assert_eq!(a.note.title, "why is auth flaky", "the older prompt is still the oldest surviving one");
+        assert!(!a.dirty);
+
+        // Remove the older prompt file so the newer one becomes oldest, beat
+        // again, and confirm the title follows and `dirty` is set.
+        std::fs::remove_file(&older_file).unwrap();
+        a.load_prompts();
+        a.maybe_autotitle(None);
+        assert_eq!(a.note.title, "add the rate limiter", "the title follows the new oldest-surviving prompt");
+        assert!(a.dirty, "a changed derivation must autosave");
 
         restore_env(prev);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2802,7 +2955,7 @@ mod tests {
         let mut a = app("body");
         let cwd = "C:\\definitely\\not\\a\\repo\\anywhere";
         assert_eq!(a.git_branch(cwd), None);
-        assert!(a.git_tried.contains(cwd), "the failure is remembered");
+        assert!(a.git_tried.contains_key(cwd), "the failure is remembered");
         assert_eq!(a.git_branch(cwd), None, "second call is a no-op");
         assert_eq!(a.git_tried.len(), 1);
     }
