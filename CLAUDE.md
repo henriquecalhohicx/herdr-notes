@@ -84,9 +84,13 @@ findings doc (and the reference implementation, `herdr-sidebar`) lives in
   (`maybe_autotitle`; the guards live in `autotitle_wanted` — `persist`,
   `showing_tab_note()`, `title_auto`, and `!state::is_blank(&note)`, the LAST
   of which is load-bearing, see Gotchas) — there is deliberately no "title is
-  empty" guard, so renaming a pane (or a branch switch) updates an
-  ALREADY-SET title too, not just an empty one: the tab's agent pane's
-  `nice_title()` (chosen by `pick_agent_pane`, which skips herdr's synthetic
+  empty" guard, so renaming a pane updates an ALREADY-SET title too, not just
+  an empty one. A branch switch does NOT: the branch is only ever consulted
+  while the title is still empty, so a note already titled `main` keeps `main`
+  after switching to `feature/x` (that is the no-demotion split below, not an
+  oversight). The chain: the tab's agent pane's
+  `nice_title()` (chosen by `pick_agent_pane`, which prefers a LABELLED pane
+  and only then the lowest pane id, and skips herdr's synthetic
   `usage` pane exactly as `build_tab_index` does), else its git branch
   (`git_branch`, at most one `git rev-parse --abbrev-ref HEAD` per cwd for
   the process's life via `App.git_tried` — a `HashMap<String, Option<String>>`
@@ -141,8 +145,11 @@ findings doc (and the reference implementation, `herdr-sidebar`) lives in
   than to silent no-capture. `capture_from_env` fetches that answer through
   `ipc::call_text_bounded`, bounded by `GATE_TIMEOUT` (300ms, well inside the
   hook's own 5s timeout), and only pays for the round trip once the off
-  switch, in-herdr, and id checks already passed — a call that could not
-  change `capture`'s answer is skipped. Consequence worth naming: a tab
+  switch, in-herdr, filename-safe tab AND pane id, and usable-`prompt`-payload
+  (`payload_prompt(stdin).is_some()`) checks have ALL already passed — that is
+  the complete list, and each of them rejects unconditionally in `capture`
+  regardless of `notes_live`, so a call that could not change `capture`'s
+  answer is skipped. Consequence worth naming: a tab
   where Notes was opened but never typed into can now leave an orphan
   `<tab>__<pane>.prompts.json` with no note file beside it, since a live
   Notes pane alone is enough to pass this gate. The note-file half still
@@ -505,12 +512,21 @@ Learned building this plugin:
   `CREATE_NO_WINDOW`, or a console flashes over the TUI on every attempt.
 - Title source 3 is the oldest SURVIVING prompt, not the first one ever sent
   — the ring evicts after `RING` submissions.
-- `pick_agent_pane` picks a tab's agent pane by LOWEST pane id, not "first
-  found". `PaneIndex` is a `HashMap`, so `.values().find(...)` would visit
-  panes in an arbitrary, per-process order — on exactly the tab shape this
-  feature targets (a 2×2 agent grid), that means the auto-title source could
-  silently flip between panes across restarts. Sorting by pane id makes the
-  same tab state always yield the same pane, and so the same title/cwd.
+- `pick_agent_pane` keys on `(has no label, pane id)`: a LABELLED pane always
+  beats an unlabelled one, and the lowest pane id only breaks the tie. Lowest
+  pane id ALONE was wrong and defeated the feature's headline promise on any
+  multi-pane tab — a tab holding an unlabelled idle `wF:p3` and a labelled
+  `wF:p7` picked `p3`, whose terminal title is the generic `Claude Code`,
+  which `nice_title` rejects; source 1 missed, the note took the git branch,
+  and the no-demotion rule then meant the rename could NEVER reach the note on
+  any later beat. `label` is absent from `pane.list` until a pane is named, so
+  unlabelled is the NORMAL state and this was the common case, not a corner
+  one. The pane-id half is still load-bearing: `PaneIndex` is a `HashMap`, so
+  `.values().find(...)` would visit panes in an arbitrary, per-process order —
+  on exactly the tab shape this feature targets (a 2×2 agent grid) the
+  auto-title source could silently flip between panes across restarts. A blank
+  label does not count as a label (matching `nice_title`), and the `usage` skip
+  is a FILTER, so it holds even for a labelled `usage` pane.
 - The empty-note preview branch used to be a fixed-height special case
   (forced `preview_scroll = 0`, no scrollbar, no hint) on the assumption the
   prompt block above it could never run more than a couple of rows. Grouping
@@ -535,6 +551,20 @@ Learned building this plugin:
   timeout, because on Windows the named pipe is a plain `File` with no
   read-timeout API. The worker may outlive the bound; that is safe only
   because the hook process exits immediately after.
+- That worker MUST be started with `std::thread::Builder::spawn`, never
+  `std::thread::spawn`. The latter is `Builder::spawn(..).expect(..)` and so
+  PANICS when the OS refuses the thread (thread/handle limit, memory pressure
+  — a machine already running several agent panes, a TUI and the herdr server
+  is exactly this code's environment). Nothing on the `--capture-prompt` path
+  catches it, so the panic unwinds out of `capture_from_env` and `main` and the
+  process exits 101 with stderr output — the two things a `UserPromptSubmit`
+  hook must never do. Same class as the `std::env::args()` panic above, on the
+  same path. `Builder::spawn` returns the failure instead, `capture_from_env`'s
+  `.ok()` maps it to `None`, and the additive gate degrades to the note-file
+  check. The bound itself lives in `ipc::bounded`, which takes the worker's
+  creation as a closure purely so that degradation is testable — a real OS
+  thread-creation failure cannot be forced from a unit test without something
+  fragile and platform-specific.
 - An auto title now re-derives every heartbeat, so `maybe_autotitle` MUST
   compare before writing. Writing unconditionally dirties the note every
   beat, which autosaves forever, bumps `updated`, and resets the header age

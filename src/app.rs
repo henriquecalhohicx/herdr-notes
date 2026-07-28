@@ -320,26 +320,45 @@ fn pick_title(
     oldest_prompt.map(str::trim).filter(|p| !p.is_empty()).map(|p| p.to_string())
 }
 
-/// The agent pane `maybe_autotitle` reads from for this tab: the pane with
-/// the LOWEST pane id among panes on the tab that have reported a non-empty
-/// agent. `PaneIndex` is a `HashMap`, so iterating `.values().find(...)`
+/// The agent pane `maybe_autotitle` reads from for this tab, among panes on
+/// the tab that have reported a non-empty agent.
+///
+/// The PRIMARY key is whether the pane carries a herdr `label`: a labelled
+/// pane always beats an unlabelled one, however the ids sort. A label is the
+/// user deliberately naming that pane, and honoring it is this phase's whole
+/// promise — "rename a pane, the note's title follows". Selecting by id alone
+/// broke that on any multi-pane tab: an idle unlabelled pane with a lower id
+/// reports the generic terminal title `Claude Code`, `nice_title` rejects it,
+/// source 1 misses, and `maybe_autotitle`'s no-demotion rule then pins the
+/// note to the git branch — after which the rename can NEVER reach the note on
+/// any later beat. `label` is absent from `pane.list` until a pane is named,
+/// so unlabelled is the normal state and this is the common case, not a corner
+/// one. A blank/whitespace label does not count, matching `nice_title`.
+///
+/// The SECONDARY key is the lowest pane id, which is what makes the choice
+/// deterministic. `PaneIndex` is a `HashMap`, so iterating `.values().find(...)`
 /// picks whichever pane the hash happens to visit first — arbitrary, and
 /// varying per process, on exactly the tab shape this feature targets (a 2x2
 /// agent grid). Sorting by pane id makes the same tab state always yield the
-/// same pane, and so the same title/cwd.
+/// same pane, and so the same title/cwd — including when two panes are both
+/// labelled.
 ///
 /// herdr's synthetic `usage` pane carries a real `tab_id` and a non-empty
-/// agent, so it is skipped here exactly as `build_tab_index` skips it. Picking
-/// it would make its title source 1 and — worse — its cwd the one cwd this tab
-/// ever gets to spend on `git rev-parse`, since `git_tried` caches the result
-/// for that cwd once the spawn returns — so the wrong cwd would permanently
-/// claim the tab's one attempt.
+/// agent, so it is skipped here exactly as `build_tab_index` skips it — and the
+/// skip is a filter, so it holds even if that pane somehow carries a label.
+/// Picking it would make its title source 1 and — worse — its cwd the one cwd
+/// this tab ever gets to spend on `git rev-parse`, since `git_tried` caches the
+/// result for that cwd once the spawn returns — so the wrong cwd would
+/// permanently claim the tab's one attempt.
 fn pick_agent_pane<'a>(index: &'a PaneIndex, tab: &str) -> Option<&'a PaneInfo> {
     index
         .iter()
         .filter(|(_, p)| p.tab_id == tab && !p.agent.trim().is_empty() && p.agent != "usage")
         .map(|(id, p)| (id.as_str(), p))
-        .min_by_key(|(id, _)| *id)
+        // `false` sorts before `true`, so "has a label" ranks ahead of "has none".
+        .min_by_key(|(id, p)| {
+            (p.label.as_deref().map(str::trim).filter(|l| !l.is_empty()).is_none(), *id)
+        })
         .map(|(_, p)| p)
 }
 
@@ -3143,6 +3162,133 @@ mod tests {
             let idx = build();
             let picked = pick_agent_pane(&idx, "w1:t1").expect("a candidate exists");
             assert_eq!(picked.title.as_deref(), Some("Alpha"), "lowest pane id (w1:p2) wins, every trial");
+        }
+    }
+
+    #[test]
+    fn pick_agent_pane_prefers_a_labelled_pane_over_a_lower_id() {
+        // The tab shape this phase targets: one idle, unlabelled agent pane
+        // with a LOWER id than the pane the user deliberately renamed. Picking
+        // by id alone returns the idle one, whose terminal title is the generic
+        // `Claude Code` — `nice_title` rejects it, source 1 misses, and the
+        // no-demotion rule then locks the note to the git branch forever, so
+        // the rename can never reach the note on any later beat.
+        let mut idx = PaneIndex::new();
+        idx.insert("wF:p3".into(), PaneInfo {
+            agent: "claude".into(),
+            tab_id: "wF:t1".into(),
+            title: Some("Claude Code".into()),
+            cwd: Some("C:\\repo".into()),
+            label: None,
+        });
+        idx.insert("wF:p7".into(), PaneInfo {
+            agent: "claude".into(),
+            tab_id: "wF:t1".into(),
+            title: Some("Claude Code".into()),
+            cwd: Some("C:\\repo".into()),
+            label: Some("auth-refactor".into()),
+        });
+        // Many trials: `PaneIndex` is a `HashMap`, so a selection that happened
+        // to be right once must be right every time.
+        for _ in 0..100 {
+            let p = pick_agent_pane(&idx, "wF:t1").expect("a candidate exists");
+            assert_eq!(
+                p.nice_title().as_deref(),
+                Some("auth-refactor"),
+                "the pane the user NAMED wins over the lower id"
+            );
+        }
+        // A label that is only whitespace is not a label — same as `nice_title`
+        // treats it — so the lowest id still wins.
+        idx.insert("wF:p7".into(), PaneInfo {
+            agent: "claude".into(),
+            tab_id: "wF:t1".into(),
+            title: Some("Claude Code".into()),
+            cwd: Some("C:\\repo".into()),
+            label: Some("   ".into()),
+        });
+        let p = pick_agent_pane(&idx, "wF:t1").expect("a candidate exists");
+        assert_eq!(p.label.as_deref(), None, "blank label does not count as labelled");
+    }
+
+    #[test]
+    fn pick_agent_pane_breaks_a_two_label_tie_by_pane_id() {
+        // Two labelled panes: the label is the PRIMARY key, but determinism
+        // still comes from the pane id, so the same tab state always yields the
+        // same title/cwd across processes.
+        let build = || {
+            let mut idx = PaneIndex::new();
+            idx.insert("wF:p9".into(), PaneInfo {
+                agent: "claude".into(),
+                tab_id: "wF:t1".into(),
+                title: None,
+                cwd: Some("C:\\zeta".into()),
+                label: Some("zeta-work".into()),
+            });
+            idx.insert("wF:p4".into(), PaneInfo {
+                agent: "codex".into(),
+                tab_id: "wF:t1".into(),
+                title: None,
+                cwd: Some("C:\\alpha".into()),
+                label: Some("alpha-work".into()),
+            });
+            idx
+        };
+        for _ in 0..200 {
+            let idx = build();
+            let p = pick_agent_pane(&idx, "wF:t1").expect("a candidate exists");
+            assert_eq!(p.nice_title().as_deref(), Some("alpha-work"), "lowest id among labelled panes");
+        }
+    }
+
+    #[test]
+    fn pick_agent_pane_still_takes_the_lowest_id_when_nothing_is_labelled() {
+        // The pre-label behavior, unchanged: no labels anywhere means the
+        // tiebreak IS the selection.
+        let build = || {
+            let mut idx = PaneIndex::new();
+            for (id, title) in [("wF:p8", "Zeta"), ("wF:p2", "Alpha"), ("wF:p5", "Mid")] {
+                idx.insert(id.into(), PaneInfo {
+                    agent: "claude".into(),
+                    tab_id: "wF:t1".into(),
+                    title: Some(title.into()),
+                    cwd: None,
+                    label: None,
+                });
+            }
+            idx
+        };
+        for _ in 0..200 {
+            let idx = build();
+            let p = pick_agent_pane(&idx, "wF:t1").expect("a candidate exists");
+            assert_eq!(p.title.as_deref(), Some("Alpha"), "lowest pane id, every trial");
+        }
+    }
+
+    #[test]
+    fn pick_agent_pane_skips_a_labelled_usage_pane() {
+        // The `usage` skip must survive the label preference: herdr's synthetic
+        // pane carrying a label (or a labelled pane id happening to sort low)
+        // must never become source 1 or spend the tab's one `git rev-parse`.
+        let mut idx = PaneIndex::new();
+        idx.insert("wF:p1".into(), PaneInfo {
+            agent: "usage".into(),
+            tab_id: "wF:t1".into(),
+            title: Some("Usage".into()),
+            cwd: Some("C:\\wrong".into()),
+            label: Some("usage-pane".into()),
+        });
+        idx.insert("wF:p6".into(), PaneInfo {
+            agent: "claude".into(),
+            tab_id: "wF:t1".into(),
+            title: Some("Real Work".into()),
+            cwd: Some("C:\\repo".into()),
+            label: None,
+        });
+        for _ in 0..100 {
+            let p = pick_agent_pane(&idx, "wF:t1").expect("the real agent pane is still a candidate");
+            assert_eq!(p.nice_title().as_deref(), Some("Real Work"), "a labelled usage pane is still skipped");
+            assert_eq!(p.cwd.as_deref(), Some("C:\\repo"), "and so is its cwd");
         }
     }
 
