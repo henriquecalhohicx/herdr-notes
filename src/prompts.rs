@@ -517,7 +517,7 @@ mod tests {
 
     /// Flattened view of `load_for_tab` for the gate tests below, which only
     /// ever exercise a single pane and care about `capture`'s gate chain, not
-    /// grouping — Task 1's temporary flatten, same shape as `app.rs`'s.
+    /// grouping.
     fn captured(dir: &std::path::Path) -> Vec<Prompt> {
         load_for_tab(dir, &crate::state::id_key("w1:t1").unwrap())
             .into_iter()

@@ -200,6 +200,18 @@ struct PaneInfo {
     cwd: Option<String>,
 }
 
+impl PaneInfo {
+    /// This pane's terminal title when it actually says something
+    /// (`meaningful_title` against its own agent name). The ONE definition,
+    /// shared by `pane_label`, `pick_title` and `maybe_autotitle`'s source-1
+    /// probe — that probe exists only to decide whether to spawn `git`, so if
+    /// it ever drifted from `pick_title`'s copy the branch would be computed
+    /// needlessly or skipped when it should run.
+    fn nice_title(&self) -> Option<String> {
+        self.title.as_deref().and_then(|t| meaningful_title(t, &self.agent))
+    }
+}
+
 type PaneIndex = std::collections::HashMap<String, PaneInfo>;
 
 /// Titles herdr reports that name the tool rather than the work. Compared
@@ -259,7 +271,7 @@ fn meaningful_title(title: &str, agent: &str) -> Option<String> {
 /// names its group.
 fn pane_label(pane_id: &str, agent: &str, index: Option<&PaneIndex>) -> String {
     if let Some(info) = index.and_then(|i| i.get(pane_id))
-        && let Some(title) = info.title.as_deref().and_then(|t| meaningful_title(t, &info.agent))
+        && let Some(title) = info.nice_title()
     {
         return title;
     }
@@ -280,7 +292,7 @@ fn pick_title(
     oldest_prompt: Option<&str>,
 ) -> Option<String> {
     if let Some(p) = agent_pane
-        && let Some(t) = p.title.as_deref().and_then(|t| meaningful_title(t, &p.agent))
+        && let Some(t) = p.nice_title()
     {
         return Some(t);
     }
@@ -298,10 +310,16 @@ fn pick_title(
 /// varying per process, on exactly the tab shape this feature targets (a 2x2
 /// agent grid). Sorting by pane id makes the same tab state always yield the
 /// same pane, and so the same title/cwd.
+///
+/// herdr's synthetic `usage` pane carries a real `tab_id` and a non-empty
+/// agent, so it is skipped here exactly as `build_tab_index` skips it. Picking
+/// it would make its title source 1 and — worse — its cwd the one cwd this tab
+/// ever gets to spend on `git rev-parse`, since `git_tried` records the cwd
+/// before the spawn.
 fn pick_agent_pane<'a>(index: &'a PaneIndex, tab: &str) -> Option<&'a PaneInfo> {
     index
         .iter()
-        .filter(|(_, p)| p.tab_id == tab && !p.agent.trim().is_empty())
+        .filter(|(_, p)| p.tab_id == tab && !p.agent.trim().is_empty() && p.agent != "usage")
         .map(|(id, p)| (id.as_str(), p))
         .min_by_key(|(id, _)| *id)
         .map(|(_, p)| p)
@@ -526,8 +544,20 @@ impl App {
         }
         self.last_beat = Instant::now();
         self.report_tokens();
-        self.refresh_prompts();
-        self.maybe_autotitle();
+        // Prompt labels and the auto-title both read the SAME `pane.list`
+        // snapshot. Fetching one each meant two round-trips on every beat —
+        // and for a tab that never resolves a title (no agent pane, or no
+        // prompts yet, both normal states) that doubling never ends. Load the
+        // prompt files first (no socket traffic), then decide ONCE whether
+        // anything actually needs a snapshot, then share it. `None` — nothing
+        // needed it, or the socket is unreachable — is the offline path both
+        // consumers already handle.
+        self.load_prompts();
+        let index = (!self.prompts.is_empty() || self.autotitle_wanted())
+            .then(pane_index)
+            .flatten();
+        self.label_prompts(index.as_ref());
+        self.maybe_autotitle(index.as_ref());
     }
 
     fn report_tokens(&self) {
@@ -545,14 +575,28 @@ impl App {
         );
     }
 
-    /// Re-read the tab's prompt files. Only the tab note has prompts — the
-    /// global note is not a tab. Gated on `persist` so unit tests never touch
-    /// the real store dir.
-    /// Clears FIRST, so every exit from this function leaves a consistent
-    /// block. The two `let … else` arms below are process-env-derived and so
-    /// constant for the pane's lifetime, meaning no stale value is reachable
-    /// today — but an asymmetric clear is a trap for the next change.
+    /// Re-read the tab's prompt files AND resolve their headings, fetching a
+    /// `pane.list` snapshot only when there is something to label. For the
+    /// callers that hold no snapshot to share (construction, `toggle_global`);
+    /// `heartbeat` drives `load_prompts` + `label_prompts` itself so it can
+    /// share one snapshot with `maybe_autotitle`.
     fn refresh_prompts(&mut self) {
+        self.load_prompts();
+        let index = (!self.prompts.is_empty()).then(pane_index).flatten();
+        self.label_prompts(index.as_ref());
+    }
+
+    /// Re-read the tab's prompt files into `self.prompts`. Only the tab note
+    /// has prompts — the global note is not a tab. Gated on `persist` so unit
+    /// tests never touch the real store dir. Deliberately does NO socket I/O:
+    /// labelling is a separate step so a caller can look at the loaded groups
+    /// before deciding whether a round-trip is worth making.
+    /// Clears FIRST (labels too, so the two can never be left mismatched), so
+    /// every exit from this function leaves a consistent block. The two
+    /// `let … else` arms below are process-env-derived and so constant for the
+    /// pane's lifetime, meaning no stale value is reachable today — but an
+    /// asymmetric clear is a trap for the next change.
+    fn load_prompts(&mut self) {
         self.prompts.clear();
         self.prompt_labels.clear();
         if !self.persist || !self.showing_tab_note() {
@@ -561,19 +605,19 @@ impl App {
         let Some(dir) = state::store_dir() else { return };
         let Some(key) = state::tab_env().as_deref().and_then(state::id_key) else { return };
         self.prompts = crate::prompts::load_for_tab(&dir, &key);
-        if self.prompts.is_empty() {
-            return;
-        }
-        // One socket round-trip per refresh, and only when there is something
-        // to label. `None` (socket unreachable) falls every group back to
-        // `{agent} {pane-suffix}`.
-        let index = pane_index();
+    }
+
+    /// Resolve one heading per loaded prompt group from an already-fetched
+    /// `pane.list` snapshot, index-aligned with `self.prompts`. `None` (socket
+    /// unreachable, or the caller judged the round-trip unnecessary) falls
+    /// every group back to `{agent} {pane-suffix}`.
+    fn label_prompts(&mut self, index: Option<&PaneIndex>) {
         self.prompt_labels = self
             .prompts
             .iter()
             .map(|g| {
                 let agent = g.prompts.first().map(|p| p.agent.as_str()).unwrap_or("");
-                pane_label(&g.pane, agent, index.as_ref())
+                pane_label(&g.pane, agent, index)
             })
             .collect();
     }
@@ -600,6 +644,18 @@ impl App {
     /// the rest of the pane's life, even if a real branch is checked out
     /// afterwards. That is the intended shape of "at most once per cwd", not
     /// an oversight.
+    ///
+    /// `cmd.output()` is a BLOCKING wait with no timeout, run on the event-loop
+    /// thread from inside `heartbeat()`. The once-per-cwd bound is what keeps
+    /// that survivable, and it is why relaxing that bound is not a free
+    /// change: a cwd on a disconnected network share, or a repo with a stuck
+    /// index lock, stalls input, drawing AND the heartbeat's identity
+    /// re-stamp for as long as `git` hangs. Past 20s of no re-stamp the
+    /// launcher classifies this live pane as a corpse; the next toggle takes
+    /// the REPLACE path, and `herdr pane close` kills with no signal, losing
+    /// whatever is sitting in the dirty debounce buffer. One stall per cwd per
+    /// process is the ceiling that keeps that chain from being reachable
+    /// repeatedly — anyone loosening it needs to add a timeout first.
     fn git_branch(&mut self, cwd: &str) -> Option<String> {
         if !self.git_tried.insert(cwd.to_string()) {
             return None;
@@ -619,41 +675,58 @@ impl App {
         (!branch.is_empty()).then_some(branch)
     }
 
+    /// Whether this note is a candidate for auto-titling at all — every guard
+    /// that can be answered without touching the socket. Split out of
+    /// `maybe_autotitle` so `heartbeat` can ask it BEFORE deciding whether a
+    /// `pane.list` round-trip is worth making.
+    /// A note with NOTHING in it is excluded, through the exact predicate the
+    /// delete-on-save rule uses (`state::is_blank`, checked by `persist_at`)
+    /// rather than a second emptiness test — so the two stay in lockstep by
+    /// construction. Deriving a title into an empty note makes it non-blank,
+    /// which stops the delete rule firing: a tab you only toggled Notes into
+    /// would leave a `{"text":"","title":"main"}` orphan forever (tab ids are
+    /// never reused), the `l` dashboard would fill with identical empty rows,
+    /// prompt capture's gate 4 ("a note file exists for this tab") would arm
+    /// permanently, and an overlay self-delete would be undone by the very
+    /// next heartbeat re-deriving the title. `is_blank` also matches the
+    /// pristine seed template, which is wanted here: seeded-but-untyped stays
+    /// deletable.
+    fn autotitle_wanted(&self) -> bool {
+        self.persist
+            && self.showing_tab_note()
+            && self.note.title_auto
+            && self.note.title.trim().is_empty()
+            && !state::is_blank(&self.note)
+    }
+
     /// Derive a title for an untitled, auto-titled note. Runs on the
     /// heartbeat; stops for good once a title is set, because `title` is then
     /// non-empty. `title_auto` stays true — it records that the title was
     /// derived, not that one is still pending.
-    fn maybe_autotitle(&mut self) {
-        if !self.persist || !self.showing_tab_note() {
-            return;
-        }
-        if !self.note.title_auto || !self.note.title.trim().is_empty() {
+    ///
+    /// `index` is a `pane.list` snapshot the caller already holds (the
+    /// heartbeat shares one with the prompt labels); `None` is the offline
+    /// path — sources 1 and 2 are simply unavailable and a captured prompt is
+    /// the only one left.
+    fn maybe_autotitle(&mut self, index: Option<&PaneIndex>) {
+        if !self.autotitle_wanted() {
             return;
         }
         let Some(tab) = state::tab_env() else { return };
-        let index = pane_index();
-        let agent_pane = index.as_ref().and_then(|i| pick_agent_pane(i, &tab));
+        let agent_pane = index.and_then(|i| pick_agent_pane(i, &tab));
         let cwd = agent_pane.and_then(|p| p.cwd.clone());
-        // Cloned so the immutable borrow of `index` ends before `git_branch`
-        // takes `&mut self`.
-        let agent_pane = agent_pane.map(|p| PaneInfo {
-            agent: p.agent.clone(),
-            tab_id: p.tab_id.clone(),
-            title: p.title.clone(),
-            cwd: p.cwd.clone(),
-        });
         // Source 1 first, without spawning anything: when the agent pane's
         // terminal title already resolves, `pick_title` never falls through
         // to the branch, so a `git` subprocess would be spawned and its
         // result thrown away every time this is the winning source (the
         // common case). Only compute the branch — and only then bear its
-        // process-spawn cost — once source 1 has actually missed.
-        let source1 = agent_pane
-            .as_ref()
-            .and_then(|p| p.title.as_deref().and_then(|t| meaningful_title(t, &p.agent)));
+        // process-spawn cost — once source 1 has actually missed. Asked
+        // through the SAME `nice_title` that `pick_title` uses, so the two
+        // can never disagree about whether source 1 hit.
+        let source1 = agent_pane.and_then(PaneInfo::nice_title);
         let branch = if source1.is_none() { cwd.and_then(|c| self.git_branch(&c)) } else { None };
         let oldest = self.oldest_prompt_text();
-        if let Some(title) = pick_title(agent_pane.as_ref(), branch.as_deref(), oldest.as_deref()) {
+        if let Some(title) = pick_title(agent_pane, branch.as_deref(), oldest.as_deref()) {
             self.note.title = title;
             self.touch();
         }
@@ -903,6 +976,14 @@ impl App {
                         e.updated = state::unix_now();
                         if e.is_self && self.showing_tab_note() {
                             self.note.title = title;
+                            // `set_title` just wrote this same rule to DISK.
+                            // The in-memory buffer wins on the next `save()`,
+                            // so leaving it stale would either strand a
+                            // cleared title as still-manual (auto-titling
+                            // never resumes) or claim a typed one is still
+                            // derivable — and the next edit writes the stale
+                            // value back over the disk one, permanently.
+                            self.note.title_auto = self.note.title.is_empty();
                         }
                     }
                     ov.mode = OverlayMode::List;
@@ -923,6 +1004,9 @@ impl App {
                         if e.is_self && self.showing_tab_note() {
                             self.note.text.clear();
                             self.note.title.clear();
+                            // Same rule as the rename path: a wiped title is
+                            // derivable again, in memory as well as on disk.
+                            self.note.title_auto = self.note.title.is_empty();
                             self.clear_box_cursor();
                         }
                         ov.entries.remove(idx);
@@ -2344,7 +2428,18 @@ mod tests {
         let cfg = dir.join("config-base");
         std::fs::create_dir_all(&cfg).unwrap();
 
-        state::persist_at(&dir.join("w1_t1.json"), &Note::default(), "w1:t1", 100);
+        // The note needs a BODY: an empty one is blank, and a blank note is
+        // never auto-titled (it would stop `persist_at` deleting it and leave
+        // an orphan file — see
+        // `autotitle_never_titles_a_blank_note_so_it_stays_deletable`). This
+        // fixture used to be `Note::default()`, which `persist_at` declines to
+        // write at all, so every case below ran against a blank buffer.
+        state::persist_at(
+            &dir.join("w1_t1.json"),
+            &Note { text: "a real body".into(), ..Default::default() },
+            "w1:t1",
+            100,
+        );
         state::persist_at(
             &dir.join("global.json"),
             &Note { text: "GLOBAL BODY".into(), ..Default::default() },
@@ -2378,7 +2473,7 @@ mod tests {
         assert!(!a.dirty, "construction alone must not dirty the note");
 
         // Case 1: untitled + auto + a prompt on disk -> derived from it.
-        a.maybe_autotitle();
+        a.maybe_autotitle(None);
         assert_eq!(a.note.title, "why is auth flaky");
         assert!(a.note.title_auto, "title_auto stays true — it records derivation, not pending-ness");
         assert!(a.dirty, "a derived title must autosave, same as any other edit");
@@ -2386,7 +2481,7 @@ mod tests {
         // Case 2: a title that is already set (derived or typed) is never
         // re-derived, even though the prompt is still sitting right there.
         a.dirty = false;
-        a.maybe_autotitle();
+        a.maybe_autotitle(None);
         assert_eq!(a.note.title, "why is auth flaky", "an already-titled note is untouched");
         assert!(!a.dirty, "no mutation means no new dirty flag");
 
@@ -2396,7 +2491,7 @@ mod tests {
         a.note.title.clear();
         a.note.title_auto = false;
         a.dirty = false;
-        a.maybe_autotitle();
+        a.maybe_autotitle(None);
         assert!(a.note.title.trim().is_empty(), "a manual (title_auto=false) note is never auto-titled");
         assert!(!a.dirty);
 
@@ -2406,12 +2501,175 @@ mod tests {
         a.note.title_auto = true;
         a.active = ActiveNote::Global;
         a.dirty = false;
-        a.maybe_autotitle();
+        a.maybe_autotitle(None);
         assert!(a.note.title.trim().is_empty(), "the global note is never auto-titled from tab sources");
         assert!(!a.dirty);
 
         restore_env(prev);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn one_heartbeat_loads_prompts_and_derives_a_title_from_one_shared_index() {
+        // `refresh_prompts` and `maybe_autotitle` used to fetch `pane.list`
+        // independently, every 5s, forever — for a tab that never resolves a
+        // title (no agent pane, or no prompts yet) that doubling is permanent,
+        // not one heartbeat. The heartbeat now fetches at most ONE snapshot
+        // and threads it into both. The round-trip COUNT is not observable
+        // from here (the socket is deliberately dead); what this pins is that
+        // the threaded path still does both jobs in a single beat.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("notes-heartbeat-share-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config-base");
+        std::fs::create_dir_all(&cfg).unwrap();
+
+        let key = state::id_key("w1:t1").unwrap();
+        state::persist_at(
+            &dir.join(format!("{key}.json")),
+            &Note { text: "real body".into(), ..Default::default() },
+            "w1:t1",
+            100,
+        );
+        let pane_key = state::id_key("w1:p5").unwrap();
+        crate::prompts::append_at(
+            &crate::prompts::prompts_file(&dir, &key, &pane_key),
+            crate::prompts::Prompt {
+                ts: 7,
+                pane: "w1:p5".into(),
+                agent: "claude".into(),
+                text: "why is auth flaky".into(),
+            },
+        );
+
+        let sock = dir.join("no-such.sock");
+        let prev = swap_env(&[
+            ("HERDR_PLUGIN_STATE_DIR", Some(dir.as_os_str())),
+            ("HERDR_TAB_ID", Some(std::ffi::OsStr::new("w1:t1"))),
+            ("HERDR_PANE_ID", None),
+            ("HERDR_SOCKET_PATH", Some(sock.as_os_str())),
+            (CONFIG_BASE_VAR, Some(cfg.as_os_str())),
+        ]);
+
+        let mut a = App::new();
+        a.note.title.clear();
+        a.note.title_auto = true;
+        a.prompts.clear();
+        a.prompt_labels.clear();
+        a.last_beat = Instant::now().checked_sub(HEARTBEAT_EVERY * 2).unwrap();
+        a.heartbeat();
+        assert_eq!(a.prompts.len(), 1, "the beat reloaded the prompt block");
+        assert_eq!(a.prompt_labels.len(), a.prompts.len(), "and labelled it (offline fallback)");
+        assert_eq!(a.prompt_labels[0], "claude p5", "no socket -> {{agent}} {{pane-suffix}}");
+        assert_eq!(a.note.title, "why is auth flaky", "the same beat derived the title");
+
+        restore_env(prev);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn autotitle_never_titles_a_blank_note_so_it_stays_deletable() {
+        // Deriving a title into a note with NOTHING in it makes it non-blank,
+        // so `persist_at`'s delete rule stops firing and every tab that merely
+        // toggled Notes on leaves a `{"text":"","title":"main"}` orphan behind
+        // — permanently, because tab ids are never reused. Same harness as the
+        // gate test below: temp store, dead socket, one prompt on disk as the
+        // only reachable title source.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("notes-autotitle-blank-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config-base");
+        std::fs::create_dir_all(&cfg).unwrap();
+
+        let key = state::id_key("w1:t1").unwrap();
+        let pane_key = state::id_key("w1:p5").unwrap();
+        crate::prompts::append_at(
+            &crate::prompts::prompts_file(&dir, &key, &pane_key),
+            crate::prompts::Prompt {
+                ts: 7,
+                pane: "w1:p5".into(),
+                agent: "claude".into(),
+                text: "why is auth flaky".into(),
+            },
+        );
+
+        let sock = dir.join("no-such.sock");
+        let prev = swap_env(&[
+            ("HERDR_PLUGIN_STATE_DIR", Some(dir.as_os_str())),
+            ("HERDR_TAB_ID", Some(std::ffi::OsStr::new("w1:t1"))),
+            ("HERDR_PANE_ID", None),
+            ("HERDR_SOCKET_PATH", Some(sock.as_os_str())),
+            (CONFIG_BASE_VAR, Some(cfg.as_os_str())),
+        ]);
+
+        let note_file = dir.join(format!("{key}.json"));
+        let mut a = App::new();
+        assert!(state::is_blank(&a.note), "fixture: nothing typed, no title");
+        assert!(a.note.title_auto);
+
+        a.maybe_autotitle(None);
+        assert!(
+            a.note.title.trim().is_empty(),
+            "an empty note must not be auto-titled — the title alone would keep the file alive"
+        );
+        assert!(!a.dirty, "no derivation means nothing to autosave");
+        a.save();
+        assert!(!note_file.exists(), "an untouched tab must leave NO note file on disk");
+
+        // `is_blank` also matches the pristine seed template exactly, so a
+        // seeded-but-untyped note is deletable too and must stay untitled.
+        a.note.text = crate::template::DEFAULT.to_string();
+        a.maybe_autotitle(None);
+        assert!(a.note.title.trim().is_empty(), "the pristine seed template counts as blank");
+        a.save();
+        assert!(!note_file.exists(), "a seeded-but-untyped note still writes no file");
+
+        // The moment there IS something in the note, the title resolves.
+        a.note.text = "actual work".into();
+        a.maybe_autotitle(None);
+        assert_eq!(a.note.title, "why is auth flaky", "a note with content IS titled");
+        a.save();
+        assert!(note_file.exists(), "and now it persists");
+
+        restore_env(prev);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pick_agent_pane_skips_the_synthetic_usage_pane() {
+        // herdr reports a synthetic `usage` pane carrying a real `tab_id`.
+        // `build_tab_index` already skips it; picking it here would make ITS
+        // terminal title source 1 and — worse — ITS cwd the one cwd the tab
+        // ever gets to spend on `git rev-parse` (`git_tried` records the cwd
+        // before the spawn, so the wrong cwd consumes the single attempt).
+        let mut idx = PaneIndex::new();
+        idx.insert("w1:p1".into(), PaneInfo {
+            agent: "usage".into(),
+            tab_id: "w1:t1".into(),
+            title: Some("Usage".into()),
+            cwd: Some("C:\\wrong".into()),
+        });
+        idx.insert("w1:p3".into(), PaneInfo {
+            agent: "claude".into(),
+            tab_id: "w1:t1".into(),
+            title: Some("Real Work".into()),
+            cwd: Some("C:\\repo".into()),
+        });
+        let p = pick_agent_pane(&idx, "w1:t1").expect("the real agent pane is still a candidate");
+        assert_eq!(p.title.as_deref(), Some("Real Work"), "the usage pane sorts lower but must be skipped");
+        assert_eq!(p.cwd.as_deref(), Some("C:\\repo"), "and so must its cwd");
+
+        // A tab holding ONLY a usage pane has no agent pane at all.
+        let mut only_usage = PaneIndex::new();
+        only_usage.insert("w1:p1".into(), PaneInfo {
+            agent: "usage".into(),
+            tab_id: "w1:t1".into(),
+            title: Some("Usage".into()),
+            cwd: Some("C:\\wrong".into()),
+        });
+        assert!(pick_agent_pane(&only_usage, "w1:t1").is_none());
     }
 
     #[test]
@@ -2768,6 +3026,58 @@ mod tests {
         a.on_key(key(KeyCode::Char('Z')));
         a.on_key(key(KeyCode::Enter));
         assert_eq!(a.note.title, "Global Title", "global buffer title must not be overwritten by a tab-row rename");
+    }
+
+    #[test]
+    fn overlay_clearing_own_row_title_hands_the_in_memory_note_back_to_auto() {
+        // `state::set_title` writes `title_auto = title.is_empty()` to DISK.
+        // The in-memory buffer wins on the next `save()`, so leaving it stale
+        // means the README's "clear the title to hand it back to auto-titling"
+        // silently does nothing, and the next edit writes the stale
+        // `title_auto:false` back over the disk value, making it permanent.
+        let mut a = app("body");
+        a.note.title = "Mine".into();
+        a.note.title_auto = false; // hand-typed
+        let mut e = entry_with_tab("Mine", state::TabStatus::Live, "w1:t1");
+        e.is_self = true;
+        a.overlay = Some(Overlay::from_entries(vec![e]));
+        a.on_key(key(KeyCode::Char('r')));
+        for _ in 0.."Mine".len() {
+            a.on_key(key(KeyCode::Backspace));
+        }
+        a.on_key(key(KeyCode::Enter));
+        assert_eq!(a.note.title, "", "the buffer's title is cleared");
+        assert!(a.note.title_auto, "and the buffer agrees with what set_title wrote to disk");
+    }
+
+    #[test]
+    fn overlay_renaming_own_row_marks_the_in_memory_note_manual() {
+        // The mirror case: a typed title is manual on disk, so the buffer must
+        // not keep claiming the note is still derivable.
+        let mut a = app("body");
+        assert!(a.note.title_auto, "starts derivable");
+        let mut e = entry_with_tab("", state::TabStatus::Live, "w1:t1");
+        e.is_self = true;
+        a.overlay = Some(Overlay::from_entries(vec![e]));
+        a.on_key(key(KeyCode::Char('r')));
+        a.on_key(key(KeyCode::Char('Z')));
+        a.on_key(key(KeyCode::Enter));
+        assert_eq!(a.note.title, "Z");
+        assert!(!a.note.title_auto, "a typed title is manual in memory too");
+    }
+
+    #[test]
+    fn overlay_deleting_own_row_leaves_the_in_memory_note_auto() {
+        let mut a = app("body");
+        a.note.title = "Mine".into();
+        a.note.title_auto = false;
+        let mut e = entry_with_tab("Mine", state::TabStatus::Live, "w1:t1");
+        e.is_self = true;
+        a.overlay = Some(Overlay::from_entries(vec![e]));
+        a.on_key(key(KeyCode::Char('d')));
+        a.on_key(key(KeyCode::Char('y')));
+        assert_eq!(a.note.title, "");
+        assert!(a.note.title_auto, "a wiped note is derivable again, in memory as well as on disk");
     }
 
     #[test]

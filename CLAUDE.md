@@ -67,17 +67,26 @@ findings doc (and the reference implementation, `herdr-sidebar`) lives in
   support lives here too: `PaneInfo { agent, tab_id, title, cwd }` and a
   `PaneIndex` (pane id → `PaneInfo`) built by `build_pane_index` from one
   `pane.list` call (`pane_index`); `meaningful_title(title, agent)` rejects a
-  blank, tool-generic (`GENERIC_TITLES`), or path-shaped title; `pane_label`
-  heads a prompt group with that title when meaningful, else `{agent}
-  {pane-suffix}`. `App.prompt_labels` is resolved once per `refresh_prompts`
-  (never per draw) from a single best-effort `pane.list`, index-aligned with
-  `App.prompts`. An untitled note with `title_auto` still set derives a title
-  on the heartbeat (`maybe_autotitle`, gated on `showing_tab_note()` and an
-  empty `note.title`): the tab's agent pane's terminal title when meaningful
-  (chosen by `pick_agent_pane`), else its git branch (`git_branch`, at most
-  one `git rev-parse --abbrev-ref HEAD` per cwd for the process's life via
-  `App.git_tried`), else the oldest SURVIVING captured prompt
-  (`oldest_prompt_text`) — resolved by `pick_title`.
+  blank, tool-generic (`GENERIC_TITLES`), or path-shaped title, and
+  `PaneInfo::nice_title()` is the ONE place that pairing is spelled — shared
+  by `pane_label`, `pick_title` and `maybe_autotitle`'s source-1 probe;
+  `pane_label` heads a prompt group with that title when meaningful, else
+  `{agent} {pane-suffix}`. `App.prompt_labels` is resolved once per refresh
+  (never per draw), index-aligned with `App.prompts`. An untitled note with
+  `title_auto` still set derives a title on the heartbeat (`maybe_autotitle`;
+  the guards live in `autotitle_wanted` — `persist`, `showing_tab_note()`,
+  `title_auto`, an empty `note.title`, and `!state::is_blank(&note)`, the
+  LAST of which is load-bearing, see Gotchas): the tab's agent pane's
+  terminal title when meaningful (chosen by `pick_agent_pane`, which skips
+  herdr's synthetic `usage` pane exactly as `build_tab_index` does), else its
+  git branch (`git_branch`, at most one `git rev-parse --abbrev-ref HEAD` per
+  cwd for the process's life via `App.git_tried`), else the oldest SURVIVING
+  captured prompt (`oldest_prompt_text`) — resolved by `pick_title`. Prompt
+  labels and the auto-title read the SAME `pane.list` snapshot: the heartbeat
+  runs `load_prompts` (no socket I/O), asks `autotitle_wanted`, then fetches
+  at most ONE index and threads `Option<&PaneIndex>` into `label_prompts` and
+  `maybe_autotitle`. `refresh_prompts` (construction, `toggle_global`) is the
+  standalone form that fetches its own only when there is something to label.
 - `src/markdown.rs` — hand-rolled renderer (headings, lists, checkboxes —
   bare `[ ]`/`[x]` as well as `- [ ]`/`* [ ]` — quotes, code, bold/italic, hr)
   + display-width wrapping. Also the crate's ONLY checkbox parser:
@@ -292,7 +301,44 @@ Learned building this plugin:
 - Wrap and horizontal cursor math must budget by display columns (unicode-width),
   not char count — CJK/emoji are double-width and get clipped otherwise.
 - Empty (no text, no title) notes are deleted on save, so toggling Notes into
-  a tab and closing without typing leaves no file.
+  a tab and closing without typing leaves no file — but ONLY because
+  `autotitle_wanted` refuses to derive a title for a note `state::is_blank`
+  says is blank. Auto-titling silently defeated that rule: a title makes the
+  note non-blank, `persist_at` writes it instead of deleting it, and since a
+  Claude pane in any git repo resolves `main` within one 5s heartbeat, every
+  tab you ever toggled Notes into left a permanent `{"text":"","title":"main"}`
+  orphan (tab ids are never reused). Knock-ons: the `l` dashboard fills with
+  identical empty rows, prompt capture's gate 4 ("a note file exists for this
+  tab") arms forever so `<tab>__<pane>.prompts.json` accumulates too, and an
+  overlay `d` on your own row is UNDONE by the next heartbeat re-deriving. The
+  gate reuses `state::is_blank` itself rather than a second emptiness test, so
+  the delete rule and the title rule cannot desync — if you widen one, you
+  widen both. (`is_blank` also matching the pristine seed template is wanted
+  here: seeded-but-untyped stays deletable.)
+- `state::set_title` writes `title_auto = title.is_empty()` to DISK, but the
+  overlay's `is_self` paths mutate the in-memory buffer too — and the buffer
+  WINS on the next `save()`. Both of them (rename Enter, delete confirm) must
+  therefore set `self.note.title_auto` alongside `self.note.title`, or
+  clearing your own row's title leaves memory saying "manual", auto-titling
+  never resumes, and the first subsequent edit writes the stale `false` back
+  over the disk value permanently. Same shape as the `global.json` clobber and
+  the `toggle_global` reset bug: a field added later has to be walked through
+  every pre-existing write path.
+- herdr's synthetic `usage` pane is reported in `pane.list` with a REAL
+  `tab_id` and a non-empty `agent`, so any per-tab pane selection has to skip
+  it by name — `build_tab_index` and `pick_agent_pane` both do. In
+  `pick_agent_pane` it also sorts by pane id like any other pane, so it can
+  win: its title becomes auto-title source 1, and its cwd consumes the tab's
+  ONE `git rev-parse` attempt (`git_tried` records the cwd before the spawn),
+  permanently disabling source 2 against the wrong directory.
+- `git_branch`'s `cmd.output()` is a blocking wait with NO timeout, on the
+  event-loop thread inside `heartbeat()`. The once-per-cwd bound
+  (`App.git_tried`) is what makes that survivable, so relaxing it is not free:
+  a cwd on a dead network share or a repo with a stuck index lock freezes
+  input, drawing AND the identity re-stamp; past 20s of no re-stamp the
+  launcher calls this live pane a corpse, the next toggle REPLACEs it, and
+  `pane close` kills with no signal — taking the dirty debounce buffer with
+  it. Add a timeout before loosening the bound.
 - v2 gave the pane two possible buffers (`App.note` is the tab note OR the
   shared global note, per `App.active`). The overlay's `is_self` flag is FILE
   identity only — it does NOT track which buffer is showing. So any self-clear
