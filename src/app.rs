@@ -1217,13 +1217,22 @@ impl App {
         self.follow_link = true;
     }
 
-    /// The URL `o` would open right now, or `None`. Separate from `open_ticket`
-    /// so the resolution is testable without launching a browser.
+    /// The URL `o` would open right now, or `None`. With a cursor live it is the
+    /// cursored hit; with no cursor it is the header TITLE's first link, which
+    /// is where the ticket usually is and which no cursor can reach. Separate
+    /// from `open_ticket` so the resolution is testable without a browser.
     fn pending_open(&self) -> Option<String> {
-        let hit = self.link_cursor.and_then(|c| self.link_hits.get(c))?;
-        match hit.kind {
-            markdown::LinkKind::Ticket => crate::tickets::ticket_url(&self.tickets, &hit.text),
-            markdown::LinkKind::Url => Some(hit.text.clone()),
+        let (text, kind) = match self.link_cursor.and_then(|c| self.link_hits.get(c)) {
+            Some(hit) => (hit.text.clone(), hit.kind),
+            None => {
+                let (range, kind) =
+                    markdown::find_links(&self.note.title, &self.tickets).into_iter().next()?;
+                (self.note.title[range].to_string(), kind)
+            }
+        };
+        match kind {
+            markdown::LinkKind::Ticket => crate::tickets::ticket_url(&self.tickets, &text),
+            markdown::LinkKind::Url => Some(text),
         }
     }
 
@@ -1455,10 +1464,26 @@ impl App {
                 ));
             } else if !self.note.title.trim().is_empty() {
                 title.push(Span::raw(" —"));
-                title.push(Span::styled(
-                    format!(" {}", self.note.title),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ));
+                let bold = Style::default().add_modifier(Modifier::BOLD);
+                // Underlined for consistency with the body, but cursorless: the
+                // header is a 1-row no-wrap Paragraph outside the scrollable
+                // body, so `n`/`N` can never reach it. Bare `o` is the
+                // affordance instead (see `pending_open`).
+                let text = format!(" {}", self.note.title);
+                let mut last = 0usize;
+                for (range, _) in markdown::find_links(&text, &self.tickets) {
+                    if range.start > last {
+                        title.push(Span::styled(text[last..range.start].to_string(), bold));
+                    }
+                    title.push(Span::styled(
+                        text[range.clone()].to_string(),
+                        bold.add_modifier(Modifier::UNDERLINED),
+                    ));
+                    last = range.end;
+                }
+                if last < text.len() {
+                    title.push(Span::styled(text[last..].to_string(), bold));
+                }
             }
             if let Some(hint) = scroll_hint {
                 title.push(Span::styled(
@@ -5260,5 +5285,54 @@ mod tests {
         assert_eq!(a.pending_open().as_deref(), Some("https://example.test/browse/HM-1"));
         a.on_key(key(KeyCode::Char('n')));
         assert_eq!(a.pending_open().as_deref(), Some("https://example.test/x"));
+    }
+
+    // ----- the header title underlines its key, and bare `o` opens it ------
+
+    #[test]
+    fn the_header_title_underlines_its_key() {
+        let mut a = ticket_app("body\n");
+        a.note.title = "Design new ticket HM-54599".into();
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 10)).unwrap();
+        term.draw(|f| a.draw(f)).unwrap();
+        let buf = term.backend().buffer();
+        let underlined: String = (0..60)
+            .filter_map(|x| buf.cell((x, 0)))
+            .filter(|c| c.modifier.contains(Modifier::UNDERLINED))
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert_eq!(underlined, "HM-54599");
+    }
+
+    #[test]
+    fn bare_o_opens_the_titles_key() {
+        // The note is usually named after its ticket, and no cursor can live in
+        // the header, so `o` with no cursor is the one-keystroke path.
+        let mut a = ticket_app("body with no keys\n");
+        a.note.title = "Design new ticket HM-54599".into();
+        rendered(&mut a, 60, 10);
+        assert_eq!(
+            a.pending_open().as_deref(),
+            Some("https://example.test/browse/HM-54599")
+        );
+    }
+
+    #[test]
+    fn a_live_cursor_beats_the_title() {
+        let mut a = ticket_app("body HM-2 here\n");
+        a.note.title = "titled HM-1".into();
+        rendered(&mut a, 60, 10);
+        a.on_key(key(KeyCode::Char('n')));
+        assert_eq!(a.pending_open().as_deref(), Some("https://example.test/browse/HM-2"));
+    }
+
+    #[test]
+    fn bare_o_with_no_key_in_the_title_is_a_no_op() {
+        let mut a = ticket_app("body with no keys\n");
+        a.note.title = "just a name".into();
+        rendered(&mut a, 60, 10);
+        assert_eq!(a.pending_open(), None);
+        a.on_key(key(KeyCode::Char('o')));
+        assert!(a.open_children.is_empty());
     }
 }
