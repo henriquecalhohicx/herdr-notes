@@ -230,12 +230,23 @@ pub fn capture(
 pub fn capture_from_env(stdin: &str) -> bool {
     let env = CaptureEnv::from_process();
     let now = crate::state::unix_now();
-    // Bounded, and only worth asking when a tab id makes the answer meaningful.
-    let notes_live = env.tab_id.as_deref().and_then(|tab| {
-        crate::ipc::call_text_bounded("pane.list", serde_json::json!({}), GATE_TIMEOUT)
-            .ok()
-            .and_then(|json| crate::launch::notes_pane_fresh(&json, tab, now))
-    });
+    // `capture` itself stays the sole authority on whether to write — this is
+    // only about not paying for a `pane.list` round trip when the answer
+    // could not possibly change what `capture` decides. Skip the socket for
+    // the off switch, outside herdr, and an unusable payload: all three
+    // reject unconditionally in `capture` regardless of `notes_live`, and the
+    // off switch in particular exists so a user can opt out of exactly this
+    // kind of round trip on every prompt they submit. `payload_prompt` is a
+    // JSON parse with no I/O, so checking it here is cheap. The tab-id
+    // condition is kept as before: no tab id, no meaningful answer to ask for.
+    let notes_live = (!env.no_capture && env.in_herdr && payload_prompt(stdin).is_some())
+        .then_some(env.tab_id.as_deref())
+        .flatten()
+        .and_then(|tab| {
+            crate::ipc::call_text_bounded("pane.list", serde_json::json!({}), GATE_TIMEOUT)
+                .ok()
+                .and_then(|json| crate::launch::notes_pane_fresh(&json, tab, now))
+        });
     capture(crate::state::store_dir().as_deref(), &env, stdin, now, notes_live)
 }
 
@@ -688,6 +699,97 @@ mod tests {
         }
         // And a live pane still cannot rescue an unusable payload.
         assert!(!capture(Some(&dir), &env_ok(), "not json", 7, Some(true)));
+        assert_eq!(captured(&dir), vec![], "none of the above may have written anything");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn capture_from_env_makes_no_socket_call_when_the_off_switch_is_set() {
+        // The users paying for a pointless round trip would be exactly the
+        // ones who opted out of this feature.
+        //
+        // Discrimination note (see task-3 report): on this machine, opening a
+        // nonexistent named pipe fails FAST (the same reason
+        // `ipc::tests::call_text_bounded_returns_promptly_when_there_is_no_socket`
+        // has to tolerate either outcome), so the elapsed-time assertion below
+        // cannot, by itself, distinguish "the socket call was skipped" from
+        // "the socket call was attempted and failed instantly". It is kept as
+        // a regression guard against anything that reintroduces
+        // GATE_TIMEOUT-scale latency. The real proof the off switch is
+        // checked BEFORE the call is structural: `capture_from_env` gates
+        // `notes_live` behind `(!env.no_capture && ...).then_some(..).flatten()
+        // .and_then(|tab| { ...call_text_bounded... })`, and `Option::and_then`
+        // never invokes its closure on a `None` receiver — so when the guard
+        // is false the socket-calling closure is not merely fast here, it
+        // never runs at all. `HERDR_PLUGIN_STATE_DIR` is pointed at an
+        // isolated temp dir so the "nothing was written" assertion is real
+        // evidence about THIS run, not a coincidence of the real note store
+        // never having a file for this made-up tab.
+        let _guard = crate::state::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let store = tempdir().join("off_switch_no_socket");
+        let _ = std::fs::remove_dir_all(&store);
+        std::fs::create_dir_all(&store).unwrap();
+
+        let prev_no_capture = std::env::var_os("HERDR_NOTES_NO_CAPTURE");
+        let prev_env = std::env::var_os("HERDR_ENV");
+        let prev_plugin_dir = std::env::var_os("HERDR_PLUGIN_STATE_DIR");
+        let prev_tab = std::env::var_os("HERDR_TAB_ID");
+        let prev_pane = std::env::var_os("HERDR_PANE_ID");
+        let prev_socket = std::env::var_os("HERDR_SOCKET_PATH");
+        // SAFETY: serialized by ENV_LOCK; every var restored below.
+        unsafe {
+            std::env::set_var("HERDR_NOTES_NO_CAPTURE", "1");
+            std::env::set_var("HERDR_ENV", "1");
+            std::env::set_var("HERDR_PLUGIN_STATE_DIR", &store);
+            std::env::set_var("HERDR_TAB_ID", "w1:t1");
+            std::env::set_var("HERDR_PANE_ID", "w1:p5");
+            // Does not exist, so if the call were (wrongly) attempted it
+            // would fail rather than hang against a real, slow-to-answer
+            // socket.
+            std::env::set_var("HERDR_SOCKET_PATH", "herdr-notes-test-no-such-socket");
+        }
+
+        let started = std::time::Instant::now();
+        let result = capture_from_env(r#"{"prompt":"x"}"#);
+        let elapsed = started.elapsed();
+
+        unsafe {
+            match prev_no_capture {
+                Some(v) => std::env::set_var("HERDR_NOTES_NO_CAPTURE", v),
+                None => std::env::remove_var("HERDR_NOTES_NO_CAPTURE"),
+            }
+            match prev_env {
+                Some(v) => std::env::set_var("HERDR_ENV", v),
+                None => std::env::remove_var("HERDR_ENV"),
+            }
+            match prev_plugin_dir {
+                Some(v) => std::env::set_var("HERDR_PLUGIN_STATE_DIR", v),
+                None => std::env::remove_var("HERDR_PLUGIN_STATE_DIR"),
+            }
+            match prev_tab {
+                Some(v) => std::env::set_var("HERDR_TAB_ID", v),
+                None => std::env::remove_var("HERDR_TAB_ID"),
+            }
+            match prev_pane {
+                Some(v) => std::env::set_var("HERDR_PANE_ID", v),
+                None => std::env::remove_var("HERDR_PANE_ID"),
+            }
+            match prev_socket {
+                Some(v) => std::env::set_var("HERDR_SOCKET_PATH", v),
+                None => std::env::remove_var("HERDR_SOCKET_PATH"),
+            }
+        }
+
+        assert!(!result, "the off switch must reject regardless of the socket");
+        assert!(
+            elapsed < GATE_TIMEOUT,
+            "the off switch must not wait on the socket: {elapsed:?}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&store).unwrap().count(),
+            0,
+            "nothing should be written when the off switch is set"
+        );
+        let _ = std::fs::remove_dir_all(&store);
     }
 }
