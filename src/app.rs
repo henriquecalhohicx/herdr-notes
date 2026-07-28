@@ -198,16 +198,30 @@ struct PaneInfo {
     tab_id: String,
     title: Option<String>,
     cwd: Option<String>,
+    /// herdr's pane label — the name the user gave this pane. `None` until one
+    /// is set: `pane.list` omits the key entirely, which is why a dump taken
+    /// before any rename made phase C conclude no such field existed.
+    label: Option<String>,
 }
 
 impl PaneInfo {
-    /// This pane's terminal title when it actually says something
-    /// (`meaningful_title` against its own agent name). The ONE definition,
-    /// shared by `pane_label`, `pick_title` and `maybe_autotitle`'s source-1
-    /// probe — that probe exists only to decide whether to spawn `git`, so if
-    /// it ever drifted from `pick_title`'s copy the branch would be computed
-    /// needlessly or skipped when it should run.
+    /// The best human-readable name for this pane: its herdr LABEL when set,
+    /// else its terminal title when that actually says something. The ONE
+    /// definition, shared by `pane_label`, `pick_title` and `maybe_autotitle`'s
+    /// source-1 probe — that probe exists only to decide whether to spawn
+    /// `git`, so if it ever drifted from `pick_title`'s copy the branch would
+    /// be computed when it should not be, or skipped when it should not be.
+    ///
+    /// A label deliberately does NOT go through `meaningful_title`. That
+    /// rejection list — the generic tool names in `GENERIC_TITLES`, path-shaped
+    /// strings, a `.exe` suffix — exists because `terminal_title_stripped` is
+    /// machine-set and unreliable. A label is a string the user typed on
+    /// purpose, so rejecting `src/app.rs` as path-shaped would be overruling
+    /// them.
     fn nice_title(&self) -> Option<String> {
+        if let Some(label) = self.label.as_deref().map(str::trim).filter(|l| !l.is_empty()) {
+            return Some(label.to_string());
+        }
         self.title.as_deref().and_then(|t| meaningful_title(t, &self.agent))
     }
 }
@@ -241,6 +255,7 @@ fn build_pane_index(panes: &[serde_json::Value]) -> PaneIndex {
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string()),
                 cwd: p.get("cwd").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                label: p.get("label").and_then(|v| v.as_str()).map(|s| s.to_string()),
             },
         );
     }
@@ -2367,6 +2382,7 @@ mod tests {
             tab_id: "wD:t2".into(),
             title: title.map(|s| s.to_string()),
             cwd: cwd.map(|s| s.to_string()),
+            label: None,
         }
     }
 
@@ -2650,12 +2666,14 @@ mod tests {
             tab_id: "w1:t1".into(),
             title: Some("Usage".into()),
             cwd: Some("C:\\wrong".into()),
+            label: None,
         });
         idx.insert("w1:p3".into(), PaneInfo {
             agent: "claude".into(),
             tab_id: "w1:t1".into(),
             title: Some("Real Work".into()),
             cwd: Some("C:\\repo".into()),
+            label: None,
         });
         let p = pick_agent_pane(&idx, "w1:t1").expect("the real agent pane is still a candidate");
         assert_eq!(p.title.as_deref(), Some("Real Work"), "the usage pane sorts lower but must be skipped");
@@ -2668,6 +2686,7 @@ mod tests {
             tab_id: "w1:t1".into(),
             title: Some("Usage".into()),
             cwd: Some("C:\\wrong".into()),
+            label: None,
         });
         assert!(pick_agent_pane(&only_usage, "w1:t1").is_none());
     }
@@ -2691,18 +2710,21 @@ mod tests {
                 tab_id: "w1:t1".into(),
                 title: Some("Zeta".into()),
                 cwd: Some("C:\\zeta".into()),
+                label: None,
             });
             idx.insert("w1:p2".into(), PaneInfo {
                 agent: "codex".into(),
                 tab_id: "w1:t1".into(),
                 title: Some("Alpha".into()),
                 cwd: Some("C:\\alpha".into()),
+                label: None,
             });
             idx.insert("w1:p5".into(), PaneInfo {
                 agent: "claude".into(),
                 tab_id: "w1:t1".into(),
                 title: Some("Mid".into()),
                 cwd: Some("C:\\mid".into()),
+                label: None,
             });
             // A pane on a DIFFERENT tab, and a bare shell pane (no agent yet)
             // on the SAME tab: neither may ever be picked.
@@ -2711,12 +2733,14 @@ mod tests {
                 tab_id: "w1:t9".into(),
                 title: Some("Other tab".into()),
                 cwd: None,
+                label: None,
             });
             idx.insert("w1:p0".into(), PaneInfo {
                 agent: String::new(),
                 tab_id: "w1:t1".into(),
                 title: Some("Shell".into()),
                 cwd: None,
+                label: None,
             });
             idx
         };
@@ -3213,6 +3237,98 @@ mod tests {
             v["agent"] = serde_json::Value::String(a.to_string());
         }
         v
+    }
+
+    fn pane_json_labelled(
+        pane_id: &str,
+        tab_id: &str,
+        agent: Option<&str>,
+        title: &str,
+        cwd: &str,
+        label: Option<&str>,
+    ) -> serde_json::Value {
+        let mut v = pane_json(pane_id, tab_id, agent, title, cwd);
+        if let Some(l) = label {
+            v["label"] = serde_json::Value::String(l.to_string());
+        }
+        v
+    }
+
+    #[test]
+    fn build_pane_index_reads_the_label_when_present() {
+        // herdr omits `label` entirely until one is set — which is exactly how
+        // phase C came to claim the field did not exist.
+        let panes = vec![
+            pane_json_labelled("wD:pE", "wD:t3", Some("claude"), "Claude Code", "C:\\repo", Some("test-1")),
+            pane_json("wD:pG", "wD:t3", Some("claude"), "Claude Code", "C:\\repo"),
+        ];
+        let idx = build_pane_index(&panes);
+        assert_eq!(idx.get("wD:pE").unwrap().label.as_deref(), Some("test-1"));
+        assert_eq!(idx.get("wD:pG").unwrap().label, None, "absent key -> None");
+    }
+
+    #[test]
+    fn nice_title_prefers_the_label_over_the_terminal_title() {
+        let info = PaneInfo {
+            agent: "claude".into(),
+            tab_id: "wD:t3".into(),
+            title: Some("HM-54271 Importer".into()),
+            cwd: None,
+            label: Some("test-1".into()),
+        };
+        assert_eq!(info.nice_title().as_deref(), Some("test-1"));
+    }
+
+    #[test]
+    fn a_label_bypasses_the_meaningful_title_rejections() {
+        // The rejection list exists because the TERMINAL title is machine-set.
+        // A label is typed on purpose, so a path-shaped or tool-shaped label is
+        // the user's choice and must be honored.
+        for label in ["src/app.rs", "Claude Code", "build.exe", "C:\\repo\\thing"] {
+            let info = PaneInfo {
+                agent: "claude".into(),
+                tab_id: "wD:t3".into(),
+                title: Some("Claude Code".into()),
+                cwd: None,
+                label: Some(label.into()),
+            };
+            assert_eq!(info.nice_title().as_deref(), Some(label), "label {label:?}");
+        }
+    }
+
+    #[test]
+    fn a_blank_label_falls_through_to_the_terminal_title() {
+        for label in [Some(""), Some("   "), None] {
+            let info = PaneInfo {
+                agent: "claude".into(),
+                tab_id: "wD:t3".into(),
+                title: Some("HM-54271 Importer".into()),
+                cwd: None,
+                label: label.map(|s| s.to_string()),
+            };
+            assert_eq!(info.nice_title().as_deref(), Some("HM-54271 Importer"), "label {label:?}");
+        }
+    }
+
+    #[test]
+    fn a_label_is_trimmed() {
+        let info = PaneInfo {
+            agent: "claude".into(),
+            tab_id: "wD:t3".into(),
+            title: None,
+            cwd: None,
+            label: Some("  test-1  ".into()),
+        };
+        assert_eq!(info.nice_title().as_deref(), Some("test-1"));
+    }
+
+    #[test]
+    fn pane_label_heads_a_group_with_the_label() {
+        let panes = vec![pane_json_labelled(
+            "wD:pE", "wD:t3", Some("claude"), "Claude Code", "C:\\repo", Some("test-1"),
+        )];
+        let idx = build_pane_index(&panes);
+        assert_eq!(pane_label("wD:pE", "claude", Some(&idx)), "test-1");
     }
 
     #[test]
