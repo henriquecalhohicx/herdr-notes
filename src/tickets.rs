@@ -1,10 +1,17 @@
 //! Ticket links: the prefix→URL config and the browser launch.
 
 use std::collections::BTreeMap;
-use std::path::Path;
 
 /// Hand-edited by the user, beside the note files.
 pub const FILE: &str = "tickets.json";
+
+/// Where the config lives: beside the note files, so it follows the same
+/// three-tier store resolution. Pure path logic, no I/O — the seam both
+/// `Config::load` and the heartbeat's mtime stat share, so the path is
+/// spelled once.
+pub fn config_path() -> Option<std::path::PathBuf> {
+    crate::state::store_dir().map(|dir| dir.join(FILE))
+}
 
 /// Issue-key prefix → URL template containing `{key}`. Empty map means the
 /// whole feature is dormant: nothing is detected, styled or openable.
@@ -38,8 +45,11 @@ impl Config {
     }
 
     /// Reads `tickets.json` from `dir`. Injected base dir so tests never touch
-    /// the real store, exactly as `state.rs` does it.
-    pub fn load_in(dir: &Path) -> Self {
+    /// the real store, exactly as `state.rs` does it. Test-only now: `load`
+    /// goes through `config_path` + a direct read instead (Task 6), so this
+    /// has no production caller left.
+    #[cfg(test)]
+    pub fn load_in(dir: &std::path::Path) -> Self {
         std::fs::read_to_string(dir.join(FILE))
             .map(|s| Self::from_json(&s))
             .unwrap_or_default()
@@ -48,7 +58,10 @@ impl Config {
     /// The real load: `tickets.json` in the note store dir, so it follows the
     /// same three-tier resolution the note files use.
     pub fn load() -> Self {
-        crate::state::store_dir().map(|d| Self::load_in(&d)).unwrap_or_default()
+        config_path()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|s| Self::from_json(&s))
+            .unwrap_or_default()
     }
 
     pub fn has_prefix(&self, prefix: &str) -> bool {
@@ -109,7 +122,7 @@ pub fn open(url: &str) -> Option<std::process::Child> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, FILE, launch_command, ticket_url};
+    use super::{Config, FILE, config_path, launch_command, ticket_url};
 
     #[test]
     fn a_well_formed_map_loads() {
@@ -164,6 +177,20 @@ mod tests {
 
         std::fs::write(dir.join(FILE), r#"{"TT":"https://example.test/{key}"}"#).unwrap();
         assert!(Config::load_in(&dir).has_prefix("TT"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_config_path_sits_beside_the_notes() {
+        // Same store dir as the note files, so it follows the same three tiers.
+        let _guard = crate::state::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("notes-cfgpath-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // SAFETY: serialized by ENV_LOCK; restored below.
+        unsafe { std::env::set_var("HERDR_PLUGIN_STATE_DIR", &dir) };
+        assert_eq!(config_path(), Some(dir.join(FILE)));
+        unsafe { std::env::remove_var("HERDR_PLUGIN_STATE_DIR") };
         let _ = std::fs::remove_dir_all(&dir);
     }
 

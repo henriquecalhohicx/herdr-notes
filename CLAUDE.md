@@ -27,26 +27,39 @@ findings doc (and the reference implementation, `herdr-sidebar`) lives in
   fires right after `j`/`k`/`space` move the cursor — gating it on the
   cursor merely existing instead would re-force the viewport to it on every
   draw and make `Up`/`Down`/`g`/`G`/PgUp/PgDn look broken the instant a
-  cursor is set. Preview also carries a SECOND cursor, `ticket_cursor` — an
-  ordinal into `App.ticket_hits`, the hit list the last preview draw's
-  `render_markdown_tickets` produced (see the `src/markdown.rs` entry below;
+  cursor is set. Preview also carries a SECOND cursor, `link_cursor` — an
+  ordinal into `App.link_hits`, the hit list the last preview draw's
+  `render_markdown_links` produced (see the `src/markdown.rs` entry below;
   it is never a fresh scan) — mutually exclusive with `box_cursor` so `esc`
-  and `space` stay unambiguous: `n`/`N` (`move_ticket`) walk it and drop
+  and `space` stay unambiguous: `n`/`N` (`move_link`) walk it and drop
   `box_cursor` doing so, `j`/`k`/`space` drop it back — NOT symmetrically:
-  `j`/`k`/`space` call `clear_ticket_cursor` UNCONDITIONALLY before they touch
-  `box_cursor`, while `move_ticket` only drops `box_cursor` after confirming
-  there is a ticket hit to move the cursor to (it early-returns first when the
-  note has no ticket hits at all). So on a note with ticket hits but no
-  checkboxes, `j`/`k`/`space` still silently drop the ticket cursor and then
+  `j`/`k`/`space` call `clear_link_cursor` UNCONDITIONALLY before they touch
+  `box_cursor`, while `move_link` only drops `box_cursor` after confirming
+  there is a link hit to move the cursor to (it early-returns first when the
+  note has no link hits at all). So on a note with link hits but no
+  checkboxes, `j`/`k`/`space` still silently drop the link cursor and then
   do nothing else, since `move_box` has nothing to move to either — a `j`
-  that looks like a no-op quietly deselects the ticket. `o` (`open_ticket`)
-  resolves the cursored key through `pending_open` (the pure, tested seam)
+  that looks like a no-op quietly deselects the link. `App.link_hits` is
+  assembled from TWO sources with the captured-prompt block FIRST: the block
+  above the note (rendered by `prompt_block`) is scanned for its own links,
+  occupying the first ordinals, and the note body's hits (from
+  `render_markdown_links`, offset so its own internal numbering starts at 0)
+  are appended after — `draw_preview` passes the block's hit count as an
+  offset (`cursor - block_hits.len()`, `None` when the cursor is IN the
+  block, since the block already applied its own REVERSED) so the two lists
+  never disagree about which ordinal is cursored. The header TITLE is styled
+  with the same underline for its own first link but can never host a
+  cursor — it is a 1-row no-wrap `Paragraph` outside the scrollable body — so
+  `n`/`N` never land there; bare `o` (no cursor live) opens the title's first
+  link instead, which is the affordance that replaces a title cursor.
+  `o` (`open_ticket`) resolves the cursored (or, with none live, the title's)
+  target through `pending_open` (the pure, tested seam)
   and hands the URL to `tickets::open`, pushing the returned `Child` onto
   `App.open_children` for the heartbeat to reap non-blockingly. `esc`
   (`clear_cursors`) is the ONE place both cursors are dropped together, and
   every path that swaps or wipes the note buffer (`toggle_global`, `x`
   confirm, overlay self-delete) calls THAT rather than either single clear —
-  `clear_box_cursor` alone would miss the ticket cursor precisely because it
+  `clear_box_cursor` alone would miss the link cursor precisely because it
   was added later than the rule it documents (see Gotchas). A fresh note is
   seeded with `template::DEFAULT` on the
   first INTERACTIVE `e` (lazy — a tab you only toggled Notes into writes no
@@ -56,17 +69,19 @@ findings doc (and the reference implementation, `herdr-sidebar`) lives in
   shows mode, title, scroll hint, then the note's age last and
   ALL-OR-NOTHING (pushed only when the whole `2h ago` token fits the header
   width, measured in display columns — never clipped to `2h ag`); the footer
-  has a full and a short form, chosen by pane width, which drops the floor
-  for keeping `q quit` on screen from 79 columns to 37 — and a second pair
-  (`PREVIEW_HINTS_CURSOR`/`_CURSOR_SHORT`, 79/39 cols) used only while a
-  checkbox cursor is live, adding `esc drop` at the cost of `l list` in the
-  narrow form. A third pair (`PREVIEW_HINTS_TICKET`/`_TICKET_SHORT`, 76/37
-  cols) is used only while the ticket cursor (below) is live, adding `n/N
-  ticket`, `o open` and `esc drop` at the cost of `j/k spc tick` and
-  `x clear` in the FULL form (it keeps `e edit`); the narrow ticket form
-  drops `e edit` too, on top of `j/k spc tick` and `l list`, since while that
-  cursor is live the way to open or drop it is the whole point. There is
-  also a notes-list overlay
+  is no longer a choice between fixed strings. Three ranked token slices —
+  `HINTS_PREVIEW` (the base preview state), `HINTS_BOX` (a checkbox cursor
+  live), `HINTS_LINK` (a link cursor live) — each pair every token with a
+  drop rank, and `fit_hints(tokens, width)` renders the full line and, only
+  if it overflows `width`, greedily removes the highest-ranked token and
+  retries; `q quit` is rank 0 and is never a candidate, so it survives to
+  whatever floor the terminal itself clips at. Greedy by rank rather than
+  optimally packed — a lower-ranked (shorter) token that would still have
+  fitted after a higher one drops is not re-added — which keeps the rule one
+  sentence long at the cost of not being the tightest possible line; the
+  exact outputs this produces for `HINTS_PREVIEW` at 79/46/37 columns are
+  pinned by dedicated tests (`src/app.rs`) so a rank change is caught rather
+  than silently reshaping the footer. There is also a notes-list overlay
   (`l` in preview: navigate with Up/Down or j/k, `enter` opens a read-only
   scrollable preview of the selected note, `r` renames it, `d` deletes it
   with a y/N confirm, `esc`/`l` closes the overlay). v2 turned the overlay
@@ -142,21 +157,38 @@ findings doc (and the reference implementation, `herdr-sidebar`) lives in
   `render_markdown_mapped`, which returns a per-rendered-row source-line map
   (one source line can wrap to several rows, which all map back to it);
   `render_markdown` is now a thin wrapper over the mapped form with its
-  signature unchanged. `find_tickets`/`TicketHit { key, row }` and
-  `render_markdown_tickets(text, width, cfg, cursor)` are, likewise, the
-  crate's ONLY ticket scan: detection happens DURING this same render pass
-  (styling a key and listing it as a hit are one walk, not two), so nothing
-  else in the crate may re-scan `note.text` for issue keys — see Gotchas for
-  what a second scan would disagree about
+  signature unchanged. `find_links(text, cfg)` is the crate's ONE scan for
+  openable targets — configured issue keys AND bare `http(s)` URLs, left to
+  right, non-overlapping — with `find_ticket_ranges` (the key scan, unchanged
+  boundary rules) and `find_url_ranges` (the URL scan) as its private
+  internals; anywhere a key range overlaps a URL range the URL wins (a key
+  inside a URL path is part of that URL, not a second target). `render_markdown`
+  and `render_markdown_mapped` stay the LINK-FREE entry points the overlay's
+  read-only note preview uses (they build a `LinkCtx` with `enabled: false`,
+  so no styling and no hit list — see Gotchas for why that flag exists
+  rather than an empty-config fast path). `render_markdown_links(text, width,
+  cfg, cursor)` is the entry point that DOES detect and style links: it runs
+  the same render pass as the other two, so styling a key/URL and listing it
+  as a hit are one walk, not two — nothing else in the crate may re-scan
+  `note.text` for links, see Gotchas for what a second scan would disagree
+  about
 - `src/tickets.rs` — the prefix→URL config (`tickets.json` in the note store
-  dir, loaded ONCE at construction — see Gotchas — forgiving parse,
-  `{key}`-less templates dropped so a keyless URL can never masquerade as a
-  working link), `ticket_url` (the pure, tested resolution), and the
-  `spawn`-only browser launch (`launch_command` picks `rundll32.exe
-  url.dll,FileProtocolHandler` / `open` / `xdg-open` by platform, asserted as
-  a `Command` rather than by actually launching anything; `open` adds the
-  null stdio and, on Windows, `CREATE_NO_WINDOW`, then `spawn`s and returns
-  the `Child` for the caller to reap)
+  dir; forgiving parse, `{key}`-less templates dropped so a keyless URL can
+  never masquerade as a working link), `ticket_url` (the pure, tested
+  resolution), and the `spawn`-only browser launch (`launch_command` picks
+  `rundll32.exe url.dll,FileProtocolHandler` / `open` / `xdg-open` by
+  platform, asserted as a `Command` rather than by actually launching
+  anything; `open` adds the null stdio and, on Windows, `CREATE_NO_WINDOW`,
+  then `spawn`s and returns the `Child` for the caller to reap). `config_path`
+  is the one place the file's location is spelled — `crate::state::store_dir`
+  plus `FILE` — shared by `Config::load` and, since Task 6, the heartbeat's
+  hot-reload: `App.tickets_mtime` caches the file's `modified()` time from the
+  last read, the heartbeat re-`stat`s it every 5s (gated on `self.persist`,
+  so unit tests never touch the real store), and only calls `Config::load`
+  again when the mtime actually moved — a missing file gives `None`, which
+  differs from any stamped `Some` and so reloads to an empty `Config`,
+  turning the feature dormant exactly as if it had never been configured
+  (see Gotchas)
 - `src/prompts.rs` — prompt capture storage for the `--capture-prompt` hook
   mode (a `UserPromptSubmit` hook piping its JSON payload into the binary; see
   Gotchas). One file PER PANE, not per tab —
@@ -464,18 +496,18 @@ Learned building this plugin:
   (`app.rs`), and every one of those paths (`toggle_global`, the `x` confirm
   arm, the overlay's `ConfirmDelete` arm) calls THAT, never a single-cursor
   clear, so a field added later cannot be missed by only some of them.
-  `clear_cursors` resets `box_cursor` and `follow_box`, AND `ticket_cursor`
-  and `follow_ticket`; `toggle_global` additionally clears `ticket_hits`
+  `clear_cursors` resets `box_cursor` and `follow_box`, AND `link_cursor`
+  and `follow_link`; `toggle_global` additionally clears `link_hits`
   (`preview_scroll` is reset alongside it, not by it — it lives on `App`
   directly, not behind either cursor). `clear_cursors` itself is a thin
   wrapper: `clear_box_cursor` only ever knew about `box_cursor`/`follow_box`,
-  because it was written before the ticket cursor existed — the indirection
+  because it was written before the link cursor existed — the indirection
   is there BECAUSE a call site that kept spelling `clear_box_cursor` directly
   would silently miss the newer field, which is exactly the class of bug this
-  bullet is warning about, not a one-off from the ticket feature. Same class
+  bullet is warning about, not a one-off from the links feature. Same class
   of bug as the `global.json` clobber above — a field added later that the
-  document swap does not know about. A `box_cursor` (or `ticket_cursor`)
-  carried across the swap highlights an arbitrary checkbox (or ticket) in the
+  document swap does not know about. A `box_cursor` (or `link_cursor`)
+  carried across the swap highlights an arbitrary checkbox (or link) in the
   note you just opened to READ, and one pager-habit `space`/`o` acts on it; a
   stale ordinal is harmless only while the text underneath is empty
   (`cursor_line()` returns None), and stops being harmless the moment `e`
@@ -643,20 +675,68 @@ Learned building this plugin:
   `w1:p2`. Determinism is what those keys are for and that is unaffected, but
   it is not numeric order — it only decides which of two equally-eligible
   panes wins, so nothing depends on it beyond being stable.
-- Ticket detection runs DURING render (`render_markdown_tickets`) and the hit
-  list is a draw product cached in `App.ticket_hits`, not a source scan. A
+- Link detection runs DURING render (`render_markdown_links`) and the hit
+  list is a draw product cached in `App.link_hits`, not a source scan. A
   second scan over the raw note text would see `HM-**54561**` where the render
   sees `HM-54561`; the counts diverge and the cursor ordinal slips onto the
   wrong key. Same single-parser rule as `markdown::checkbox_lines`.
-- Hit rows index the FINAL preview line list, so `draw_preview` shifts them by
-  `block.len()` exactly as it shifts `map`. Forgetting that scrolls the
-  ticket cursor to a row in the prompt block.
+- Body hit rows index the FINAL preview line list, so `draw_preview` shifts
+  them by `block.len()` exactly as it shifts `map` (the block's own hits
+  already carry correct rows and are left alone). Forgetting that scrolls the
+  link cursor to a row in the prompt block.
+- Block links occupy the FIRST ordinals and body links are offset by
+  `block_hits.len()`. `render_markdown_links` highlights the nth BODY hit, so
+  `draw_preview` passes `cursor - block_hits.len()` and `None` when the cursor
+  is in the block (the block applied its own REVERSED). Two hit lists agreeing
+  on one order is the same failure shape as the cross-line ordinal bug above.
+- The empty-note preview branch must KEEP the block's hits, not clear them: a
+  titled, body-less note still has a note file and so still accumulates
+  prompts, and those prompts are the only links it has.
+- The header title can be styled but can NEVER host a cursor — it is a 1-row
+  no-wrap `Paragraph` outside the scrollable body. Bare `o` (no cursor live)
+  opening the title's first link is the affordance that replaces one, and it
+  is why `pending_open` has a title fallback at all.
 - A ratatui widget cannot emit OSC 8 hyperlinks and herdr owns pane mouse
   events, so a mouse-clickable link is not reachable from this plugin at all.
   `n`/`N`/`o` is not a stylistic choice, it is the only mechanism available.
-- `tickets.json` is read ONCE at construction (`App::new`, beside
-  `refresh_prompts`), never on the heartbeat: it changes ~never and the
-  heartbeat already does socket work. Editing it needs a pane restart.
+- `prompt_block` TRUNCATES with `truncate_w` and appends NO ellipsis, so a cut
+  `HM-54283` reads as a perfectly valid `HM-542`. Link detection there must
+  scan the FULL prompt text and keep only hits ending inside the retained
+  prefix, or `o` opens a ticket that was never in the note. Same reason
+  `block_line` takes the `N. ` number as its own span: putting it in the same
+  string would shift every link offset by three. Prompt text arriving at
+  `block_line` is ALSO already condensed for storage — `prompts::condense`
+  cuts at `MAX_CHARS` and appends `…`, and `…` is not `keyish`
+  (`find_ticket_ranges`' boundary check treats it exactly like a space), so a
+  cut key (`…HM-542…`) passes the right-boundary check and would otherwise
+  become an `o`-openable hit for a ticket that never existed. `block_line`
+  therefore separately rejects any hit ending at or past a trailing ellipsis —
+  conservative, since it also drops a complete key sitting immediately before
+  the cut, which is indistinguishable from a genuinely truncated one once
+  `condense` has already thrown the rest of the text away. Two truncations,
+  two guards: `truncate_w`'s (render-side) and `condense`'s (storage-side).
+- URLs interact with the markdown emphasis parser in a way ticket keys never
+  could, because a URL can contain `_` and `*`. `parse_inline` is guarded on
+  BOTH ends of a marker pair against `find_url_ranges`' mask (an unrelated
+  EARLIER marker must not reach forward and pair with a character inside a
+  later URL as its close), and `trim_url_end` trims a trailing `*`/`_` only
+  when the same marker char immediately precedes the URL match (glued
+  emphasis, e.g. `_https://x/y_`) — real trailing content like `.../report_`
+  must keep its underscore. Removing either half silently mangles or
+  truncates real URLs.
+- URLs need no config, so `emit`'s old "empty `Config` means nothing to find"
+  fast path is GONE. What keeps the overlay's read-only preview plain is the
+  `enabled` flag on `LinkCtx`: `render_markdown`/`render_markdown_mapped`
+  build a disabled context. Anything new that renders a note nobody can put a
+  cursor in belongs on that path too.
+- Config hot-reload is ONE `metadata` stat per 5s beat, and a read only when
+  the mtime moved. That is deliberately not the `git_branch` gotcha's class
+  (that one is about SPAWNING on the event-loop thread) — but the ceiling is
+  the same: nothing heavier than a local stat belongs on the heartbeat.
+- Footer hints drop by RANK, greedily, and are not optimally packed: at 37
+  columns a shorter token that would still have fitted is not re-added.
+  Accepted for one-sentence predictability; the exact outputs at 79/46/37 are
+  asserted so a change is visible.
 - `tickets::open` must `spawn`, never `output` — the `git_branch` freeze chain
   applies verbatim (blocked event loop, no identity re-stamp, launcher REPLACEs
   the pane, `pane close` takes the dirty buffer with it). The returned `Child`

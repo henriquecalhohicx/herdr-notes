@@ -397,9 +397,13 @@ pub struct App {
     /// — draw clears it once applied — so a cursor merely existing does not
     /// fight manual scrolling (`Up`/`Dn`/`g`/`G`/PgUp/PgDn) on every frame.
     follow_box: bool,
-    /// Prefix→URL templates for issue keys, loaded ONCE (see `App::new`).
-    /// Default-empty in `with_note`, so unit tests never read the store dir.
+    /// Prefix→URL templates for issue keys, loaded at construction and
+    /// hot-reloaded on the heartbeat (see `tickets_mtime`). Default-empty in
+    /// `with_note`, so unit tests never read the store dir.
     tickets: crate::tickets::Config,
+    /// Modification time of `tickets.json` as of the last read, so the
+    /// heartbeat can reload only when it actually changed.
+    tickets_mtime: Option<std::time::SystemTime>,
     /// Links (ticket keys and URLs) found by the last preview draw, in
     /// document order. The draw is the single scan that both styles the
     /// targets and lists them, so nav and highlight cannot disagree. The loop
@@ -467,6 +471,9 @@ impl App {
         // Real disk read, so it belongs beside `refresh_prompts` here rather
         // than in `with_note` — the test constructor must stay hermetic.
         app.tickets = crate::tickets::Config::load();
+        app.tickets_mtime = crate::tickets::config_path()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .and_then(|m| m.modified().ok());
         app
     }
 
@@ -481,6 +488,7 @@ impl App {
             box_cursor: None,
             follow_box: false,
             tickets: crate::tickets::Config::default(),
+            tickets_mtime: None,
             link_hits: Vec::new(),
             link_cursor: None,
             follow_link: false,
@@ -617,6 +625,23 @@ impl App {
         self.last_beat = Instant::now();
         // Non-blocking: a browser still running just stays in the list.
         self.open_children.retain_mut(|c| !matches!(c.try_wait(), Ok(Some(_)) | Err(_)));
+        // Config hot-reload: ONE local `metadata` stat per beat, and a real
+        // read only when the mtime moved. Deliberately not the `git_branch`
+        // class of gotcha — that one is about SPAWNING a process on the
+        // event-loop thread; a stat of a local file is not in that class. Keep
+        // it that way: anything heavier here freezes input, drawing AND the
+        // identity re-stamp. A missing file gives `None`, which differs from a
+        // stamped `Some` and so reloads to an empty config — the feature going
+        // dormant, symmetric with never having had a config at all.
+        if self.persist {
+            let mtime = crate::tickets::config_path()
+                .and_then(|p| std::fs::metadata(p).ok())
+                .and_then(|m| m.modified().ok());
+            if mtime != self.tickets_mtime {
+                self.tickets_mtime = mtime;
+                self.tickets = crate::tickets::Config::load();
+            }
+        }
         self.report_tokens();
         // Prompt labels and the auto-title both read the SAME `pane.list`
         // snapshot. Fetching one each meant two round-trips on every beat —
@@ -3425,6 +3450,46 @@ mod tests {
         assert!(!a.dirty, "an unchanged pane-derived candidate must not touch() the note");
 
         restore_env(prev);
+    }
+
+    #[test]
+    fn the_heartbeat_picks_up_an_edited_config() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("notes-hotreload-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("no-such.sock");
+        let prev = swap_env(&[
+            ("HERDR_PLUGIN_STATE_DIR", Some(dir.as_os_str())),
+            ("HERDR_TAB_ID", Some(std::ffi::OsStr::new("w1:t1"))),
+            ("HERDR_PANE_ID", None),
+            ("HERDR_SOCKET_PATH", Some(sock.as_os_str())),
+        ]);
+
+        let mut a = App::new();
+        assert!(a.tickets.is_empty(), "no config file yet");
+
+        let path = dir.join(crate::tickets::FILE);
+        std::fs::write(&path, r#"{"TT":"https://example.test/{key}"}"#).unwrap();
+        a.last_beat = Instant::now() - HEARTBEAT_EVERY;
+        a.heartbeat();
+        assert!(a.tickets.has_prefix("TT"), "an edited config is picked up");
+
+        // An UNCHANGED mtime must not reload: clobber the in-memory config and
+        // check the beat leaves it alone.
+        a.tickets = crate::tickets::Config::default();
+        a.last_beat = Instant::now() - HEARTBEAT_EVERY;
+        a.heartbeat();
+        assert!(a.tickets.is_empty(), "unchanged mtime: no reload");
+        a.tickets = crate::tickets::Config::load(); // put it back for the next step
+
+        std::fs::remove_file(&path).unwrap();
+        a.last_beat = Instant::now() - HEARTBEAT_EVERY;
+        a.heartbeat();
+        assert!(a.tickets.is_empty(), "a deleted config turns the feature off");
+
+        restore_env(prev);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

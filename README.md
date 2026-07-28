@@ -101,17 +101,17 @@ Edit:
 <img src="docs/media/edit.png" alt="Edit mode: the same note as plain markdown with a block cursor" width="920">
 </div>
 
-### Ticket links
+### Links
 
-Issue keys in the note (`HM-54561`) are underlined once their prefix is
-configured. `n`/`N` walk them, `o` opens the selected one in your browser,
-`esc` drops the cursor.
+Configured issue keys (`HM-54599`) and bare `http(s)://` URLs in the note are
+underlined. `n`/`N` walk them — the captured-prompt block above the note counts
+too, and its links come first — `o` opens the selected one in your browser,
+`esc` drops the cursor. With NO cursor live, `o` opens the first key in the
+note's title, which is where the ticket usually is.
 
-Create `tickets.json` next to the note files — `%LOCALAPPDATA%\herdr\plugins\herdr-notes\`
-on Windows, `~/.local/share/herdr/plugins/herdr-notes/` on unix. Outside herdr
-it sits next to the config-dir fallback instead: `%APPDATA%\herdr\notes\` on
-Windows, `~/.config/herdr/notes/` on unix — `tickets.json` always lives beside
-the note files, wherever those resolve:
+Create `tickets.json` beside the note files (`%LOCALAPPDATA%\herdr\plugins\herdr-notes\`
+inside herdr, `%APPDATA%\herdr\notes\` outside it; unix
+`~/.local/share/herdr/plugins/herdr-notes/` and `~/.config/herdr/notes/`):
 
 ```json
 {
@@ -120,14 +120,10 @@ the note files, wherever those resolve:
 }
 ```
 
-A prefix must be two or more uppercase ASCII letters (`HM`, not `hm`, `H` or
-`HM2`) — that is what the underliner matches in the note text, so any other
-shape can be configured but will never match anything.
-
-Only listed prefixes are detected, so an unmapped key is never highlighted and
-never pretends to be openable. The file is read once at startup: after editing
-it, close and reopen the Notes pane. A missing or malformed file simply turns
-the feature off.
+A prefix must be two or more UPPERCASE letters, and only listed prefixes are
+detected — an unmapped key is never underlined and never pretends to be
+openable. Edits are picked up within about five seconds, no restart needed. A
+missing or malformed file simply turns issue keys off; URLs need no config.
 
 ## Persistence
 
