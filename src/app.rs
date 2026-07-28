@@ -1592,8 +1592,14 @@ impl App {
                     let mut merged_map = vec![None; n];
                     merged_map.append(&mut map);
                     map = merged_map;
-                    // Hit rows index the FINAL list, so they shift with it —
-                    // the block is never scanned for links, only prepended.
+                    // Hit rows index the FINAL list: body rows shift by
+                    // `block.len()` (`n`) here. The block IS scanned for links
+                    // (via `prompt_block`/`block_line`) and its hits already
+                    // carry correct rows, so they are untouched — only these
+                    // body-side rows need the shift. Ordinals are a separate
+                    // axis from rows: block hits take the FIRST ordinals and
+                    // body ordinals are offset by `block_hits.len()`, done
+                    // below where `all` is assembled.
                     for hit in &mut hits {
                         hit.row += n;
                     }
@@ -2051,11 +2057,24 @@ fn render_hints(keep: &[(&str, u8)]) -> String {
 /// (REVERSED when its ordinal is `cursor`). Hits are appended to `hits` with
 /// `row`.
 ///
-/// Truncation is the hazard here: `truncate_w` appends NO ellipsis, so a cut
-/// `HM-54283` would read as a perfectly valid `HM-542` and `o` would open the
-/// wrong ticket. The scan therefore runs on the FULL text and keeps only hits
-/// that end inside the retained prefix — which is a byte prefix, so the
-/// offsets line up.
+/// Truncation is the hazard here, and there are TWO sources of it. Render
+/// truncation: `truncate_w` appends NO ellipsis, so a cut `HM-54283` would
+/// read as a perfectly valid `HM-542` and `o` would open the wrong ticket.
+/// The scan therefore runs on the FULL text and keeps only hits that end
+/// inside the retained prefix — which is a byte prefix, so the offsets line
+/// up. STORAGE truncation: `prompts::condense` already cut `text` at
+/// `MAX_CHARS` and appended a real `…` before this function ever sees it,
+/// and `…` is neither ASCII-alphanumeric nor `_`, so it satisfies
+/// `find_ticket_ranges`'/`find_url_ranges`' right-hand boundary just as well
+/// as a space would — a key or URL straddling THAT cut looks bounded and
+/// complete on the stored text alone, and the render-side guard above never
+/// fires because the cut already happened upstream. So: when `text` ends
+/// with `…`, any hit ending at or after the ellipsis's start byte is dropped
+/// too. This is deliberately conservative — it also drops a complete key or
+/// URL that happens to sit immediately before the cut, since nothing here
+/// can tell that case apart from a genuinely truncated one without the
+/// original, untruncated prompt `condense` never keeps — but the
+/// alternative is `o` opening a ticket or URL that was never in the prompt.
 #[allow(clippy::too_many_arguments)] // one row-render call site per block line; a struct would just rename these fields
 fn block_line(
     number: &str,
@@ -2068,13 +2087,20 @@ fn block_line(
     hits: &mut Vec<markdown::LinkHit>,
 ) -> Line<'static> {
     let kept = truncate_w(text, budget);
+    // `None` when `text` doesn't end in a stored ellipsis at all — the
+    // common case, and the check below is then always false.
+    let ellipsis_at = text.ends_with('…').then(|| text.len() - '…'.len_utf8());
     let mut spans: Vec<Span<'static>> = Vec::new();
     if !number.is_empty() {
         spans.push(Span::styled(number.to_string(), style));
     }
     let mut last = 0usize;
+    // Both cutoffs only get stricter as the scan moves right (`find_links`
+    // returns ranges in ascending, non-overlapping order, so ends only grow),
+    // so `break` on either is as safe as the pre-existing `kept.len()` check
+    // alone was.
     for (range, kind) in markdown::find_links(text, cfg) {
-        if range.end > kept.len() {
+        if range.end > kept.len() || ellipsis_at.is_some_and(|e| range.end >= e) {
             break;
         }
         if range.start > last {
@@ -2399,6 +2425,77 @@ mod tests {
         let groups = vec![("claude p5".to_string(), vec![prompt(1, "padding HM-54283")])];
         let (lines, hits) = prompt_block(&groups, 14, &ticket_cfg(), None);
         assert!(hits.is_empty(), "{lines:?}");
+    }
+
+    /// A key straddling the cut `prompts::condense` makes on-disk, built from
+    /// `MAX_CHARS` rather than a hand-counted literal so this can't rot if
+    /// that constant moves. `budget` is generous (well past the condensed
+    /// text's own length) so only the STORED-ellipsis guard, not the
+    /// render-side `truncate_w` one, could possibly be catching this.
+    #[test]
+    fn a_stored_ellipsis_does_not_reopen_a_cut_key() {
+        let key = "HM-54283";
+        // Land the cut mid-key: pad (plus one boundary space, so the key's
+        // LEFT side is legitimately bounded and only the ellipsis-cut RIGHT
+        // side is under test) so the key starts a few chars before the
+        // condensed length, then let the rest of the line run well past it.
+        let pad = "x".repeat(crate::prompts::MAX_CHARS - 1 - 1 - key.len() / 2);
+        let raw = format!("{pad} {key} trailing text long enough to force condense to cut and ellipsize this line");
+        let stored = crate::prompts::condense(&raw);
+        assert!(stored.ends_with('…'), "fixture must actually get condensed: {stored:?}");
+        let groups = vec![("claude p5".to_string(), vec![prompt(1, &stored)])];
+        let (_, hits) = prompt_block(&groups, 200, &ticket_cfg(), None);
+        assert!(hits.is_empty(), "a key straddling the stored ellipsis must not become a hit: {stored:?}");
+    }
+
+    /// Deliberately conservative case: the key itself is NOT cut — it ends
+    /// exactly where `condense`'s cut lands, so the stored text reads
+    /// `...HM-54283…` — but nothing at this point can distinguish "complete
+    /// key, cut landed right after" from "key cut mid-way" without the
+    /// original, untruncated prompt, which `condense` never keeps. Losing
+    /// this one link is the accepted cost of never opening a ticket that was
+    /// never in the prompt.
+    #[test]
+    fn a_complete_key_immediately_before_the_stored_ellipsis_is_still_dropped() {
+        let key = "HM-54283";
+        // Boundary space for the same reason as the test above: the key's
+        // LEFT side must be legitimately bounded so this test exercises the
+        // ellipsis handling specifically, not an unrelated boundary miss.
+        let pad = "x".repeat(crate::prompts::MAX_CHARS - 1 - 1 - key.len());
+        let raw = format!("{pad} {key} trailing text long enough to force condense to cut and ellipsize this line");
+        let stored = crate::prompts::condense(&raw);
+        assert!(
+            stored.ends_with(&format!("{key}…")),
+            "fixture must place a complete key right at the cut: {stored:?}"
+        );
+        let groups = vec![("claude p5".to_string(), vec![prompt(1, &stored)])];
+        let (_, hits) = prompt_block(&groups, 200, &ticket_cfg(), None);
+        assert!(hits.is_empty(), "conservative: a complete key immediately before the stored ellipsis is dropped too");
+    }
+
+    /// The URL shape of the same hazard: `find_url_ranges` runs to the next
+    /// whitespace, and with no whitespace between the URL and the stored `…`
+    /// the match absorbs the ellipsis — which would otherwise open a broken
+    /// URL that was never actually in the prompt.
+    #[test]
+    fn a_url_absorbing_the_stored_ellipsis_is_not_a_hit() {
+        let raw = format!("see https://example.test/{}", "y".repeat(200));
+        let stored = crate::prompts::condense(&raw);
+        assert!(stored.ends_with('…'), "fixture must actually get condensed: {stored:?}");
+        let groups = vec![("claude p5".to_string(), vec![prompt(1, &stored)])];
+        let (_, hits) = prompt_block(&groups, 200, &ticket_cfg(), None);
+        assert!(hits.is_empty(), "a URL absorbing the stored ellipsis must not become a hit: {stored:?}");
+    }
+
+    /// Guards against over-rejecting: an ordinary, un-truncated prompt's URL
+    /// must still link (its key counterpart is
+    /// `a_key_in_the_prompt_block_is_a_hit` above).
+    #[test]
+    fn a_short_prompt_with_a_url_still_gets_a_hit() {
+        let groups = vec![("claude p5".to_string(), vec![prompt(1, "see https://example.test/doc please")])];
+        let (_, hits) = prompt_block(&groups, 60, &ticket_cfg(), None);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].kind, markdown::LinkKind::Url);
     }
 
     #[test]
