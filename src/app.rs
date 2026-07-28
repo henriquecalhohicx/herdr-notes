@@ -1484,40 +1484,30 @@ impl App {
         }
         frame.render_widget(Paragraph::new(Line::from(title)), title_a);
 
-        // The full hint line no longer fits a narrow right dock, and it ends
-        // in `q quit` — exactly what clipping would eat. Each form is picked
-        // by width so `q quit` survives down to the shortest one's own length
-        // (37 columns bare, 39 with the cursor hint); below that it clips.
-        // `esc drop` appears only while a checkbox cursor is live: it is the
-        // only exit from that cursor, and advertising it unconditionally
-        // would spend scarce columns on a key that does nothing. It costs
-        // `l list` its place in the narrow cursor form — while you are stuck
-        // in a cursor, the way out beats the way to the dashboard. A third
-        // pair covers the ticket cursor: while it is live, `o` (open in
-        // browser — Task 5) and `esc drop` are the whole point, so the short
-        // ticket form drops even `e edit` to keep both inside the 37-column
-        // floor that every short form must still fit `q quit` under.
-        const PREVIEW_HINTS: &str =
-            " e edit  j/k spc tick  n ticket  r title  l list  Up/Dn scroll  x clear  q quit";
-        const PREVIEW_HINTS_SHORT: &str = " e edit  j/k spc tick  l list  q quit";
-        const PREVIEW_HINTS_CURSOR: &str =
-            " e edit  j/k spc tick  esc drop  r title  l list  Up/Dn scroll  x clear  q quit";
-        const PREVIEW_HINTS_CURSOR_SHORT: &str = " e edit  j/k spc tick  esc drop  q quit";
-        const PREVIEW_HINTS_TICKET: &str =
-            " e edit  n/N ticket  o open  esc drop  r title  l list  Up/Dn scroll  q quit";
-        const PREVIEW_HINTS_TICKET_SHORT: &str = " n/N ticket  o open  esc drop  q quit";
+        // The full hint line no longer fits a narrow right dock (the user's
+        // real dock is ~46 columns), so tokens degrade one at a time by rank
+        // instead of jumping between two fixed forms — the old short form
+        // had no room for the link hint at all, making `n`/`N` invisible in
+        // exactly the pane the feature ships in. `q quit` is rank 0 and
+        // never drops; below its own length the terminal clips, same as
+        // before. `esc drop` is state-scoped: it is the only exit from
+        // whichever cursor is live (checkbox or link), so it is offered only
+        // in `HINTS_BOX`/`HINTS_LINK`, not `HINTS_PREVIEW` — advertising it
+        // with no cursor live would spend scarce columns on a key that does
+        // nothing. `o open` is `HINTS_LINK`-only for the same reason: it only
+        // does something once a link cursor exists.
         let hints = match self.note.mode {
             Mode::Preview => {
-                let (full, short) = if self.link_cursor.is_some() {
-                    (PREVIEW_HINTS_TICKET, PREVIEW_HINTS_TICKET_SHORT)
+                let tokens = if self.link_cursor.is_some() {
+                    HINTS_LINK
                 } else if self.box_cursor.is_some() {
-                    (PREVIEW_HINTS_CURSOR, PREVIEW_HINTS_CURSOR_SHORT)
+                    HINTS_BOX
                 } else {
-                    (PREVIEW_HINTS, PREVIEW_HINTS_SHORT)
+                    HINTS_PREVIEW
                 };
-                if usize::from(hint_a.width) >= full.chars().count() { full } else { short }
+                fit_hints(tokens, usize::from(hint_a.width))
             }
-            Mode::Edit => " Esc preview (saves)   Ctrl+S save",
+            Mode::Edit => " Esc preview (saves)   Ctrl+S save".to_string(),
         };
         frame.render_widget(
             Paragraph::new(Span::styled(hints, Style::default().add_modifier(Modifier::DIM))),
@@ -1964,6 +1954,83 @@ fn fit_right(context: &str, progress: &str, age: &str, budget: usize) -> String 
     .map(|s| s.trim_start().to_string())
     .find(|s| dwidth(s) <= budget)
     .unwrap_or_default()
+}
+
+/// Footer hint tokens for one preview state, in DISPLAY order, each with a drop
+/// rank: when the line does not fit, the highest rank goes first and ties break
+/// on the later slice position. Rank 0 never drops, so `q quit` survives to the
+/// floor and only below that does the terminal clip — which is what the six
+/// fixed hint strings used to guarantee, at the cost of a step change between
+/// two widths and nothing in between.
+type Hints = &'static [(&'static str, u8)];
+
+const HINTS_PREVIEW: Hints = &[
+    ("e edit", 3),
+    ("j/k spc tick", 4),
+    ("n/N link", 2),
+    ("r title", 6),
+    ("l list", 5),
+    ("Up/Dn scroll", 7),
+    ("x clear", 8),
+    ("q quit", 0),
+];
+
+/// While a checkbox cursor is live, `esc drop` is the only way out of it, so it
+/// outranks everything but `q quit`.
+const HINTS_BOX: Hints = &[
+    ("e edit", 3),
+    ("j/k spc tick", 4),
+    ("esc drop", 1),
+    ("r title", 6),
+    ("l list", 5),
+    ("Up/Dn scroll", 7),
+    ("x clear", 8),
+    ("q quit", 0),
+];
+
+/// While a link cursor is live, opening is the point (`o open`) and `esc drop`
+/// is the way out; `x clear` is not offered at all — wiping the note under a
+/// live link cursor is not a thing anyone reaches for.
+const HINTS_LINK: Hints = &[
+    ("e edit", 4),
+    ("n/N link", 3),
+    ("o open", 1),
+    ("esc drop", 2),
+    ("r title", 6),
+    ("l list", 5),
+    ("Up/Dn scroll", 7),
+    ("q quit", 0),
+];
+
+/// Renders `tokens` into a footer line of at most `width` display COLUMNS,
+/// dropping by rank until it fits. Greedy by rank rather than optimal packing:
+/// a lower-ranked token that would still have fitted is not re-added, which
+/// keeps the rule one sentence long and the output predictable.
+fn fit_hints(tokens: Hints, width: usize) -> String {
+    let mut keep: Vec<(&str, u8)> = tokens.to_vec();
+    loop {
+        let line = render_hints(&keep);
+        if dwidth(&line) <= width {
+            return line;
+        }
+        let Some(pos) = keep
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, rank))| *rank > 0)
+            .max_by_key(|(i, (_, rank))| (*rank, *i))
+            .map(|(i, _)| i)
+        else {
+            return line; // only rank 0 left: let the terminal clip, as before
+        };
+        keep.remove(pos);
+    }
+}
+
+/// One leading space, two spaces between tokens — the shape the fixed hint
+/// strings had.
+fn render_hints(keep: &[(&str, u8)]) -> String {
+    let joined: Vec<&str> = keep.iter().map(|(t, _)| *t).collect();
+    format!(" {}", joined.join("  "))
 }
 
 /// The dim per-agent prompt block rendered above the note: one heading per
@@ -4422,6 +4489,65 @@ mod tests {
         let narrow = rendered(&mut a, 40, 8);
         assert!(narrow.contains("j/k spc tick"), "the new binding survives truncation: {narrow}");
         assert!(narrow.contains("q quit"), "quit must never be the thing that gets clipped: {narrow}");
+    }
+
+    #[test]
+    fn the_full_footer_shows_every_token() {
+        assert_eq!(
+            fit_hints(HINTS_PREVIEW, 79),
+            " e edit  j/k spc tick  n/N link  r title  l list  Up/Dn scroll  x clear  q quit"
+        );
+    }
+
+    #[test]
+    fn a_narrow_dock_drops_tokens_by_rank() {
+        // 46 columns is a typical right dock. Ranks drop x clear, Up/Dn scroll,
+        // r title and l list in that order; what is left fits in 39.
+        assert_eq!(fit_hints(HINTS_PREVIEW, 46), " e edit  j/k spc tick  n/N link  q quit");
+        // At the 37-column floor the checkbox hint goes too. Greedy by rank,
+        // not optimal packing: something shorter could still have fitted, and
+        // that is the accepted trade for one simple rule.
+        assert_eq!(fit_hints(HINTS_PREVIEW, 37), " e edit  n/N link  q quit");
+    }
+
+    #[test]
+    fn the_link_state_keeps_o_open_and_esc_drop_to_the_floor() {
+        for w in [37, 46, 60] {
+            let line = fit_hints(HINTS_LINK, w);
+            assert!(line.contains("o open"), "{w}: {line}");
+            assert!(line.contains("esc drop"), "{w}: {line}");
+            assert!(dwidth(&line) <= w, "{w}: {line}");
+        }
+    }
+
+    #[test]
+    fn every_state_keeps_q_quit_at_every_width() {
+        for tokens in [HINTS_PREVIEW, HINTS_BOX, HINTS_LINK] {
+            for w in 10..=90 {
+                assert!(fit_hints(tokens, w).contains("q quit"), "width {w}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_wider_pane_never_shows_fewer_tokens() {
+        for tokens in [HINTS_PREVIEW, HINTS_BOX, HINTS_LINK] {
+            let mut prev = 0;
+            for w in 10..=100 {
+                let n = fit_hints(tokens, w).split("  ").count();
+                assert!(n >= prev, "width {w} regressed from {prev} to {n}");
+                prev = n;
+            }
+        }
+    }
+
+    #[test]
+    fn the_footer_advertises_the_link_key_in_a_narrow_dock() {
+        // The whole point of this task: at 46 columns the old short form had no
+        // room for it, so the feature was invisible.
+        let mut a = ticket_app("HM-1\n");
+        let screen = rendered(&mut a, 46, 10);
+        assert!(screen.contains("n/N link"), "{screen}");
     }
 
     #[test]
