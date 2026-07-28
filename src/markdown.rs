@@ -359,14 +359,21 @@ fn find_url_ranges(s: &str) -> Vec<std::ops::Range<usize>> {
 
 /// Trims trailing sentence punctuation from a URL, and a trailing `)`/`]`/`}`
 /// only when the URL holds no matching opener — so `(see https://x/y)` gives
-/// the bracket back to the prose while `https://x/a_(b)` keeps it.
+/// the bracket back to the prose while `https://x/a_(b)` keeps it. `*`/`_`
+/// trim the same simple way as `.`/`,`: a URL glued to a following `**bold**`
+/// or `*italic*`/`_italic_` with no separating whitespace (`**https://x/y**`)
+/// otherwise has no boundary at all to stop at, so the match runs to the end
+/// of the line and swallows the closing marker — `parse_inline`'s own
+/// URL-vs-marker guard (`url_char_mask`) then disagrees with what
+/// `style_links` computes after the marker is stripped, and the trailing
+/// `**`/`__` ends up IN the reported hit text.
 fn trim_url_end(s: &str, start: usize, mut end: usize) -> usize {
     let bytes = s.as_bytes();
     while end > start {
         // Always safe: end > start and we're indexing bytes
         let last = bytes[end - 1];
         let opener = match last {
-            b'.' | b',' | b';' | b':' | b'!' | b'?' | b'\'' | b'"' => {
+            b'.' | b',' | b';' | b':' | b'!' | b'?' | b'\'' | b'"' | b'*' | b'_' => {
                 end -= 1;
                 continue;
             }
@@ -397,13 +404,14 @@ fn is_hr(t: &str) -> bool {
 
 /// Per-char mask, index-aligned with `s.chars()`: true where that char falls
 /// inside a bare URL `find_url_ranges` finds in `s`. `parse_inline` consults
-/// this before opening a `*`/`_` marker: a URL's own underscores/asterisks
-/// (wiki titles, Confluence, S3 keys) are not emphasis, and if `parse_inline`
-/// split one into several spans, `style_links` — which scans per-span,
-/// AFTER this runs — would only ever see the fragment in whichever span
-/// happened to hold the scheme, silently truncating the hit text and the `o`
-/// target. Ticket keys can never contain these chars, so this codepath is
-/// URL-only; nothing here needs `cfg`.
+/// this at BOTH ends of a candidate `*`/`_` pair: a URL's own
+/// underscores/asterisks (wiki titles, Confluence, S3 keys) are not emphasis,
+/// and if `parse_inline` paired one of them with a marker — as either the
+/// open or the close — and split the URL across spans, `style_links` — which
+/// scans per-span, AFTER this runs — would only ever see the fragment in
+/// whichever span happened to hold the scheme, silently truncating the hit
+/// text and the `o` target. Ticket keys can never contain these chars, so
+/// this codepath is URL-only; nothing here needs `cfg`.
 fn url_char_mask(s: &str) -> Vec<bool> {
     let ranges = find_url_ranges(s);
     s.char_indices().map(|(i, _)| ranges.iter().any(|r| r.contains(&i))).collect()
@@ -411,10 +419,17 @@ fn url_char_mask(s: &str) -> Vec<bool> {
 
 /// Inline spans: `` `code` ``, `**bold**`, `*italic*` / `_italic_`. Markers
 /// without a closing partner (or with empty content) render literally; no
-/// nesting — styled content is taken as-is. A `*`/`_` is never treated as a
-/// marker OPEN while it sits inside a bare URL (see `url_char_mask`) — the
-/// URL then survives as one plain run, which is what lets `style_links` find
-/// it whole afterwards.
+/// nesting — styled content is taken as-is. A `*`/`_` never opens OR closes a
+/// marker while it sits inside a bare URL (see `url_char_mask`). Both ends
+/// matter: guarding only the open still lets an UNRELATED earlier marker
+/// (`foo_bar, see https://x/a_b` — the `_` in `foo_bar` is a perfectly legal
+/// opener on its own) reach forward and pair with the URL's own char as its
+/// close, swallowing the tail of the URL exactly as an unguarded open would.
+/// `find_marker_close`/`find_double_star` SKIP a URL-internal candidate
+/// rather than giving up the search there — a real closing marker may still
+/// follow later on the line — so the marker opens normally against whatever
+/// closer comes after the URL, and simply renders literally (no italic/bold)
+/// when none does.
 fn parse_inline(s: &str, base: Style) -> Vec<(String, Style)> {
     let chars: Vec<char> = s.chars().collect();
     let in_url = url_char_mask(s);
@@ -438,7 +453,7 @@ fn parse_inline(s: &str, base: Style) -> Vec<(String, Style)> {
                 continue;
             }
         } else if c == '*' && chars.get(i + 1) == Some(&'*') && !is_in_url(i) {
-            if let Some(close) = find_double_star(&chars, i + 2).filter(|&p| p > i + 2) {
+            if let Some(close) = find_double_star(&chars, i + 2, &in_url).filter(|&p| p > i + 2) {
                 flush(&mut plain, &mut out);
                 out.push((
                     chars[i + 2..close].iter().collect(),
@@ -449,9 +464,8 @@ fn parse_inline(s: &str, base: Style) -> Vec<(String, Style)> {
             }
         } else if (c == '*' || c == '_')
             && !is_in_url(i)
-            && let Some(off) = chars[i + 1..].iter().position(|&d| d == c).filter(|&o| o > 0)
+            && let Some(close) = find_marker_close(&chars, i + 1, c, &in_url).filter(|&p| p > i + 1)
         {
-            let close = i + 1 + off;
             flush(&mut plain, &mut out);
             out.push((
                 chars[i + 1..close].iter().collect(),
@@ -467,8 +481,18 @@ fn parse_inline(s: &str, base: Style) -> Vec<(String, Style)> {
     out
 }
 
-fn find_double_star(chars: &[char], from: usize) -> Option<usize> {
-    (from..chars.len().saturating_sub(1)).find(|&j| chars[j] == '*' && chars[j + 1] == '*')
+/// First index at or after `from` holding `target`, SKIPPING any index a URL
+/// owns (`in_url`) rather than stopping the search there — see `parse_inline`
+/// for why a URL-internal candidate must not be accepted as a close.
+fn find_marker_close(chars: &[char], from: usize, target: char, in_url: &[bool]) -> Option<usize> {
+    (from..chars.len()).find(|&j| chars[j] == target && !in_url.get(j).copied().unwrap_or(false))
+}
+
+/// Same skip-and-keep-scanning rule as `find_marker_close`, for the two-char
+/// `**` close.
+fn find_double_star(chars: &[char], from: usize, in_url: &[bool]) -> Option<usize> {
+    (from..chars.len().saturating_sub(1))
+        .find(|&j| chars[j] == '*' && chars[j + 1] == '*' && !in_url.get(j).copied().unwrap_or(false))
 }
 
 /// `wrap_into` with the link pass in front of it: matched targets get their
@@ -1109,5 +1133,46 @@ mod tests {
             && s.style.add_modifier.contains(Modifier::ITALIC)));
         assert!(spans.iter().any(|s| s.content == "us"
             && s.style.add_modifier.contains(Modifier::ITALIC)));
+    }
+
+    #[test]
+    fn an_unrelated_earlier_underscore_does_not_reach_into_a_later_url() {
+        // A lone `_` in an identifier is a legal opener on its own; the guard
+        // must reject the URL's OWN `_` as its close, not just refuse to open
+        // inside the URL — the earlier bug guarded only the open.
+        let (lines, _, hits) = render_markdown_links(
+            "rename foo_bar, see https://example.test/x_y for details",
+            80,
+            &cfg(),
+            None,
+        );
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].text, "https://example.test/x_y");
+        let underlined: usize = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .filter(|s| s.style.add_modifier.contains(Modifier::UNDERLINED))
+            .map(|s| s.content.chars().count())
+            .sum();
+        assert_eq!(underlined, "https://example.test/x_y".chars().count());
+    }
+
+    #[test]
+    fn an_unrelated_earlier_asterisk_does_not_reach_into_a_later_url() {
+        let (lines, _, hits) = render_markdown_links(
+            "a * lonely star, see https://example.test/x*y for details",
+            80,
+            &cfg(),
+            None,
+        );
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].text, "https://example.test/x*y");
+        let underlined: usize = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .filter(|s| s.style.add_modifier.contains(Modifier::UNDERLINED))
+            .map(|s| s.content.chars().count())
+            .sum();
+        assert_eq!(underlined, "https://example.test/x*y".chars().count());
     }
 }
