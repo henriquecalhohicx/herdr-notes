@@ -64,29 +64,46 @@ findings doc (and the reference implementation, `herdr-sidebar`) lives in
   delete/rename is gated on `showing_tab_note()` — acting on your own
   tab-note row while viewing the global note must NOT touch the global buffer
   (that path silently deleted `global.json`; see Gotchas). Per-agent grouping
-  support lives here too: `PaneInfo { agent, tab_id, title, cwd }` and a
+  support lives here too: `PaneInfo { agent, tab_id, title, cwd, label }` and a
   `PaneIndex` (pane id → `PaneInfo`) built by `build_pane_index` from one
   `pane.list` call (`pane_index`); `meaningful_title(title, agent)` rejects a
   blank, tool-generic (`GENERIC_TITLES`), or path-shaped title, and
   `PaneInfo::nice_title()` is the ONE place that pairing is spelled — shared
-  by `pane_label`, `pick_title` and `maybe_autotitle`'s source-1 probe;
+  by `pane_label`, `pick_title` and `maybe_autotitle`'s source-1 probe.
+  `nice_title` prefers the trimmed `label` (herdr's pane label, present only
+  once the user — or the launcher — names the pane; absent from `pane.list`
+  entirely until then) and falls back to the terminal title only when there
+  is no label; a label deliberately BYPASSES `meaningful_title` — that
+  rejection list exists for `terminal_title_stripped`, which is machine-set
+  and unreliable, while a label is a string the user typed on purpose, so
+  rejecting e.g. `src/app.rs` as path-shaped would be overruling them.
   `pane_label` heads a prompt group with that title when meaningful, else
   `{agent} {pane-suffix}`. `App.prompt_labels` is resolved once per refresh
-  (never per draw), index-aligned with `App.prompts`. An untitled note with
-  `title_auto` still set derives a title on the heartbeat (`maybe_autotitle`;
-  the guards live in `autotitle_wanted` — `persist`, `showing_tab_note()`,
-  `title_auto`, an empty `note.title`, and `!state::is_blank(&note)`, the
-  LAST of which is load-bearing, see Gotchas): the tab's agent pane's
-  terminal title when meaningful (chosen by `pick_agent_pane`, which skips
-  herdr's synthetic `usage` pane exactly as `build_tab_index` does), else its
-  git branch (`git_branch`, at most one `git rev-parse --abbrev-ref HEAD` per
-  cwd for the process's life via `App.git_tried`), else the oldest SURVIVING
-  captured prompt (`oldest_prompt_text`) — resolved by `pick_title`. Prompt
-  labels and the auto-title read the SAME `pane.list` snapshot: the heartbeat
-  runs `load_prompts` (no socket I/O), asks `autotitle_wanted`, then fetches
-  at most ONE index and threads `Option<&PaneIndex>` into `label_prompts` and
-  `maybe_autotitle`. `refresh_prompts` (construction, `toggle_global`) is the
-  standalone form that fetches its own only when there is something to label.
+  (never per draw), index-aligned with `App.prompts`. A note with
+  `title_auto` still set RE-DERIVES its title on EVERY heartbeat
+  (`maybe_autotitle`; the guards live in `autotitle_wanted` — `persist`,
+  `showing_tab_note()`, `title_auto`, and `!state::is_blank(&note)`, the LAST
+  of which is load-bearing, see Gotchas) — there is deliberately no "title is
+  empty" guard, so renaming a pane (or a branch switch) updates an
+  ALREADY-SET title too, not just an empty one: the tab's agent pane's
+  `nice_title()` (chosen by `pick_agent_pane`, which skips herdr's synthetic
+  `usage` pane exactly as `build_tab_index` does), else its git branch
+  (`git_branch`, at most one `git rev-parse --abbrev-ref HEAD` per cwd for
+  the process's life via `App.git_tried` — a `HashMap<String, Option<String>>`
+  caching BOTH outcomes, success and failure, inserted only once the spawn
+  RETURNS), else the oldest SURVIVING captured prompt (`oldest_prompt_text`)
+  — resolved by `pick_title`. An EXISTING title may only be REPLACED by the
+  pane-derived source, never demoted back to the branch or a captured
+  prompt (`maybe_autotitle`'s no-demotion split), and the note is only
+  touched when the derived value actually differs from what is already
+  there — writing unconditionally on every beat would dirty the note, fire
+  the 2s autosave forever, and reset the header age to `just now` on a loop.
+  Prompt labels and the auto-title read the SAME `pane.list` snapshot: the
+  heartbeat runs `load_prompts` (no socket I/O), asks `autotitle_wanted`,
+  then fetches at most ONE index and threads `Option<&PaneIndex>` into
+  `label_prompts` and `maybe_autotitle`. `refresh_prompts` (construction,
+  `toggle_global`) is the standalone form that fetches its own only when
+  there is something to label.
 - `src/markdown.rs` — hand-rolled renderer (headings, lists, checkboxes —
   bare `[ ]`/`[x]` as well as `- [ ]`/`* [ ]` — quotes, code, bold/italic, hr)
   + display-width wrapping. Also the crate's ONLY checkbox parser:
@@ -113,13 +130,26 @@ findings doc (and the reference implementation, `herdr-sidebar`) lives in
   `ts` descending, ties broken on `pane` ascending (`read_dir` order isn't
   guaranteed across platforms). `capture` is a gate chain — the
   `HERDR_NOTES_NO_CAPTURE` off switch, running inside herdr, filename-safe tab
-  AND pane ids, an existing note file for this tab (no note, no capture — a
-  tab that never opened Notes gets no prompt file either), a usable `prompt`
-  field in the hook's stdin payload — every rejection silent and total,
-  because the caller runs inside a `UserPromptSubmit` hook. Gate 4 asks
-  `state::note_file_in` for the note path rather than spelling `<key>.json`
-  again — the hook is a second process and prints nothing, so a layout drift
-  would stop capture with no diagnostic anywhere. `App.prompts` (`app.rs`)
+  AND pane ids, a LIVE Notes pane in this tab OR an existing note file for
+  this tab, a usable `prompt` field in the hook's stdin payload — every
+  rejection silent and total, because the caller runs inside a
+  `UserPromptSubmit` hook. The live-pane half is a fifth parameter,
+  `notes_live: Option<bool>`, injected so the gate stays socket-free in
+  tests; it is ADDITIVE — `Some(true)` (from `launch::notes_pane_fresh`)
+  opens the gate early, but `Some(false)` and `None` both fall back to the
+  note-file check, so a socket failure degrades to the PRIOR behavior rather
+  than to silent no-capture. `capture_from_env` fetches that answer through
+  `ipc::call_text_bounded`, bounded by `GATE_TIMEOUT` (300ms, well inside the
+  hook's own 5s timeout), and only pays for the round trip once the off
+  switch, in-herdr, and id checks already passed — a call that could not
+  change `capture`'s answer is skipped. Consequence worth naming: a tab
+  where Notes was opened but never typed into can now leave an orphan
+  `<tab>__<pane>.prompts.json` with no note file beside it, since a live
+  Notes pane alone is enough to pass this gate. The note-file half still
+  asks `state::note_file_in` for the note path rather than spelling
+  `<key>.json` again — the hook is a second process and prints nothing, so a
+  layout drift would stop capture with no diagnostic anywhere. `App.prompts`
+  (`app.rs`)
   re-reads via `load_for_tab` into a `Vec<PromptGroup>`, and `prompt_block`
   renders one heading per group above the note in preview — there is
   deliberately NO single "Last Prompts" heading any more, each group is headed
@@ -328,9 +358,11 @@ Learned building this plugin:
   `tab_id` and a non-empty `agent`, so any per-tab pane selection has to skip
   it by name — `build_tab_index` and `pick_agent_pane` both do. In
   `pick_agent_pane` it also sorts by pane id like any other pane, so it can
-  win: its title becomes auto-title source 1, and its cwd consumes the tab's
-  ONE `git rev-parse` attempt (`git_tried` records the cwd before the spawn),
-  permanently disabling source 2 against the wrong directory.
+  win: its title becomes auto-title source 1, and its cwd would consume the
+  tab's ONE `git rev-parse` attempt (`git_tried` caches BOTH outcomes,
+  success and failure, keyed by cwd, inserted only once the spawn RETURNS —
+  not reserved up front), permanently disabling source 2 against the wrong
+  directory.
 - `git_branch`'s `cmd.output()` is a blocking wait with NO timeout, on the
   event-loop thread inside `heartbeat()`. The once-per-cwd bound
   (`App.git_tried`) is what makes that survivable, so relaxing it is not free:
@@ -446,15 +478,24 @@ Learned building this plugin:
   agent panes, and a shared per-tab file would mean concurrent
   read-modify-write from independent hook processes (each `UserPromptSubmit`
   fires as its own short-lived process with no coordination between panes).
-- `terminal_title_stripped` is the ONLY human-readable per-pane string herdr
-  exposes — there is no pane label or name field (verified against a live
-  `pane.list` on 0.7.4, whose full key set is `agent`, `agent_session`,
-  `agent_status`, `cwd`, `focused`, `pane_id`, `revision`, `scroll`, `tab_id`,
-  `terminal_id`, `terminal_title`, `terminal_title_stripped`, `tokens`,
-  `workspace_id`). It is unreliable: a working Claude pane reads `HM-54271
-  Generic Importer Config API`, an idle one reads `Claude Code`, a shell pane
-  reads its `powershell.exe` path. Anything using it needs the generic-name
-  and path-shaped rejections in `meaningful_title`.
+- CORRECTED: `terminal_title_stripped` is the ONLY human-readable per-pane
+  string herdr reports UNPROMPTED, not the only human-readable string it
+  exposes period — herdr DOES expose a real pane
+  `label` field, set once the user (or the launcher) renames the pane. The
+  original claim here came from a live `pane.list` dump taken before any
+  pane had ever been renamed: `pane.list` omits the `label` key ENTIRELY
+  until one is set, so that dump's key set (`agent`, `agent_session`,
+  `agent_status`, `cwd`, `focused`, `pane_id`, `revision`, `scroll`,
+  `tab_id`, `terminal_id`, `terminal_title`, `terminal_title_stripped`,
+  `tokens`, `workspace_id`) was not evidence the field does not exist, only
+  that nothing had set it yet — a key's absence in a pre-rename dump is not
+  proof the key can never appear. `terminal_title_stripped` is still
+  unreliable exactly as originally described: a working Claude pane reads
+  `HM-54271 Generic Importer Config API`, an idle one reads `Claude Code`, a
+  shell pane reads its `powershell.exe` path — `meaningful_title`'s
+  generic-name/path-shaped rejections still apply to it. A `label`, once
+  set, is user-typed and deliberately bypasses that rejection list
+  (`PaneInfo::nice_title`).
 - `title_auto`'s missing-field default is `title.trim().is_empty()`. That is
   the entire migration for existing notes, and inverting it would make every
   note the user has already named start re-deriving over the top of them.
@@ -479,6 +520,25 @@ Learned building this plugin:
   `(lines, map)` the same way on both the empty-note and real-note paths and
   shares one clamp/scroll/scrollbar/hint tail, so the help is always
   reachable regardless of block height.
+- `launch::token_stale` returns FALSE for a MISSING token, and `Pane::is_notes`
+  accepts the `"Notes"` LABEL alone. Both are right for the launcher, which
+  must recognize a pane it has just labeled before that pane's TUI has
+  reported anything. Both are wrong for a liveness check: a label outlives a
+  dead pane. `notes_pane_fresh` therefore requires the token present AND
+  fresh, and anything else asking "is this pane alive" must do the same
+  rather than reusing `is_notes`.
+- The capture gate's socket answer is ADDITIVE — `Some(true)` opens the gate
+  early, but `Some(false)` and `None` both fall back to the note-file check.
+  Making it subtractive would stop capture for a tab with a real note the
+  moment its Notes pane closed.
+- `ipc::call_text_bounded` bounds with a worker thread, not a socket read
+  timeout, because on Windows the named pipe is a plain `File` with no
+  read-timeout API. The worker may outlive the bound; that is safe only
+  because the hook process exits immediately after.
+- An auto title now re-derives every heartbeat, so `maybe_autotitle` MUST
+  compare before writing. Writing unconditionally dirties the note every
+  beat, which autosaves forever, bumps `updated`, and resets the header age
+  to `just now` on a loop.
 
 ## README screenshots (Alex's criteria — follow on every reshoot)
 

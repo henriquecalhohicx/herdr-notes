@@ -280,10 +280,11 @@ fn meaningful_title(title: &str, agent: &str) -> Option<String> {
     Some(t.to_string())
 }
 
-/// The heading for a pane's prompt group: its terminal title when meaningful,
-/// otherwise `{agent} {pane-suffix}` (`claude p8`) built from data the stored
-/// prompt always carries — so a closed pane or an unreachable socket still
-/// names its group.
+/// The heading for a pane's prompt group: the pane's `nice_title()` — its
+/// herdr label when set, else its terminal title when meaningful — otherwise
+/// `{agent} {pane-suffix}` (`claude p8`) built from data the stored prompt
+/// always carries — so a closed pane or an unreachable socket still names
+/// its group.
 fn pane_label(pane_id: &str, agent: &str, index: Option<&PaneIndex>) -> String {
     if let Some(info) = index.and_then(|i| i.get(pane_id))
         && let Some(title) = info.nice_title()
@@ -298,9 +299,10 @@ fn pane_label(pane_id: &str, agent: &str, index: Option<&PaneIndex>) -> String {
     }
 }
 
-/// The title chain: the agent pane's terminal title when meaningful, then the
-/// git branch, then the oldest surviving captured prompt. `None` when nothing
-/// has resolved yet — the caller retries on the next heartbeat.
+/// The title chain: the agent pane's `nice_title()` (its herdr label when
+/// set, else its terminal title when meaningful), then the git branch, then
+/// the oldest surviving captured prompt. `None` when nothing has resolved
+/// yet — the caller retries on the next heartbeat.
 fn pick_title(
     agent_pane: Option<&PaneInfo>,
     branch: Option<&str>,

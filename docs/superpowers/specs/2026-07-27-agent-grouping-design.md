@@ -38,6 +38,16 @@ Read off a real `pane.list` on this machine:
   `"Claude Code"`, and a shell pane reads
   `"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe"`.
 
+> **CORRECTED in Task 6 documentation pass.** herdr DOES expose a dedicated
+> pane label field (`label`) — the bullet above is wrong. The dump it was
+> read off was taken before any pane had ever been renamed, and `pane.list`
+> omits the `label` key ENTIRELY until one is set; a key's absence in a dump
+> taken before any rename is therefore not evidence the field does not
+> exist, only that nothing had set it yet. `terminal_title_stripped` is
+> still the only human-readable string herdr reports UNPROMPTED, which is
+> the narrower, still-true claim. See `PaneInfo.label` / `nice_title` in
+> `src/app.rs` and the corresponding gotcha in `CLAUDE.md`.
+
 Also worth recording, because it shaped the title chain: on this user's machine
 the ticket id appears in the terminal title, not the branch — the branch at the
 time of writing was `20260727-team-solutions`.
