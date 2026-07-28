@@ -702,6 +702,14 @@ mod tests {
         assert_eq!(keys("HM-4-final"), ["HM-4"]);
     }
 
+    #[test]
+    fn two_keys_jammed_together_with_no_separator_match_neither() {
+        // "HM-1CR-2": the boundary check fails on BOTH candidates — the `C`
+        // right after HM-1's digit run means HM-1 has no right boundary, and
+        // the `1` right before CR-2's prefix means CR-2 has no left boundary.
+        assert!(keys("HM-1CR-2").is_empty());
+    }
+
     fn hit_style(lines: &[Line], key: &str) -> Style {
         lines
             .iter()

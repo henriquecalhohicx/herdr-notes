@@ -108,7 +108,10 @@ configured. `n`/`N` walk them, `o` opens the selected one in your browser,
 `esc` drops the cursor.
 
 Create `tickets.json` next to the note files — `%LOCALAPPDATA%\herdr\plugins\herdr-notes\`
-on Windows, `~/.local/share/herdr/plugins/herdr-notes/` on unix:
+on Windows, `~/.local/share/herdr/plugins/herdr-notes/` on unix. Outside herdr
+it sits next to the config-dir fallback instead: `%APPDATA%\herdr\notes\` on
+Windows, `~/.config/herdr/notes/` on unix — `tickets.json` always lives beside
+the note files, wherever those resolve:
 
 ```json
 {
@@ -116,6 +119,10 @@ on Windows, `~/.local/share/herdr/plugins/herdr-notes/` on unix:
   "CR": "https://your-tracker.example/issue/{key}"
 }
 ```
+
+A prefix must be two or more uppercase ASCII letters (`HM`, not `hm`, `H` or
+`HM2`) — that is what the underliner matches in the note text, so any other
+shape can be configured but will never match anything.
 
 Only listed prefixes are detected, so an unmapped key is never highlighted and
 never pretends to be openable. The file is read once at startup: after editing

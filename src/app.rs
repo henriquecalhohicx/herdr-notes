@@ -4666,6 +4666,20 @@ mod tests {
     }
 
     #[test]
+    fn n_upper_with_no_cursor_lands_on_the_last_hit() {
+        // From `None`, `move_ticket`'s `None => n - 1` arm is only reachable
+        // when `N` (delta < 0) is the FIRST key pressed — every other test in
+        // this module presses `n` first, so that arm would go unexercised
+        // (and a `None => 0` typo there would still pass the suite) without
+        // this one starting cold on `N`.
+        let mut a = ticket_app("first HM-1\nsecond HM-2\n");
+        rendered(&mut a, 40, 10);
+        assert_eq!(a.ticket_cursor, None, "no cursor until you ask for one");
+        a.on_key(key(KeyCode::Char('N')));
+        assert_eq!(a.ticket_cursor, Some(1), "N from no cursor lands on the last hit");
+    }
+
+    #[test]
     fn n_does_nothing_without_configured_tickets() {
         let mut a = app("HM-1 here"); // no config injected
         rendered(&mut a, 40, 10);

@@ -32,7 +32,14 @@ findings doc (and the reference implementation, `herdr-sidebar`) lives in
   `render_markdown_tickets` produced (see the `src/markdown.rs` entry below;
   it is never a fresh scan) — mutually exclusive with `box_cursor` so `esc`
   and `space` stay unambiguous: `n`/`N` (`move_ticket`) walk it and drop
-  `box_cursor` doing so, `j`/`k`/`space` drop it back, `o` (`open_ticket`)
+  `box_cursor` doing so, `j`/`k`/`space` drop it back — NOT symmetrically:
+  `j`/`k`/`space` call `clear_ticket_cursor` UNCONDITIONALLY before they touch
+  `box_cursor`, while `move_ticket` only drops `box_cursor` after confirming
+  there is a ticket hit to move the cursor to (it early-returns first when the
+  note has no ticket hits at all). So on a note with ticket hits but no
+  checkboxes, `j`/`k`/`space` still silently drop the ticket cursor and then
+  do nothing else, since `move_box` has nothing to move to either — a `j`
+  that looks like a no-op quietly deselects the ticket. `o` (`open_ticket`)
   resolves the cursored key through `pending_open` (the pure, tested seam)
   and hands the URL to `tickets::open`, pushing the returned `Child` onto
   `App.open_children` for the heartbeat to reap non-blockingly. `esc`
@@ -55,9 +62,11 @@ findings doc (and the reference implementation, `herdr-sidebar`) lives in
   checkbox cursor is live, adding `esc drop` at the cost of `l list` in the
   narrow form. A third pair (`PREVIEW_HINTS_TICKET`/`_TICKET_SHORT`, 76/37
   cols) is used only while the ticket cursor (below) is live, adding `n/N
-  ticket` and `o open` at the cost of `e edit`/`x clear` — the narrow ticket
-  form drops even `e edit`, since while that cursor is live the way to open
-  or drop it is the whole point. There is also a notes-list overlay
+  ticket`, `o open` and `esc drop` at the cost of `j/k spc tick` and
+  `x clear` in the FULL form (it keeps `e edit`); the narrow ticket form
+  drops `e edit` too, on top of `j/k spc tick` and `l list`, since while that
+  cursor is live the way to open or drop it is the whole point. There is
+  also a notes-list overlay
   (`l` in preview: navigate with Up/Down or j/k, `enter` opens a read-only
   scrollable preview of the selected note, `r` renames it, `d` deletes it
   with a y/N confirm, `esc`/`l` closes the overlay). v2 turned the overlay
@@ -450,15 +459,27 @@ Learned building this plugin:
   viewport back to the cursor on every draw, so every other scroll key
   (`Up`/`Down`/`g`/`G`/PgUp/PgDn) looks broken the instant a checkbox cursor
   is set.
-- EVERY piece of per-document state must reset in `toggle_global`:
-  `preview_scroll`, `box_cursor` AND `follow_box` (`clear_box_cursor`).
-  Same class of bug as the `global.json` clobber above — a field added later
-  that the document swap does not know about. A `box_cursor` carried across
-  the swap highlights an arbitrary checkbox in the note you just opened to
-  READ, and one pager-habit `space` ticks it. The same clear belongs on
-  every text-wiping path (`x` confirm, overlay self-delete): a stale ordinal
-  is harmless only while the text is empty (`cursor_line()` returns None),
-  and stops being harmless the moment `e` re-seeds text under it.
+- EVERY piece of per-document state must reset on a buffer swap or a
+  text-wiping path — the single function that does it is `clear_cursors()`
+  (`app.rs`), and every one of those paths (`toggle_global`, the `x` confirm
+  arm, the overlay's `ConfirmDelete` arm) calls THAT, never a single-cursor
+  clear, so a field added later cannot be missed by only some of them.
+  `clear_cursors` resets `box_cursor` and `follow_box`, AND `ticket_cursor`
+  and `follow_ticket`; `toggle_global` additionally clears `ticket_hits`
+  (`preview_scroll` is reset alongside it, not by it — it lives on `App`
+  directly, not behind either cursor). `clear_cursors` itself is a thin
+  wrapper: `clear_box_cursor` only ever knew about `box_cursor`/`follow_box`,
+  because it was written before the ticket cursor existed — the indirection
+  is there BECAUSE a call site that kept spelling `clear_box_cursor` directly
+  would silently miss the newer field, which is exactly the class of bug this
+  bullet is warning about, not a one-off from the ticket feature. Same class
+  of bug as the `global.json` clobber above — a field added later that the
+  document swap does not know about. A `box_cursor` (or `ticket_cursor`)
+  carried across the swap highlights an arbitrary checkbox (or ticket) in the
+  note you just opened to READ, and one pager-habit `space`/`o` acts on it; a
+  stale ordinal is harmless only while the text underneath is empty
+  (`cursor_line()` returns None), and stops being harmless the moment `e`
+  re-seeds text under it.
 - `state::persist_at` stamps `created`/`updated` onto a CLONE of the note, so
   `App::save` has to mirror them back onto `self.note` (hence `&mut self`).
   Without that, the in-session note keeps whatever `load()` read at startup:
