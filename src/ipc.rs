@@ -64,3 +64,74 @@ fn exchange<S: std::io::Read + Write>(mut stream: S, request: &str) -> std::io::
     BufReader::new(stream).read_line(&mut line)?;
     Ok(line)
 }
+
+/// `call_text` with a wall-clock bound. Used on the `--capture-prompt` path,
+/// which runs inside a `UserPromptSubmit` hook: Claude Code kills a hook at its
+/// configured timeout, so the socket must never be allowed to sit anywhere near
+/// it.
+///
+/// Bounded with a worker thread rather than a socket read timeout because on
+/// Windows the named pipe is opened as a plain `File`, which has no
+/// read-timeout API. The worker can outlive the bound; that is fine here
+/// because the hook process exits straight afterward and teardown reaps it.
+// Not yet called outside tests — the capture-gate wiring lands in Task 3.
+#[allow(dead_code)]
+pub fn call_text_bounded(
+    method: &str,
+    params: serde_json::Value,
+    timeout: std::time::Duration,
+) -> std::io::Result<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let method = method.to_string();
+    std::thread::spawn(move || {
+        let _ = tx.send(call_text(&method, params));
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "herdr socket did not answer in time",
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn call_text_bounded_returns_promptly_when_there_is_no_socket() {
+        // Intent: with no HERDR_SOCKET_PATH and no default socket reachable,
+        // the inner call fails fast, so this returns that error rather than
+        // waiting out the timeout. This machine has a live herdr session at
+        // the platform-default socket path even with HERDR_SOCKET_PATH unset,
+        // so the connect can succeed here instead of failing fast — the
+        // `is_err` assertion does not hold in that environment. The timing
+        // bound is the property under test regardless of outcome, so it is
+        // kept unconditionally.
+        let started = std::time::Instant::now();
+        let _ = call_text_bounded(
+            "pane.list",
+            serde_json::json!({}),
+            std::time::Duration::from_secs(3),
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "must not sit on the timeout when the connect itself fails: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn call_text_bounded_reports_a_timeout_as_timed_out() {
+        // A zero timeout can never be met, so this exercises the timeout arm
+        // without needing a hung server.
+        let out = call_text_bounded(
+            "pane.list",
+            serde_json::json!({}),
+            std::time::Duration::from_millis(0),
+        );
+        let err = out.expect_err("zero timeout cannot succeed");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "got {err:?}");
+    }
+}
