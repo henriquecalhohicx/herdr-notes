@@ -411,6 +411,9 @@ pub struct App {
     ticket_cursor: Option<usize>,
     /// One-shot scroll-follow, same contract as `follow_box`.
     follow_ticket: bool,
+    /// Browser launches still running, reaped on the heartbeat so unix does not
+    /// accumulate a zombie per `o`.
+    open_children: Vec<std::process::Child>,
     /// The tab's captured prompts, grouped per agent pane and newest group
     /// first, each with the heading resolved at refresh time. Refreshed on the
     /// heartbeat rather than per draw. Rendered above the note, never part of
@@ -481,6 +484,7 @@ impl App {
             ticket_hits: Vec::new(),
             ticket_cursor: None,
             follow_ticket: false,
+            open_children: Vec::new(),
             prompts: Vec::new(),
             prompt_labels: Vec::new(),
             git_tried: std::collections::HashMap::new(),
@@ -611,6 +615,8 @@ impl App {
             return;
         }
         self.last_beat = Instant::now();
+        // Non-blocking: a browser still running just stays in the list.
+        self.open_children.retain_mut(|c| !matches!(c.try_wait(), Ok(Some(_)) | Err(_)));
         self.report_tokens();
         // Prompt labels and the auto-title both read the SAME `pane.list`
         // snapshot. Fetching one each meant two round-trips on every beat —
@@ -915,6 +921,7 @@ impl App {
             }
             KeyCode::Char('n') => self.move_ticket(1),
             KeyCode::Char('N') => self.move_ticket(-1),
+            KeyCode::Char('o') => self.open_ticket(),
             // The only way out of either preview cursor. Without it the
             // highlight is a mode you can enter and not leave — the other
             // exits are all side effects (swap documents, `x` clear, edit the
@@ -1159,7 +1166,9 @@ impl App {
 
     /// Drops the checkbox cursor and any pending scroll-follow. Both are
     /// per-DOCUMENT state, so every path that swaps or wipes the buffer
-    /// (`toggle_global`, `x` clear, overlay self-delete) must call this.
+    /// (`toggle_global`, `x` clear, overlay self-delete) must call
+    /// `clear_cursors`, not this directly — a cursor added later (the ticket
+    /// one did) would otherwise survive a swap this function alone cannot see.
     fn clear_box_cursor(&mut self) {
         self.box_cursor = None;
         self.follow_box = false;
@@ -1206,6 +1215,22 @@ impl App {
             Some(c) => c.saturating_add_signed(delta).min(n - 1),
         });
         self.follow_ticket = true;
+    }
+
+    /// The URL `o` would open right now, or `None`. Separate from `open_ticket`
+    /// so the resolution is testable without launching a browser.
+    fn pending_open(&self) -> Option<String> {
+        let key = self.ticket_cursor.and_then(|c| self.ticket_hits.get(c)).map(|h| h.key.clone())?;
+        crate::tickets::ticket_url(&self.tickets, &key)
+    }
+
+    /// Opens the cursored ticket. Silent no-op when there is no cursor, no
+    /// mapping, or the spawn fails — nothing may print from the TUI.
+    fn open_ticket(&mut self) {
+        let Some(url) = self.pending_open() else { return };
+        if let Some(child) = crate::tickets::open(&url) {
+            self.open_children.push(child);
+        }
     }
 
     /// Steps the checkbox cursor. From no cursor, `j` lands on the first box
@@ -4445,6 +4470,19 @@ mod tests {
     }
 
     #[test]
+    fn toggle_global_drops_the_ticket_cursor() {
+        // Same shape as the checkbox cursor above: an ordinal into THIS
+        // document's ticket hits means nothing once the buffer swaps.
+        let mut a = ticket_app("first HM-1\nsecond HM-2\n");
+        rendered(&mut a, 40, 10);
+        a.on_key(key(KeyCode::Char('n')));
+        assert_eq!(a.ticket_cursor, Some(0));
+        a.toggle_global();
+        assert_eq!(a.ticket_cursor, None, "the cursor is per-document, like preview_scroll");
+        assert!(!a.follow_ticket, "and so is its pending scroll-follow");
+    }
+
+    #[test]
     fn clearing_the_note_drops_the_checkbox_cursor() {
         let mut a = app("[ ] one\n[ ] two");
         a.on_key(key(KeyCode::Char('j')));
@@ -4469,6 +4507,22 @@ mod tests {
         assert_eq!(a.note.text, "");
         assert_eq!(a.box_cursor, None, "clearing the buffer clears its cursor");
         assert!(!a.follow_box);
+    }
+
+    #[test]
+    fn overlay_self_delete_drops_the_ticket_cursor() {
+        let mut a = ticket_app("first HM-1\nsecond HM-2\n");
+        rendered(&mut a, 40, 10);
+        a.on_key(key(KeyCode::Char('n')));
+        assert_eq!(a.ticket_cursor, Some(0));
+        a.overlay = Some(Overlay::from_entries(vec![
+            OverlayEntry { is_self: true, ..entry("X", state::TabStatus::Closed) },
+        ]));
+        a.on_key(key(KeyCode::Char('d')));
+        a.on_key(key(KeyCode::Char('y')));
+        assert_eq!(a.note.text, "");
+        assert_eq!(a.ticket_cursor, None, "clearing the buffer clears its cursor");
+        assert!(!a.follow_ticket);
     }
 
     #[test]
@@ -4743,5 +4797,36 @@ mod tests {
         assert_eq!(a.ticket_cursor, Some(1));
         assert_eq!(a.ticket_hits[1].key, "HM-2");
         assert!(a.ticket_hits[0].row < a.ticket_hits[1].row);
+    }
+
+    // ----- o opens the cursored ticket in the browser ----------------------
+
+    #[test]
+    fn o_without_a_cursor_or_config_does_nothing() {
+        // No panic, no child, no output — the whole failure contract.
+        let mut a = ticket_app("HM-1\n");
+        rendered(&mut a, 40, 10);
+        a.on_key(key(KeyCode::Char('o')));
+        assert!(a.open_children.is_empty(), "no cursor, nothing to open");
+
+        let mut b = app("HM-1\n"); // no config
+        rendered(&mut b, 40, 10);
+        b.on_key(key(KeyCode::Char('n')));
+        b.on_key(key(KeyCode::Char('o')));
+        assert!(b.open_children.is_empty());
+    }
+
+    #[test]
+    fn o_resolves_the_cursored_key_to_a_url() {
+        // The URL, not the spawn, is the tested part: `pending_open` returns
+        // what `o` would hand to the browser.
+        let mut a = ticket_app("first HM-1\nsecond HM-2\n");
+        rendered(&mut a, 40, 10);
+        a.on_key(key(KeyCode::Char('n')));
+        a.on_key(key(KeyCode::Char('n')));
+        assert_eq!(
+            a.pending_open().as_deref(),
+            Some("https://example.test/browse/HM-2")
+        );
     }
 }

@@ -27,7 +27,21 @@ findings doc (and the reference implementation, `herdr-sidebar`) lives in
   fires right after `j`/`k`/`space` move the cursor — gating it on the
   cursor merely existing instead would re-force the viewport to it on every
   draw and make `Up`/`Down`/`g`/`G`/PgUp/PgDn look broken the instant a
-  cursor is set. A fresh note is seeded with `template::DEFAULT` on the
+  cursor is set. Preview also carries a SECOND cursor, `ticket_cursor` — an
+  ordinal into `App.ticket_hits`, the hit list the last preview draw's
+  `render_markdown_tickets` produced (see the `src/markdown.rs` entry below;
+  it is never a fresh scan) — mutually exclusive with `box_cursor` so `esc`
+  and `space` stay unambiguous: `n`/`N` (`move_ticket`) walk it and drop
+  `box_cursor` doing so, `j`/`k`/`space` drop it back, `o` (`open_ticket`)
+  resolves the cursored key through `pending_open` (the pure, tested seam)
+  and hands the URL to `tickets::open`, pushing the returned `Child` onto
+  `App.open_children` for the heartbeat to reap non-blockingly. `esc`
+  (`clear_cursors`) is the ONE place both cursors are dropped together, and
+  every path that swaps or wipes the note buffer (`toggle_global`, `x`
+  confirm, overlay self-delete) calls THAT rather than either single clear —
+  `clear_box_cursor` alone would miss the ticket cursor precisely because it
+  was added later than the rule it documents (see Gotchas). A fresh note is
+  seeded with `template::DEFAULT` on the
   first INTERACTIVE `e` (lazy — a tab you only toggled Notes into writes no
   file; `enter_edit(seed)` takes the flag so restoring a persisted
   `mode: "edit"` never seeds), landing the cursor on the template's blank
@@ -36,10 +50,14 @@ findings doc (and the reference implementation, `herdr-sidebar`) lives in
   ALL-OR-NOTHING (pushed only when the whole `2h ago` token fits the header
   width, measured in display columns — never clipped to `2h ag`); the footer
   has a full and a short form, chosen by pane width, which drops the floor
-  for keeping `q quit` on screen from 69 columns to 37 — and a second pair
+  for keeping `q quit` on screen from 79 columns to 37 — and a second pair
   (`PREVIEW_HINTS_CURSOR`/`_CURSOR_SHORT`, 79/39 cols) used only while a
   checkbox cursor is live, adding `esc drop` at the cost of `l list` in the
-  narrow form. There is also a notes-list overlay
+  narrow form. A third pair (`PREVIEW_HINTS_TICKET`/`_TICKET_SHORT`, 76/37
+  cols) is used only while the ticket cursor (below) is live, adding `n/N
+  ticket` and `o open` at the cost of `e edit`/`x clear` — the narrow ticket
+  form drops even `e edit`, since while that cursor is live the way to open
+  or drop it is the whole point. There is also a notes-list overlay
   (`l` in preview: navigate with Up/Down or j/k, `enter` opens a read-only
   scrollable preview of the selected note, `r` renames it, `d` deletes it
   with a y/N confirm, `esc`/`l` closes the overlay). v2 turned the overlay
@@ -115,7 +133,21 @@ findings doc (and the reference implementation, `herdr-sidebar`) lives in
   `render_markdown_mapped`, which returns a per-rendered-row source-line map
   (one source line can wrap to several rows, which all map back to it);
   `render_markdown` is now a thin wrapper over the mapped form with its
-  signature unchanged
+  signature unchanged. `find_tickets`/`TicketHit { key, row }` and
+  `render_markdown_tickets(text, width, cfg, cursor)` are, likewise, the
+  crate's ONLY ticket scan: detection happens DURING this same render pass
+  (styling a key and listing it as a hit are one walk, not two), so nothing
+  else in the crate may re-scan `note.text` for issue keys — see Gotchas for
+  what a second scan would disagree about
+- `src/tickets.rs` — the prefix→URL config (`tickets.json` in the note store
+  dir, loaded ONCE at construction — see Gotchas — forgiving parse,
+  `{key}`-less templates dropped so a keyless URL can never masquerade as a
+  working link), `ticket_url` (the pure, tested resolution), and the
+  `spawn`-only browser launch (`launch_command` picks `rundll32.exe
+  url.dll,FileProtocolHandler` / `open` / `xdg-open` by platform, asserted as
+  a `Command` rather than by actually launching anything; `open` adds the
+  null stdio and, on Windows, `CREATE_NO_WINDOW`, then `spawn`s and returns
+  the `Child` for the caller to reap)
 - `src/prompts.rs` — prompt capture storage for the `--capture-prompt` hook
   mode (a `UserPromptSubmit` hook piping its JSON payload into the binary; see
   Gotchas). One file PER PANE, not per tab —
@@ -590,6 +622,24 @@ Learned building this plugin:
   `w1:p2`. Determinism is what those keys are for and that is unaffected, but
   it is not numeric order — it only decides which of two equally-eligible
   panes wins, so nothing depends on it beyond being stable.
+- Ticket detection runs DURING render (`render_markdown_tickets`) and the hit
+  list is a draw product cached in `App.ticket_hits`, not a source scan. A
+  second scan over the raw note text would see `HM-**54561**` where the render
+  sees `HM-54561`; the counts diverge and the cursor ordinal slips onto the
+  wrong key. Same single-parser rule as `markdown::checkbox_lines`.
+- Hit rows index the FINAL preview line list, so `draw_preview` shifts them by
+  `block.len()` exactly as it shifts `map`. Forgetting that scrolls the
+  ticket cursor to a row in the prompt block.
+- A ratatui widget cannot emit OSC 8 hyperlinks and herdr owns pane mouse
+  events, so a mouse-clickable link is not reachable from this plugin at all.
+  `n`/`N`/`o` is not a stylistic choice, it is the only mechanism available.
+- `tickets.json` is read ONCE at construction (`App::new`, beside
+  `refresh_prompts`), never on the heartbeat: it changes ~never and the
+  heartbeat already does socket work. Editing it needs a pane restart.
+- `tickets::open` must `spawn`, never `output` — the `git_branch` freeze chain
+  applies verbatim (blocked event loop, no identity re-stamp, launcher REPLACEs
+  the pane, `pane close` takes the dirty buffer with it). The returned `Child`
+  is reaped on the heartbeat or unix leaves a zombie per `o`.
 
 ## README screenshots (Alex's criteria — follow on every reshoot)
 

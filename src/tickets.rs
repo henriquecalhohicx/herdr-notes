@@ -1,7 +1,5 @@
 //! Ticket links: the prefix→URL config and the browser launch.
 
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -69,9 +67,45 @@ pub fn ticket_url(cfg: &Config, key: &str) -> Option<String> {
     Some(cfg.map.get(prefix)?.replace("{key}", key))
 }
 
+/// The platform's URL handler, as a `Command` so it can be asserted without
+/// launching anything. `rundll32` rather than `cmd /c start` on Windows: `cmd`
+/// flashes a console over the TUI and its quoting mangles URLs containing `&`.
+fn launch_command(url: &str) -> std::process::Command {
+    let mut cmd = if cfg!(windows) {
+        let mut c = std::process::Command::new("rundll32.exe");
+        c.arg("url.dll,FileProtocolHandler");
+        c
+    } else if cfg!(target_os = "macos") {
+        std::process::Command::new("open")
+    } else {
+        std::process::Command::new("xdg-open")
+    };
+    cmd.arg(url);
+    cmd
+}
+
+/// Hands `url` to the platform browser. `spawn`, never `output`: a blocking
+/// wait here sits on the event-loop thread and would freeze input, drawing AND
+/// the 5s identity re-stamp — past 20s the launcher calls this live pane a
+/// corpse and REPLACEs it, and `pane close` kills with no signal, taking the
+/// dirty debounce buffer. Returns the child so the caller can reap it (unix
+/// would otherwise leave a zombie per open); `None` on any failure, silently.
+pub fn open(url: &str) -> Option<std::process::Child> {
+    let mut cmd = launch_command(url);
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    cmd.spawn().ok()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Config, FILE, ticket_url};
+    use super::{Config, FILE, launch_command, ticket_url};
 
     #[test]
     fn a_well_formed_map_loads() {
@@ -127,5 +161,24 @@ mod tests {
         std::fs::write(dir.join(FILE), r#"{"TT":"https://example.test/{key}"}"#).unwrap();
         assert!(Config::load_in(&dir).has_prefix("TT"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_launch_command_matches_the_platform() {
+        let cmd = launch_command("https://example.test/browse/HM-1");
+        let program = cmd.get_program().to_string_lossy().to_string();
+        let args: Vec<String> =
+            cmd.get_args().map(|a| a.to_string_lossy().to_string()).collect();
+        if cfg!(windows) {
+            assert_eq!(program, "rundll32.exe");
+            assert_eq!(args[0], "url.dll,FileProtocolHandler");
+        } else if cfg!(target_os = "macos") {
+            assert_eq!(program, "open");
+        } else {
+            assert_eq!(program, "xdg-open");
+        }
+        // The URL is a single argv entry: no shell, so nothing in it is
+        // interpreted (an `&` in a query string, for one).
+        assert_eq!(args.last().unwrap(), "https://example.test/browse/HM-1");
     }
 }

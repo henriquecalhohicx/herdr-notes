@@ -101,6 +101,27 @@ Edit:
 <img src="docs/media/edit.png" alt="Edit mode: the same note as plain markdown with a block cursor" width="920">
 </div>
 
+### Ticket links
+
+Issue keys in the note (`HM-54561`) are underlined once their prefix is
+configured. `n`/`N` walk them, `o` opens the selected one in your browser,
+`esc` drops the cursor.
+
+Create `tickets.json` next to the note files — `%LOCALAPPDATA%\herdr\plugins\herdr-notes\`
+on Windows, `~/.local/share/herdr/plugins/herdr-notes/` on unix:
+
+```json
+{
+  "HM": "https://your-org.atlassian.net/browse/{key}",
+  "CR": "https://your-tracker.example/issue/{key}"
+}
+```
+
+Only listed prefixes are detected, so an unmapped key is never highlighted and
+never pretends to be openable. The file is read once at startup: after editing
+it, close and reopen the Notes pane. A missing or malformed file simply turns
+the feature off.
+
 ## Persistence
 
 Each herdr tab gets its own note, stored as `<tab-key>.json` in herdr's
