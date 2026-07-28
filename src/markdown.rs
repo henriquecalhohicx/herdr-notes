@@ -188,6 +188,51 @@ pub fn toggle_checkbox(text: &str, line_idx: usize) -> Option<String> {
     Some(lines.join("\n"))
 }
 
+/// Byte ranges of every CONFIGURED issue key in `s`, left to right and
+/// non-overlapping. A key is an uppercase ASCII run of 2+, a `-`, then 1+
+/// ASCII digits, with a non-alphanumeric boundary on both sides — and its
+/// prefix must be in `cfg`, so an unmapped tracker is never highlighted and
+/// the ticket cursor can never land on something `o` cannot open.
+///
+/// The crate's ONE ticket scan. Anything that needs to know where the keys are
+/// goes through here, for the same reason the checkbox parser is single-homed:
+/// a second scan drifts.
+#[allow(dead_code)]
+pub fn find_tickets(s: &str, cfg: &crate::tickets::Config) -> Vec<std::ops::Range<usize>> {
+    fn keyish(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b == b'_'
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'-' {
+            i += 1;
+            continue;
+        }
+        // The uppercase run before the dash, then the digit run after it. Both
+        // walks stay inside ASCII, so `start`/`end` land on char boundaries.
+        let mut start = i;
+        while start > 0 && bytes[start - 1].is_ascii_uppercase() {
+            start -= 1;
+        }
+        let mut end = i + 1;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+        let long_enough = i - start >= 2 && end > i + 1;
+        let bounded = (start == 0 || !keyish(bytes[start - 1]))
+            && (end == bytes.len() || !keyish(bytes[end]));
+        if long_enough && bounded && cfg.has_prefix(&s[start..i]) {
+            out.push(start..end);
+            i = end;
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
 /// `---` / `***` / `___` (3+ of the same marker, spaces allowed between).
 fn is_hr(t: &str) -> bool {
     let bare: String = t.chars().filter(|c| !c.is_whitespace()).collect();
@@ -498,5 +543,46 @@ mod tests {
         let (lines, map) = render_markdown_mapped("", 40);
         assert_eq!(lines.len(), 1);
         assert_eq!(map, vec![None]);
+    }
+
+    fn cfg() -> crate::tickets::Config {
+        crate::tickets::Config::from_json(
+            r#"{"HM":"https://example.test/{key}","CR":"https://example.test/c/{key}"}"#,
+        )
+    }
+
+    fn keys(s: &str) -> Vec<String> {
+        find_tickets(s, &cfg()).into_iter().map(|r| s[r].to_string()).collect()
+    }
+
+    #[test]
+    fn the_matcher_finds_configured_keys_left_to_right() {
+        assert_eq!(keys("To estimate CR-3171 HM-54561"), ["CR-3171", "HM-54561"]);
+        assert_eq!(keys("HM-1"), ["HM-1"]);
+    }
+
+    #[test]
+    fn the_matcher_rejects_near_misses() {
+        for s in ["hm-1", "HM-", "H-1", "xHM-1", "HM-1x", "HM-1_", "-1", "HM1"] {
+            assert!(keys(s).is_empty(), "{s:?} is not a ticket key");
+        }
+    }
+
+    #[test]
+    fn the_matcher_skips_unconfigured_prefixes() {
+        assert!(keys("ABC-99").is_empty());
+    }
+
+    #[test]
+    fn the_matcher_tolerates_multibyte_neighbours() {
+        // `start` only walks back over ASCII uppercase, so the byte before it
+        // can be a UTF-8 continuation byte — slicing there must not panic.
+        assert_eq!(keys("café HM-7 —"), ["HM-7"]);
+    }
+
+    #[test]
+    fn punctuation_is_a_boundary() {
+        assert_eq!(keys("(HM-2), [HM-3]."), ["HM-2", "HM-3"]);
+        assert_eq!(keys("HM-4-final"), ["HM-4"]);
     }
 }
