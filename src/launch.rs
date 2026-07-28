@@ -110,6 +110,28 @@ fn token_stale(tokens: &serde_json::Map<String, serde_json::Value>, key: &str, n
     }
 }
 
+/// Whether THIS tab has a Notes pane that is alive right now: `Some(true)` when
+/// a pane in `tab_id` carries a `herdr-notes` heartbeat token that is present
+/// AND fresh, `Some(false)` when the list parsed and no such pane exists,
+/// `None` when the JSON could not be parsed at all.
+///
+/// Deliberately does NOT use [`Pane::is_notes`], which also accepts the "Notes"
+/// LABEL, nor [`token_stale`] alone, which reports a MISSING token as not
+/// stale. Both are right for the launcher — it must recognize a pane it has
+/// just labeled, before that pane's TUI has reported anything. Both are wrong
+/// for the capture gate, which needs evidence the pane is running: a label
+/// outlives a dead pane, the token does not.
+// Not yet called outside tests — the capture-gate wiring lands in Task 3.
+#[allow(dead_code)]
+pub fn notes_pane_fresh(pane_list_json: &str, tab_id: &str, now: u64) -> Option<bool> {
+    let msg = serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json)).ok()?;
+    Some(msg.result.panes.iter().any(|p| {
+        p.tab_id.as_deref() == Some(tab_id)
+            && p.tokens.contains_key(METADATA_SOURCE)
+            && !token_stale(&p.tokens, METADATA_SOURCE, now)
+    }))
+}
+
 /// `OPEN`, `FOCUS <id>`, `CLOSE <id>`, or `REPLACE <id>` (dead pane: close it,
 /// then open fresh) from a `pane list` JSON. Unparseable input, no focused
 /// pane, or an unsafe id all degrade to `OPEN`.
@@ -379,5 +401,57 @@ mod tests {
         let json = format!("\u{feff}{}", pane_list(FOCUSED));
         assert_eq!(launch_decision(&json, 100), "OPEN");
         assert!(focused_pane(&json).starts_with("w1:p1\t"));
+    }
+
+    #[test]
+    fn notes_pane_fresh_requires_a_present_and_fresh_token() {
+        let json = pane_list(
+            r#"{"pane_id":"w1:p2","tab_id":"w1:t1","tokens":{"herdr-notes":"95"}}"#,
+        );
+        assert_eq!(notes_pane_fresh(&json, "w1:t1", 100), Some(true), "5s old is fresh");
+        assert_eq!(notes_pane_fresh(&json, "w1:t9", 100), Some(false), "other tab");
+    }
+
+    #[test]
+    fn notes_pane_fresh_rejects_a_stale_token() {
+        // 60s old against a 20s threshold.
+        let json = pane_list(
+            r#"{"pane_id":"w1:p2","tab_id":"w1:t1","tokens":{"herdr-notes":"40"}}"#,
+        );
+        assert_eq!(notes_pane_fresh(&json, "w1:t1", 100), Some(false));
+    }
+
+    #[test]
+    fn notes_pane_fresh_rejects_a_missing_token_even_with_the_notes_label() {
+        // `token_stale` says "not stale" for an absent token and `is_notes`
+        // accepts the label alone — both right for the launcher, both wrong
+        // here. A label outlives a dead pane; the token does not.
+        let json = pane_list(
+            r#"{"pane_id":"w1:p2","tab_id":"w1:t1","label":"Notes"}"#,
+        );
+        assert_eq!(notes_pane_fresh(&json, "w1:t1", 100), Some(false));
+    }
+
+    #[test]
+    fn notes_pane_fresh_rejects_an_unparsable_token_value() {
+        let json = pane_list(
+            r#"{"pane_id":"w1:p2","tab_id":"w1:t1","tokens":{"herdr-notes":{"v":1}}}"#,
+        );
+        assert_eq!(notes_pane_fresh(&json, "w1:t1", 100), Some(false));
+    }
+
+    #[test]
+    fn notes_pane_fresh_is_none_on_unparsable_json() {
+        assert_eq!(notes_pane_fresh("not json", "w1:t1", 100), None);
+        assert_eq!(notes_pane_fresh("", "w1:t1", 100), None);
+    }
+
+    #[test]
+    fn notes_pane_fresh_strips_a_bom() {
+        let json = format!(
+            "\u{feff}{}",
+            pane_list(r#"{"pane_id":"w1:p2","tab_id":"w1:t1","tokens":{"herdr-notes":"95"}}"#)
+        );
+        assert_eq!(notes_pane_fresh(&json, "w1:t1", 100), Some(true));
     }
 }
