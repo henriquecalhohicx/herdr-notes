@@ -385,12 +385,16 @@ pub struct App {
     /// `pane.list` call at refresh time so the draw path stays I/O-free.
     prompt_labels: Vec<String>,
     /// Branch lookups already made, keyed by cwd: `Some(branch)` cached from a
-    /// success, `None` cached from a failure. Caching the SUCCESS matters under
-    /// re-derive — the chain runs every heartbeat, and a pane that later loses
-    /// its label must still be able to fall back to the branch it found the
-    /// first time. Caching the FAILURE is what bounds the spawn: without it a
-    /// tab that is not a repo would spawn `git` every 5 seconds for the life of
-    /// the pane. See `git_branch` for what a hang costs.
+    /// success, `None` cached from a failure. Caching the SUCCESS matters
+    /// because the empty-title path re-runs on EVERY heartbeat until
+    /// something fills it (`maybe_autotitle`'s no-demotion rule means a note
+    /// whose title is already set never asks the branch again at all) — so
+    /// without it, a tab that stays untitled for several beats (no pane
+    /// candidate yet, no prompt captured yet) would spawn `git` again on
+    /// every one of those beats, not just the first. Caching the FAILURE is
+    /// what bounds the spawn on the other side: without it a tab that is not
+    /// a repo would spawn `git` every 5 seconds for the life of the pane. See
+    /// `git_branch` for what a hang costs.
     git_tried: std::collections::HashMap<String, Option<String>>,
     confirm_clear: bool,
     dirty: bool,
@@ -729,9 +733,12 @@ impl App {
     ///
     /// An EXISTING title may only be REPLACED by a pane-derived candidate
     /// (source 1, below) — never demoted to the branch or a captured prompt.
-    /// An EMPTY title still runs the full chain, because filling one is the
-    /// whole feature. Without that split, re-deriving every beat can demote a
-    /// good title on its own, with no rename involved:
+    /// An EMPTY title (trimmed — a whitespace-only title from a hand-edited
+    /// or legacy file is "empty" here exactly as `title_auto`'s own
+    /// missing-field default treats it, `state::parse`) still runs the full
+    /// chain, because filling one is the whole feature. Without that split,
+    /// re-deriving every beat can demote a good title on its own, with no
+    /// rename involved:
     ///   - `heartbeat` collapses `index` to `None` on any transient
     ///     `pane.list` failure, which silently drops sources 1 and 2 for that
     ///     one beat only; the chain would fall through to whatever prompt
@@ -763,7 +770,7 @@ impl App {
         // `nice_title` that `pick_title` uses, so the two can never disagree
         // about whether source 1 hit.
         let source1 = agent_pane.and_then(PaneInfo::nice_title);
-        let title = if self.note.title.is_empty() {
+        let title = if self.note.title.trim().is_empty() {
             let cwd = agent_pane.and_then(|p| p.cwd.clone());
             // Only compute the branch — and only then bear its process-spawn
             // cost — once source 1 has actually missed: when source 1 hits,
@@ -2490,9 +2497,11 @@ mod tests {
 
     #[test]
     fn git_branch_caches_a_success_and_reuses_it() {
-        // Under re-derive the chain runs repeatedly. Without caching, a pane
-        // that loses its label would fall PAST the branch to the prompt text,
-        // because that cwd's one attempt was already spent.
+        // While a title is still empty, `maybe_autotitle` asks the branch
+        // again on every heartbeat (a note whose title is already set never
+        // asks at all — see the no-demotion rule there). Without caching the
+        // success, an untitled tab with no pane candidate yet would spawn
+        // `git` again on every one of those beats, not just the first.
         let mut a = app("body");
         let cwd = std::env::current_dir().unwrap().display().to_string();
         let first = a.git_branch(&cwd);
@@ -2723,6 +2732,39 @@ mod tests {
     }
 
     #[test]
+    fn maybe_autotitle_fills_a_whitespace_only_title_the_same_as_an_empty_one() {
+        // `state::parse`'s `title_auto` missing-field default is
+        // `title.trim().is_empty()` (`src/state.rs`), so a whitespace-only
+        // title from a hand-edited or legacy file reads as auto/derivable.
+        // `maybe_autotitle`'s empty-vs-set split has to agree: a bare
+        // `.is_empty()` there would read "   " as already SET, permanently
+        // blocking the branch/prompt from ever filling it (only a
+        // pane-derived candidate could, and none exists here).
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = swap_env(&[("HERDR_TAB_ID", Some(std::ffi::OsStr::new("w1:t1")))]);
+
+        let mut a = app("a real body");
+        a.persist = true;
+        a.note.title = "   ".into();
+        a.note.title_auto = true;
+        a.prompts = vec![crate::prompts::PromptGroup {
+            pane: "w1:p5".into(),
+            prompts: vec![crate::prompts::Prompt {
+                ts: 1,
+                pane: "w1:p5".into(),
+                agent: "claude".into(),
+                text: "why is auth flaky".into(),
+            }],
+        }];
+
+        a.maybe_autotitle(None);
+        assert_eq!(a.note.title, "why is auth flaky", "a whitespace-only title must still be fillable");
+        assert!(a.dirty, "filling a title is a real edit");
+
+        restore_env(prev);
+    }
+
+    #[test]
     fn maybe_autotitle_never_demotes_an_existing_title_when_the_index_is_lost() {
         // `heartbeat` collapses `index` to `None` on any transient
         // `pane.list` failure. Without the no-demotion rule, re-derive would
@@ -2821,6 +2863,42 @@ mod tests {
         a.maybe_autotitle(Some(&idx));
         assert_eq!(a.note.title, "checkout-tests", "a new pane label still replaces an existing non-pane title");
         assert!(a.dirty, "a genuine pane-derived change must autosave");
+
+        restore_env(prev);
+    }
+
+    #[test]
+    fn maybe_autotitle_does_not_dirty_when_the_pane_label_still_matches_the_title() {
+        // The compare-before-write guard (`title != self.note.title`) is
+        // what stops a labelled pane with a STABLE label from `touch()`ing
+        // the note on every single heartbeat forever — source 1 resolves to
+        // the same string every beat, so without the guard `updated` would
+        // keep bumping and the header age would reset to `just now` on a
+        // loop. None of the other autotitle tests reach this: they either
+        // start from an empty title (nothing to compare against) or change
+        // the pane's candidate (so the guard sees a genuine difference) —
+        // this is the only one where a live, reachable `Some` candidate
+        // equals the note's current title.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = swap_env(&[("HERDR_TAB_ID", Some(std::ffi::OsStr::new("w1:t1")))]);
+
+        let mut idx = PaneIndex::new();
+        idx.insert("w1:p5".into(), PaneInfo {
+            agent: "claude".into(),
+            tab_id: "w1:t1".into(),
+            title: None,
+            cwd: None,
+            label: Some("auth-refactor".into()),
+        });
+
+        let mut a = app("a real body");
+        a.persist = true;
+        a.note.title = "auth-refactor".into(); // already derived from this very label
+        a.note.title_auto = true;
+
+        a.maybe_autotitle(Some(&idx));
+        assert_eq!(a.note.title, "auth-refactor");
+        assert!(!a.dirty, "an unchanged pane-derived candidate must not touch() the note");
 
         restore_env(prev);
     }
