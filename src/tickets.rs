@@ -56,12 +56,15 @@ impl Config {
     }
 
     /// The real load: `tickets.json` in the note store dir, so it follows the
-    /// same three-tier resolution the note files use.
+    /// same three-tier resolution the note files use. Collapses EVERY
+    /// failure (absent, unreadable) to an empty config — right for a one-time
+    /// startup read, where there is no previous good config to protect. The
+    /// heartbeat's hot-reload cannot afford that collapse (see `try_load`).
     pub fn load() -> Self {
-        config_path()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .map(|s| Self::from_json(&s))
-            .unwrap_or_default()
+        match try_load() {
+            LoadResult::Loaded(cfg) => cfg,
+            LoadResult::Absent | LoadResult::ReadError => Self::default(),
+        }
     }
 
     pub fn has_prefix(&self, prefix: &str) -> bool {
@@ -74,6 +77,41 @@ impl Config {
     #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
+    }
+}
+
+/// The outcome of one attempt to read `tickets.json`, distinguishing "no
+/// file" — a real, non-error state, the feature legitimately dormant — from
+/// "the file exists but the read failed" — an AV scan, a sharing violation
+/// while an editor rewrites it, a network store hiccup, always transient.
+/// `Config::load` collapses both to an empty config (right for a one-time
+/// startup read, nothing to protect); the heartbeat's hot-reload cannot make
+/// that same collapse, because it also decides whether to stamp the new
+/// mtime — stamping it on a transient read failure would turn the feature
+/// off and leave it dormant until the user next touches the file, since
+/// nothing else would ever make the mtime "move" again.
+#[derive(Debug)]
+pub enum LoadResult {
+    /// No file at this path (including when the store dir itself could not
+    /// be resolved).
+    Absent,
+    /// Read and parsed — parsing itself never fails, see `Config::from_json`.
+    Loaded(Config),
+    /// The file exists but reading it failed. The caller must not treat this
+    /// as "the config is now empty" and must not remember the mtime it was
+    /// chasing when this happened.
+    ReadError,
+}
+
+/// One attempt to read `tickets.json`, classified per `LoadResult`. The seam
+/// the heartbeat's hot-reload decides against, kept separate from `load` so
+/// each caller can want a different thing from the same read.
+pub fn try_load() -> LoadResult {
+    let Some(path) = config_path() else { return LoadResult::Absent };
+    match std::fs::read_to_string(&path) {
+        Ok(s) => LoadResult::Loaded(Config::from_json(&s)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => LoadResult::Absent,
+        Err(_) => LoadResult::ReadError,
     }
 }
 
@@ -122,7 +160,7 @@ pub fn open(url: &str) -> Option<std::process::Child> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, FILE, config_path, launch_command, ticket_url};
+    use super::{Config, FILE, LoadResult, config_path, launch_command, ticket_url, try_load};
 
     #[test]
     fn a_well_formed_map_loads() {
@@ -187,10 +225,61 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("notes-cfgpath-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        // Restore whatever this var held BEFORE the test, matching the
+        // swap/restore convention used everywhere else in the crate
+        // (`app.rs`'s `swap_env`/`restore_env`) rather than an unconditional
+        // `remove_var` — a bare remove is only correct when nothing else in
+        // the same test binary ever needs this var set, which is not
+        // something a single test may assume.
+        let prev = std::env::var_os("HERDR_PLUGIN_STATE_DIR");
         // SAFETY: serialized by ENV_LOCK; restored below.
         unsafe { std::env::set_var("HERDR_PLUGIN_STATE_DIR", &dir) };
         assert_eq!(config_path(), Some(dir.join(FILE)));
-        unsafe { std::env::remove_var("HERDR_PLUGIN_STATE_DIR") };
+        // SAFETY: serialized by ENV_LOCK.
+        unsafe {
+            match prev {
+                Some(val) => std::env::set_var("HERDR_PLUGIN_STATE_DIR", val),
+                None => std::env::remove_var("HERDR_PLUGIN_STATE_DIR"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn try_load_distinguishes_absent_from_unreadable() {
+        // The classification the heartbeat's hot-reload decides against
+        // (Important 3): "no file" must stamp the new mtime (a real,
+        // non-error state); a genuine read failure must not, or the retry
+        // that would otherwise fire next beat never happens. Forcing a real
+        // I/O error portably (no permissions API, works the same on Windows
+        // and Unix): put a DIRECTORY where the file is expected. `metadata`
+        // on it succeeds — its mtime would look like "the file changed" —
+        // but `read_to_string` fails, which is exactly the shape a sharing
+        // violation or a network hiccup takes from this function's point of
+        // view.
+        let _guard = crate::state::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("notes-tickets-seam-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let prev = std::env::var_os("HERDR_PLUGIN_STATE_DIR");
+        // SAFETY: serialized by ENV_LOCK; restored below.
+        unsafe { std::env::set_var("HERDR_PLUGIN_STATE_DIR", &dir) };
+
+        assert!(matches!(try_load(), LoadResult::Absent), "no file at all is Absent, not an error");
+
+        std::fs::create_dir_all(dir.join(FILE)).unwrap();
+        assert!(
+            matches!(try_load(), LoadResult::ReadError),
+            "a path that exists but cannot be read as a file is ReadError, not Absent"
+        );
+
+        // SAFETY: serialized by ENV_LOCK.
+        unsafe {
+            match prev {
+                Some(val) => std::env::set_var("HERDR_PLUGIN_STATE_DIR", val),
+                None => std::env::remove_var("HERDR_PLUGIN_STATE_DIR"),
+            }
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

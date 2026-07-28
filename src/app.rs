@@ -633,13 +633,32 @@ impl App {
         // identity re-stamp. A missing file gives `None`, which differs from a
         // stamped `Some` and so reloads to an empty config — the feature going
         // dormant, symmetric with never having had a config at all.
+        //
+        // `tickets_mtime` is stamped ONLY on `Absent`/`Loaded` — both real
+        // outcomes, either of which means this mtime has been fully dealt
+        // with. A `ReadError` (AV scan, a sharing violation while an editor
+        // rewrites the file, a network store hiccup) leaves it untouched, so
+        // the identical stat next beat still reads as "changed" and retries —
+        // stamping it here would silently and PERMANENTLY disable the
+        // feature, since nothing else would ever make the mtime move again.
+        // The truncate-then-write case still self-heals on its own: the
+        // content write bumps the mtime a second time.
         if self.persist {
             let mtime = crate::tickets::config_path()
                 .and_then(|p| std::fs::metadata(p).ok())
                 .and_then(|m| m.modified().ok());
             if mtime != self.tickets_mtime {
-                self.tickets_mtime = mtime;
-                self.tickets = crate::tickets::Config::load();
+                match crate::tickets::try_load() {
+                    crate::tickets::LoadResult::Absent => {
+                        self.tickets_mtime = mtime;
+                        self.tickets = crate::tickets::Config::default();
+                    }
+                    crate::tickets::LoadResult::Loaded(cfg) => {
+                        self.tickets_mtime = mtime;
+                        self.tickets = cfg;
+                    }
+                    crate::tickets::LoadResult::ReadError => {}
+                }
             }
         }
         self.report_tokens();
@@ -1246,10 +1265,21 @@ impl App {
     /// cursored hit; with no cursor it is the header TITLE's first link, which
     /// is where the ticket usually is and which no cursor can reach. Separate
     /// from `open_ticket` so the resolution is testable without a browser.
+    ///
+    /// The no-cursor arm is gated on `showing_tab_note()`: in Global mode
+    /// `self.note` IS the shared global note, whose title is user-settable
+    /// with `r` ungated on which note is showing, but the header renders
+    /// `— ★ Global` and never a title in that mode. Without this gate, `o`
+    /// could open a link derived from text the user was never shown — the
+    /// governing rule this feature does not get to break just because a
+    /// second document was added later (see the two-document-buffer Gotchas).
     fn pending_open(&self) -> Option<String> {
         let (text, kind) = match self.link_cursor.and_then(|c| self.link_hits.get(c)) {
             Some(hit) => (hit.text.clone(), hit.kind),
             None => {
+                if !self.showing_tab_note() {
+                    return None;
+                }
                 let (range, kind) =
                     markdown::find_links(&self.note.title, &self.tickets).into_iter().next()?;
                 (self.note.title[range].to_string(), kind)
@@ -1544,8 +1574,16 @@ impl App {
         // whichever cursor is live (checkbox or link), so it is offered only
         // in `HINTS_BOX`/`HINTS_LINK`, not `HINTS_PREVIEW` — advertising it
         // with no cursor live would spend scarce columns on a key that does
-        // nothing. `o open` is `HINTS_LINK`-only for the same reason: it only
-        // does something once a link cursor exists.
+        // nothing. `o open` is `HINTS_LINK`-only too, but NOT for that same
+        // reason any more: bare `o` (no cursor live) opens the title's first
+        // link, so it is never a no-op key. It stays out of `HINTS_PREVIEW`
+        // because most notes have no link in their title at all, so
+        // advertising it there would spend scarce columns on a key with
+        // nothing to open more often than not — whereas once a link cursor
+        // exists (`n`/`N`), `o` is guaranteed a target, the cursored hit
+        // itself. Whether `o open` belongs in `HINTS_PREVIEW` regardless is a
+        // separate product decision, not settled here — the token tables
+        // themselves are unchanged.
         let hints = match self.note.mode {
             Mode::Preview => {
                 let tokens = if self.link_cursor.is_some() {
@@ -2569,7 +2607,14 @@ mod tests {
 
     #[test]
     fn the_highlight_and_the_open_target_agree_across_both_regions() {
-        // The one place two hit lists must agree on an order.
+        // The one place two hit lists must agree on an order. Presence alone
+        // (`reversed.contains(expected)`) is not enough: deleting the
+        // `checked_sub` in `draw_preview` and passing `link_cursor` straight
+        // to the body render — the exact regression this split guards
+        // against — would highlight BOTH the block hit and the body hit for
+        // the same ordinal, and a presence-only check would still pass. So
+        // for each ordinal we also assert the OTHER region's link is NOT
+        // reversed.
         let mut a = ticket_app("body HM-2 here\n");
         a.prompts = vec![crate::prompts::PromptGroup {
             pane: "w1:p5".into(),
@@ -2577,7 +2622,7 @@ mod tests {
         }];
         a.prompt_labels = vec!["claude p5".into()];
         rendered(&mut a, 60, 20);
-        for (ordinal, expected) in [(0usize, "HM-1"), (1, "HM-2")] {
+        for (ordinal, expected, other) in [(0usize, "HM-1", "HM-2"), (1, "HM-2", "HM-1")] {
             a.link_cursor = Some(ordinal);
             let mut term =
                 ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 20)).unwrap();
@@ -2590,6 +2635,10 @@ mod tests {
                 .map(|c| c.symbol().to_string())
                 .collect();
             assert!(reversed.contains(expected), "ordinal {ordinal}: reversed={reversed:?}");
+            assert!(
+                !reversed.contains(other),
+                "ordinal {ordinal}: the region NOT selected must stay unhighlighted, reversed={reversed:?}"
+            );
             assert!(a.pending_open().unwrap().ends_with(expected));
         }
     }
@@ -2605,6 +2654,25 @@ mod tests {
         a.prompt_labels = vec!["claude p5".into()];
         rendered(&mut a, 60, 20);
         assert_eq!(a.link_hits.len(), 1, "the empty-note path must not drop block hits");
+        // The empty-note branch renders the block, then the help text, with
+        // no body lines at all — so the hit's row must land inside the
+        // block's own line count, not spill into the help (which maps to no
+        // source line and carries no hits of its own).
+        let (block_lines, _) = prompt_block(&a.labelled_prompts(), 59, &a.tickets, None);
+        assert!(
+            a.link_hits[0].row < block_lines.len(),
+            "hit row {} must point into the block (len {})",
+            a.link_hits[0].row,
+            block_lines.len()
+        );
+        // And `pending_open` must actually resolve through this path — the
+        // body is empty, so the only way this can succeed is via the block.
+        a.link_cursor = Some(0);
+        assert_eq!(
+            a.pending_open().as_deref(),
+            Some("https://example.test/browse/HM-1"),
+            "pending_open must resolve the block hit on a titled, body-less note"
+        );
     }
 
     #[test]
@@ -3487,6 +3555,54 @@ mod tests {
         a.last_beat = Instant::now() - HEARTBEAT_EVERY;
         a.heartbeat();
         assert!(a.tickets.is_empty(), "a deleted config turns the feature off");
+
+        restore_env(prev);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_transient_read_failure_does_not_cache_the_new_mtime() {
+        // Important 3: `tickets_mtime` must be stamped only on a REAL
+        // outcome (file absent, or read+parsed) — never on a read failure.
+        // Stamping it on a transient failure (AV scan, a sharing violation
+        // while an editor rewrites the file, a network store hiccup) turns
+        // the feature off and leaves it dormant until the user next touches
+        // the file, since nothing else would ever make the mtime "move"
+        // again. Forced portably (no permissions API needed, same on
+        // Windows and Unix): a DIRECTORY in place of the file gives a real
+        // `metadata` success — a new, different mtime, so the beat sees it
+        // as "changed" — but a real `read_to_string` failure, the same
+        // shape `try_load` sees from an actual sharing violation.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("notes-hotreload-err-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("no-such.sock");
+        let prev = swap_env(&[
+            ("HERDR_PLUGIN_STATE_DIR", Some(dir.as_os_str())),
+            ("HERDR_TAB_ID", Some(std::ffi::OsStr::new("w1:t1"))),
+            ("HERDR_PANE_ID", None),
+            ("HERDR_SOCKET_PATH", Some(sock.as_os_str())),
+        ]);
+
+        let mut a = App::new();
+        let path = dir.join(crate::tickets::FILE);
+        std::fs::write(&path, r#"{"TT":"https://example.test/{key}"}"#).unwrap();
+        a.last_beat = Instant::now() - HEARTBEAT_EVERY;
+        a.heartbeat();
+        assert!(a.tickets.has_prefix("TT"), "a real config is picked up");
+        let good_mtime = a.tickets_mtime;
+
+        // Replace the file with a directory of the same name.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir_all(&path).unwrap();
+        a.last_beat = Instant::now() - HEARTBEAT_EVERY;
+        a.heartbeat();
+        assert!(a.tickets.has_prefix("TT"), "a read failure must not clear the existing config");
+        assert_eq!(
+            a.tickets_mtime, good_mtime,
+            "a read failure must not cache the mtime it was chasing, or the retry never fires"
+        );
 
         restore_env(prev);
         let _ = std::fs::remove_dir_all(&dir);
@@ -5399,5 +5515,30 @@ mod tests {
         assert_eq!(a.pending_open(), None);
         a.on_key(key(KeyCode::Char('o')));
         assert!(a.open_children.is_empty());
+    }
+
+    #[test]
+    fn bare_o_ignores_the_tab_notes_title_while_showing_global() {
+        // `self.note` IS the global note in Global mode, and its title is
+        // user-settable with `r` ungated on `showing_tab_note()` — but the
+        // header shows `— ★ Global` and never a title in that mode. Without
+        // the gate in `pending_open`, `o` would launch a browser at a link
+        // derived from text nowhere on screen.
+        let mut a = ticket_app("body with no keys\n");
+        a.note.title = "titled HM-1".into();
+        a.active = ActiveNote::Global;
+        rendered(&mut a, 60, 10);
+        assert_eq!(a.pending_open(), None);
+        a.on_key(key(KeyCode::Char('o')));
+        assert!(a.open_children.is_empty(), "o must spawn nothing");
+    }
+
+    #[test]
+    fn bare_o_opens_the_first_of_two_links_in_the_title() {
+        // The README promises "first"; nothing previously pinned `.next()`.
+        let mut a = ticket_app("body with no keys\n");
+        a.note.title = "HM-1 and HM-2".into();
+        rendered(&mut a, 60, 10);
+        assert_eq!(a.pending_open().as_deref(), Some("https://example.test/browse/HM-1"));
     }
 }

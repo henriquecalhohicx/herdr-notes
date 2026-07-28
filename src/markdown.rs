@@ -319,9 +319,11 @@ pub fn find_links(
 /// Byte ranges of bare `http://` / `https://` URLs. The scheme is matched
 /// case-insensitively, needs a non-alphanumeric boundary on its LEFT (a match
 /// may start at offset 0, or the preceding byte must not be ASCII
-/// alphanumeric — mirrors the ticket key boundary below), the URL runs to the
-/// next whitespace, and at least one non-whitespace character must follow
-/// `//` — a bare scheme is not a link.
+/// alphanumeric — narrower than the ticket key boundary above, which also
+/// rejects a preceding `_` via `keyish`; this check does not, so `foo_https://x`
+/// IS a URL while `foo_HM-1` is NOT a key), the URL runs to the next
+/// whitespace, and at least one non-whitespace character must follow `//` —
+/// a bare scheme is not a link.
 fn find_url_ranges(s: &str) -> Vec<std::ops::Range<usize>> {
     const SCHEMES: [&str; 2] = ["https://", "http://"];
     let bytes = s.as_bytes();

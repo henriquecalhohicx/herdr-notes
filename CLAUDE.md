@@ -181,14 +181,18 @@ findings doc (and the reference implementation, `herdr-sidebar`) lives in
   anything; `open` adds the null stdio and, on Windows, `CREATE_NO_WINDOW`,
   then `spawn`s and returns the `Child` for the caller to reap). `config_path`
   is the one place the file's location is spelled — `crate::state::store_dir`
-  plus `FILE` — shared by `Config::load` and, since Task 6, the heartbeat's
-  hot-reload: `App.tickets_mtime` caches the file's `modified()` time from the
-  last read, the heartbeat re-`stat`s it every 5s (gated on `self.persist`,
-  so unit tests never touch the real store), and only calls `Config::load`
-  again when the mtime actually moved — a missing file gives `None`, which
-  differs from any stamped `Some` and so reloads to an empty `Config`,
-  turning the feature dormant exactly as if it had never been configured
-  (see Gotchas)
+  plus `FILE` — shared by `Config::load` and the heartbeat's hot-reload, added
+  later so an edited `tickets.json` takes effect without restarting the pane:
+  `App.tickets_mtime` caches the file's `modified()` time from the last read,
+  the heartbeat re-`stat`s it every 5s (gated on `self.persist`, so unit tests
+  never touch the real store), and only reloads when the mtime actually
+  moved — a missing file gives `None`, which differs from any stamped `Some`
+  and so reloads to an empty `Config`, turning the feature dormant exactly as
+  if it had never been configured. The reload itself goes through
+  `tickets::try_load`, whose `LoadResult` distinguishes "no file" (a real,
+  stamp-worthy outcome) from "the file exists but the read failed" (a
+  transient error the heartbeat must NOT cache the new mtime against, or the
+  retry that would otherwise fire next beat never happens — see Gotchas)
 - `src/prompts.rs` — prompt capture storage for the `--capture-prompt` hook
   mode (a `UserPromptSubmit` hook piping its JSON payload into the binary; see
   Gotchas). One file PER PANE, not per tab —
@@ -741,6 +745,19 @@ Learned building this plugin:
   applies verbatim (blocked event loop, no identity re-stamp, launcher REPLACEs
   the pane, `pane close` takes the dirty buffer with it). The returned `Child`
   is reaped on the heartbeat or unix leaves a zombie per `o`.
+- `clamp_link_cursor` runs AFTER the frame is rendered (`draw_preview` builds
+  `lines`/`map`/hits first, then clamps), so the single frame following an
+  edit that removed links renders with the STALE ordinal — nothing highlighted,
+  because it points past the end of the new, shorter hit list — and only the
+  very next `o` opens the already-clamped hit. One frame of no highlight,
+  accepted; do not "fix" it by re-rendering after the clamp.
+- The block/body ordinal offset (`block_hits.len()`) moves whenever the
+  block's own hit count changes — a heartbeat delivering a new prompt that
+  contains a link, or a resize that pushes a block link past `truncate_w` and
+  drops it. Highlight and open target still agree with each other (both
+  re-derive from the one `link_hits` list on the same draw), but a link
+  cursor left live across such a change can silently retarget to a different
+  link than the one the user pointed it at.
 
 ## README screenshots (Alex's criteria — follow on every reshoot)
 
