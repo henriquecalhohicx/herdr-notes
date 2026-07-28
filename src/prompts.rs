@@ -16,6 +16,10 @@ use std::path::{Path, PathBuf};
 pub const RING: usize = 3;
 /// Characters kept per prompt, ellipsis included.
 pub const MAX_CHARS: usize = 120;
+/// Wall-clock bound on the capture gate's `pane.list` call. Well short of the
+/// hook's own `timeout: 5`, because a hook killed at its limit is a risk to the
+/// user's prompt and this path must never approach it.
+pub const GATE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(300);
 
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Prompt {
@@ -179,9 +183,22 @@ impl CaptureEnv {
 /// inside a prompt-submit hook.
 ///
 /// Gates, in order: the off switch, running inside herdr, filename-safe tab
-/// AND pane ids (no legacy fallback — prompts are per-tab or nothing), an
-/// existing note file for the tab, and a usable payload.
-pub fn capture(dir: Option<&Path>, env: &CaptureEnv, stdin: &str, now: u64) -> bool {
+/// AND pane ids (no legacy fallback — prompts are per-tab or nothing), a live
+/// Notes pane in this tab OR an existing note file, and a usable payload.
+///
+/// `notes_live` is injected so every gate stays testable without a socket:
+/// `Some(true)` a Notes pane in this tab is alive, `Some(false)` the socket
+/// answered and none is, `None` the socket could not be reached. It is
+/// ADDITIVE — it can only open the gate earlier, never close it on something
+/// that captures today — so a socket failure degrades to the note-file check
+/// rather than to silent no-capture.
+pub fn capture(
+    dir: Option<&Path>,
+    env: &CaptureEnv,
+    stdin: &str,
+    now: u64,
+    notes_live: Option<bool>,
+) -> bool {
     if env.no_capture || !env.in_herdr {
         return false;
     }
@@ -193,13 +210,10 @@ pub fn capture(dir: Option<&Path>, env: &CaptureEnv, stdin: &str, now: u64) -> b
     else {
         return false;
     };
-    // No note for this tab means the user has not opened Notes here; writing
-    // would leave a file behind for a tab that never wanted one. The path
-    // comes from `state::note_file_in` rather than being spelled again here:
-    // this runs in a SECOND process, and a note layout that grew a suffix or a
-    // subdirectory would otherwise stop capture silently, with no diagnostic
-    // anywhere (the hook prints nothing by design).
-    if !crate::state::note_file_in(dir, &tab_key).exists() {
+    // A live Notes pane means the user is looking at this tab's note right
+    // now, so capture without waiting for them to type something into it —
+    // an empty note is `state::is_blank` and therefore has no file at all.
+    if notes_live != Some(true) && !crate::state::note_file_in(dir, &tab_key).exists() {
         return false;
     }
     let Some(text) = payload_prompt(stdin) else {
@@ -212,14 +226,41 @@ pub fn capture(dir: Option<&Path>, env: &CaptureEnv, stdin: &str, now: u64) -> b
     true
 }
 
-/// `capture` against the real environment and store dir.
+/// `capture` against the real environment, store dir, and herdr socket.
 pub fn capture_from_env(stdin: &str) -> bool {
-    capture(
-        crate::state::store_dir().as_deref(),
-        &CaptureEnv::from_process(),
-        stdin,
-        crate::state::unix_now(),
-    )
+    let env = CaptureEnv::from_process();
+    let now = crate::state::unix_now();
+    // `capture` itself stays the sole authority on whether to write — this is
+    // only about not paying for a `pane.list` round trip when the answer
+    // could not possibly change what `capture` decides. Skip the socket for
+    // the off switch, outside herdr, an unusable payload, and an unsafe or
+    // missing tab/pane id: all of these reject unconditionally in `capture`
+    // regardless of `notes_live`, and the off switch in particular exists so
+    // a user can opt out of exactly this kind of round trip on every prompt
+    // they submit. `payload_prompt` is a JSON parse with no I/O, so checking
+    // it here is cheap — it does mean the payload gets parsed twice per
+    // capture (once here, once at gate 5 below), which is fine given it's
+    // pure and allocation-light, but is worth naming so it doesn't read as an
+    // accident. The id check asks the SAME question gate 3 does, through the
+    // same `state::id_key`, rather than a second safety predicate that could
+    // drift from it — a bare presence check (`tab_id.is_some()`) would still
+    // let an unsafe id (e.g. "bad id") through to the socket, only to be
+    // rejected afterward at gate 3.
+    let notes_live = (!env.no_capture && env.in_herdr && payload_prompt(stdin).is_some())
+        .then_some(())
+        .and_then(|()| {
+            let tab = env.tab_id.as_deref()?;
+            let pane = env.pane_id.as_deref()?;
+            crate::state::id_key(tab)?;
+            crate::state::id_key(pane)?;
+            Some(tab)
+        })
+        .and_then(|tab| {
+            crate::ipc::call_text_bounded("pane.list", serde_json::json!({}), GATE_TIMEOUT)
+                .ok()
+                .and_then(|json| crate::launch::notes_pane_fresh(&json, tab, now))
+        });
+    capture(crate::state::store_dir().as_deref(), &env, stdin, now, notes_live)
 }
 
 #[cfg(test)]
@@ -528,7 +569,7 @@ mod tests {
     #[test]
     fn capture_writes_a_condensed_entry_when_every_gate_passes() {
         let dir = store_with_note("gate_pass");
-        assert!(capture(Some(&dir), &env_ok(), r#"{"prompt":"fix the auth test\nsecond line"}"#, 99));
+        assert!(capture(Some(&dir), &env_ok(), r#"{"prompt":"fix the auth test\nsecond line"}"#, 99, None));
         let got = captured(&dir);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].text, "fix the auth test", "first line only");
@@ -542,7 +583,7 @@ mod tests {
     fn capture_gate_1_off_switch() {
         let dir = store_with_note("gate1");
         let env = CaptureEnv { no_capture: true, ..env_ok() };
-        assert!(!capture(Some(&dir), &env, r#"{"prompt":"x"}"#, 1));
+        assert!(!capture(Some(&dir), &env, r#"{"prompt":"x"}"#, 1, None));
         assert_eq!(captured(&dir), vec![]);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -551,7 +592,7 @@ mod tests {
     fn capture_gate_2_outside_herdr() {
         let dir = store_with_note("gate2");
         let env = CaptureEnv { in_herdr: false, ..env_ok() };
-        assert!(!capture(Some(&dir), &env, r#"{"prompt":"x"}"#, 1));
+        assert!(!capture(Some(&dir), &env, r#"{"prompt":"x"}"#, 1, None));
         assert_eq!(captured(&dir), vec![]);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -565,7 +606,7 @@ mod tests {
             CaptureEnv { pane_id: None, ..env_ok() },
             CaptureEnv { pane_id: Some("../escape".into()), ..env_ok() },
         ] {
-            assert!(!capture(Some(&dir), &env, r#"{"prompt":"x"}"#, 1));
+            assert!(!capture(Some(&dir), &env, r#"{"prompt":"x"}"#, 1, None));
         }
         assert_eq!(captured(&dir), vec![], "no legacy fallback: per-tab or nothing");
         let _ = std::fs::remove_dir_all(&dir);
@@ -576,7 +617,7 @@ mod tests {
         let dir = tempdir().join("gate4");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        assert!(!capture(Some(&dir), &env_ok(), r#"{"prompt":"x"}"#, 1));
+        assert!(!capture(Some(&dir), &env_ok(), r#"{"prompt":"x"}"#, 1, None));
         assert_eq!(captured(&dir), vec![], "no note, no capture, no file");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -585,7 +626,7 @@ mod tests {
     fn capture_gate_5_unusable_payloads() {
         let dir = store_with_note("gate5");
         for stdin in ["", "not json", r#"{}"#, r#"{"prompt":""}"#, r#"{"prompt":"  "}"#] {
-            assert!(!capture(Some(&dir), &env_ok(), stdin, 1), "stdin {stdin:?} must not write");
+            assert!(!capture(Some(&dir), &env_ok(), stdin, 1, None), "stdin {stdin:?} must not write");
         }
         assert_eq!(captured(&dir), vec![]);
         let _ = std::fs::remove_dir_all(&dir);
@@ -593,7 +634,7 @@ mod tests {
 
     #[test]
     fn capture_without_a_store_dir_is_a_noop() {
-        assert!(!capture(None, &env_ok(), r#"{"prompt":"x"}"#, 1));
+        assert!(!capture(None, &env_ok(), r#"{"prompt":"x"}"#, 1, None));
     }
 
     #[test]
@@ -601,12 +642,253 @@ mod tests {
         let dir = store_with_note("per_pane");
         let p5 = CaptureEnv { pane_id: Some("w1:p5".into()), ..env_ok() };
         let p6 = CaptureEnv { pane_id: Some("w1:p6".into()), ..env_ok() };
-        assert!(capture(Some(&dir), &p5, r#"{"prompt":"from p5"}"#, 10));
-        assert!(capture(Some(&dir), &p6, r#"{"prompt":"from p6"}"#, 20));
+        assert!(capture(Some(&dir), &p5, r#"{"prompt":"from p5"}"#, 10, None));
+        assert!(capture(Some(&dir), &p6, r#"{"prompt":"from p6"}"#, 20, None));
         assert!(prompts_file(&dir, "w1_t1", &crate::state::id_key("w1:p5").unwrap()).exists());
         assert!(prompts_file(&dir, "w1_t1", &crate::state::id_key("w1:p6").unwrap()).exists());
         let got = captured(&dir);
         assert_eq!(got.iter().map(|p| p.text.as_str()).collect::<Vec<_>>(), vec!["from p6", "from p5"]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn capture_needs_no_note_file_when_a_notes_pane_is_live() {
+        // The whole point of the phase: opening Notes is enough, without
+        // typing anything into the note first.
+        let dir = tempdir().join("gate_live_pane");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(capture(Some(&dir), &env_ok(), r#"{"prompt":"from a live pane"}"#, 7, Some(true)));
+        let got = load_for_tab(&dir, &crate::state::id_key("w1:t1").unwrap());
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].prompts[0].text, "from a live pane");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn capture_falls_back_to_the_note_file_when_no_pane_is_live() {
+        // Socket answered "no live Notes pane": everything that captures today
+        // must keep capturing. The answer is additive, never subtractive.
+        let dir = store_with_note("gate_no_pane");
+        assert!(capture(Some(&dir), &env_ok(), r#"{"prompt":"still captured"}"#, 7, Some(false)));
+        assert_eq!(captured(&dir).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn capture_rejects_with_neither_a_live_pane_nor_a_note_file() {
+        let dir = tempdir().join("gate_neither");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for live in [Some(false), None] {
+            assert!(!capture(Some(&dir), &env_ok(), r#"{"prompt":"x"}"#, 7, live));
+        }
+        assert_eq!(load_for_tab(&dir, &crate::state::id_key("w1:t1").unwrap()), vec![]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn capture_falls_back_to_the_note_file_when_the_socket_failed() {
+        let dir = store_with_note("gate_socket_down");
+        assert!(capture(Some(&dir), &env_ok(), r#"{"prompt":"offline"}"#, 7, None));
+        assert_eq!(captured(&dir).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_live_pane_does_not_bypass_the_earlier_gates() {
+        // The off switch, the in-herdr check and the id checks all still bind
+        // regardless of what the socket says.
+        let dir = tempdir().join("gate_precedence");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for env in [
+            CaptureEnv { no_capture: true, ..env_ok() },
+            CaptureEnv { in_herdr: false, ..env_ok() },
+            CaptureEnv { tab_id: None, ..env_ok() },
+            CaptureEnv { pane_id: Some("../escape".into()), ..env_ok() },
+        ] {
+            assert!(!capture(Some(&dir), &env, r#"{"prompt":"x"}"#, 7, Some(true)));
+        }
+        // And a live pane still cannot rescue an unusable payload.
+        assert!(!capture(Some(&dir), &env_ok(), "not json", 7, Some(true)));
+        assert_eq!(captured(&dir), vec![], "none of the above may have written anything");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn capture_from_env_makes_no_socket_call_when_the_off_switch_is_set() {
+        // The users paying for a pointless round trip would be exactly the
+        // ones who opted out of this feature.
+        //
+        // Discrimination note (see task-3 report): on this machine, opening a
+        // nonexistent named pipe fails FAST (the same reason
+        // `ipc::tests::call_text_bounded_returns_promptly_when_there_is_no_socket`
+        // has to tolerate either outcome), so the elapsed-time assertion below
+        // cannot, by itself, distinguish "the socket call was skipped" from
+        // "the socket call was attempted and failed instantly". It is kept as
+        // a regression guard against anything that reintroduces
+        // GATE_TIMEOUT-scale latency. The real proof the off switch is
+        // checked BEFORE the call is structural: `capture_from_env` gates
+        // `notes_live` behind `(!env.no_capture && ...).then_some(()).and_then(|()| {...})
+        // .and_then(|tab| { ...call_text_bounded... })`, and `Option::and_then`
+        // never invokes its closure on a `None` receiver — so when the guard
+        // is false the socket-calling closure is not merely fast here, it
+        // never runs at all. `HERDR_PLUGIN_STATE_DIR` is pointed at an
+        // isolated temp dir so the "nothing was written" assertion is real
+        // evidence about THIS run, not a coincidence of the real note store
+        // never having a file for this made-up tab.
+        let _guard = crate::state::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let store = tempdir().join("off_switch_no_socket");
+        let _ = std::fs::remove_dir_all(&store);
+        std::fs::create_dir_all(&store).unwrap();
+
+        let prev_no_capture = std::env::var_os("HERDR_NOTES_NO_CAPTURE");
+        let prev_env = std::env::var_os("HERDR_ENV");
+        let prev_plugin_dir = std::env::var_os("HERDR_PLUGIN_STATE_DIR");
+        let prev_tab = std::env::var_os("HERDR_TAB_ID");
+        let prev_pane = std::env::var_os("HERDR_PANE_ID");
+        let prev_socket = std::env::var_os("HERDR_SOCKET_PATH");
+        // SAFETY: serialized by ENV_LOCK; every var restored below.
+        unsafe {
+            std::env::set_var("HERDR_NOTES_NO_CAPTURE", "1");
+            std::env::set_var("HERDR_ENV", "1");
+            std::env::set_var("HERDR_PLUGIN_STATE_DIR", &store);
+            std::env::set_var("HERDR_TAB_ID", "w1:t1");
+            std::env::set_var("HERDR_PANE_ID", "w1:p5");
+            // Does not exist, so if the call were (wrongly) attempted it
+            // would fail rather than hang against a real, slow-to-answer
+            // socket.
+            std::env::set_var("HERDR_SOCKET_PATH", "herdr-notes-test-no-such-socket");
+        }
+
+        let started = std::time::Instant::now();
+        let result = capture_from_env(r#"{"prompt":"x"}"#);
+        let elapsed = started.elapsed();
+
+        unsafe {
+            match prev_no_capture {
+                Some(v) => std::env::set_var("HERDR_NOTES_NO_CAPTURE", v),
+                None => std::env::remove_var("HERDR_NOTES_NO_CAPTURE"),
+            }
+            match prev_env {
+                Some(v) => std::env::set_var("HERDR_ENV", v),
+                None => std::env::remove_var("HERDR_ENV"),
+            }
+            match prev_plugin_dir {
+                Some(v) => std::env::set_var("HERDR_PLUGIN_STATE_DIR", v),
+                None => std::env::remove_var("HERDR_PLUGIN_STATE_DIR"),
+            }
+            match prev_tab {
+                Some(v) => std::env::set_var("HERDR_TAB_ID", v),
+                None => std::env::remove_var("HERDR_TAB_ID"),
+            }
+            match prev_pane {
+                Some(v) => std::env::set_var("HERDR_PANE_ID", v),
+                None => std::env::remove_var("HERDR_PANE_ID"),
+            }
+            match prev_socket {
+                Some(v) => std::env::set_var("HERDR_SOCKET_PATH", v),
+                None => std::env::remove_var("HERDR_SOCKET_PATH"),
+            }
+        }
+
+        assert!(!result, "the off switch must reject regardless of the socket");
+        assert!(
+            elapsed < GATE_TIMEOUT,
+            "the off switch must not wait on the socket: {elapsed:?}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&store).unwrap().count(),
+            0,
+            "nothing should be written when the off switch is set"
+        );
+        let _ = std::fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn capture_from_env_makes_no_socket_call_for_an_unsafe_tab_id() {
+        // A bare presence check (`tab_id.is_some()`) would let "bad id"
+        // through to the socket, only for gate 3 to reject it afterward —
+        // the round trip would have fired for an id that can never capture.
+        // The guard now routes the id through the same `state::id_key` gate
+        // 3 uses, so this must reject before ever touching the socket.
+        //
+        // Discrimination note (same caveat as the off-switch test above): on
+        // this machine opening a nonexistent named pipe fails FAST, so the
+        // elapsed-time assertion cannot, by itself, distinguish "the call was
+        // skipped" from "the call was attempted and failed instantly" — it is
+        // kept as a regression guard against the id check being hoisted out
+        // of the guard later, not as proof the call never fires. The
+        // structural proof is the same as above: the id check runs inside the
+        // same lazy `and_then` chain as the socket call, so an unsafe id
+        // short-circuits before `call_text_bounded` is ever reached.
+        let _guard = crate::state::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let store = tempdir().join("unsafe_tab_id_no_socket");
+        let _ = std::fs::remove_dir_all(&store);
+        std::fs::create_dir_all(&store).unwrap();
+
+        let prev_no_capture = std::env::var_os("HERDR_NOTES_NO_CAPTURE");
+        let prev_env = std::env::var_os("HERDR_ENV");
+        let prev_plugin_dir = std::env::var_os("HERDR_PLUGIN_STATE_DIR");
+        let prev_tab = std::env::var_os("HERDR_TAB_ID");
+        let prev_pane = std::env::var_os("HERDR_PANE_ID");
+        let prev_socket = std::env::var_os("HERDR_SOCKET_PATH");
+        // SAFETY: serialized by ENV_LOCK; every var restored below.
+        unsafe {
+            std::env::remove_var("HERDR_NOTES_NO_CAPTURE");
+            std::env::set_var("HERDR_ENV", "1");
+            std::env::set_var("HERDR_PLUGIN_STATE_DIR", &store);
+            // Unsafe: contains a space, fails `state::id_key`/gate 3.
+            std::env::set_var("HERDR_TAB_ID", "bad id");
+            std::env::set_var("HERDR_PANE_ID", "w1:p5");
+            // Does not exist, so if the call were (wrongly) attempted it
+            // would fail rather than hang against a real, slow-to-answer
+            // socket.
+            std::env::set_var("HERDR_SOCKET_PATH", "herdr-notes-test-no-such-socket");
+        }
+
+        let started = std::time::Instant::now();
+        let result = capture_from_env(r#"{"prompt":"x"}"#);
+        let elapsed = started.elapsed();
+
+        unsafe {
+            match prev_no_capture {
+                Some(v) => std::env::set_var("HERDR_NOTES_NO_CAPTURE", v),
+                None => std::env::remove_var("HERDR_NOTES_NO_CAPTURE"),
+            }
+            match prev_env {
+                Some(v) => std::env::set_var("HERDR_ENV", v),
+                None => std::env::remove_var("HERDR_ENV"),
+            }
+            match prev_plugin_dir {
+                Some(v) => std::env::set_var("HERDR_PLUGIN_STATE_DIR", v),
+                None => std::env::remove_var("HERDR_PLUGIN_STATE_DIR"),
+            }
+            match prev_tab {
+                Some(v) => std::env::set_var("HERDR_TAB_ID", v),
+                None => std::env::remove_var("HERDR_TAB_ID"),
+            }
+            match prev_pane {
+                Some(v) => std::env::set_var("HERDR_PANE_ID", v),
+                None => std::env::remove_var("HERDR_PANE_ID"),
+            }
+            match prev_socket {
+                Some(v) => std::env::set_var("HERDR_SOCKET_PATH", v),
+                None => std::env::remove_var("HERDR_SOCKET_PATH"),
+            }
+        }
+
+        assert!(!result, "an unsafe tab id must reject regardless of the socket");
+        assert!(
+            elapsed < GATE_TIMEOUT,
+            "an unsafe tab id must not wait on the socket: {elapsed:?}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&store).unwrap().count(),
+            0,
+            "nothing should be written for an unsafe tab id"
+        );
+        let _ = std::fs::remove_dir_all(&store);
     }
 }

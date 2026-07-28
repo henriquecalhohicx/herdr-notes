@@ -198,16 +198,30 @@ struct PaneInfo {
     tab_id: String,
     title: Option<String>,
     cwd: Option<String>,
+    /// herdr's pane label — the name the user gave this pane. `None` until one
+    /// is set: `pane.list` omits the key entirely, which is why a dump taken
+    /// before any rename made phase C conclude no such field existed.
+    label: Option<String>,
 }
 
 impl PaneInfo {
-    /// This pane's terminal title when it actually says something
-    /// (`meaningful_title` against its own agent name). The ONE definition,
-    /// shared by `pane_label`, `pick_title` and `maybe_autotitle`'s source-1
-    /// probe — that probe exists only to decide whether to spawn `git`, so if
-    /// it ever drifted from `pick_title`'s copy the branch would be computed
-    /// needlessly or skipped when it should run.
+    /// The best human-readable name for this pane: its herdr LABEL when set,
+    /// else its terminal title when that actually says something. The ONE
+    /// definition, shared by `pane_label`, `pick_title` and `maybe_autotitle`'s
+    /// source-1 probe — that probe exists only to decide whether to spawn
+    /// `git`, so if it ever drifted from `pick_title`'s copy the branch would
+    /// be computed when it should not be, or skipped when it should not be.
+    ///
+    /// A label deliberately does NOT go through `meaningful_title`. That
+    /// rejection list — the generic tool names in `GENERIC_TITLES`, path-shaped
+    /// strings, a `.exe` suffix — exists because `terminal_title_stripped` is
+    /// machine-set and unreliable. A label is a string the user typed on
+    /// purpose, so rejecting `src/app.rs` as path-shaped would be overruling
+    /// them.
     fn nice_title(&self) -> Option<String> {
+        if let Some(label) = self.label.as_deref().map(str::trim).filter(|l| !l.is_empty()) {
+            return Some(label.to_string());
+        }
         self.title.as_deref().and_then(|t| meaningful_title(t, &self.agent))
     }
 }
@@ -241,6 +255,7 @@ fn build_pane_index(panes: &[serde_json::Value]) -> PaneIndex {
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string()),
                 cwd: p.get("cwd").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                label: p.get("label").and_then(|v| v.as_str()).map(|s| s.to_string()),
             },
         );
     }
@@ -265,10 +280,11 @@ fn meaningful_title(title: &str, agent: &str) -> Option<String> {
     Some(t.to_string())
 }
 
-/// The heading for a pane's prompt group: its terminal title when meaningful,
-/// otherwise `{agent} {pane-suffix}` (`claude p8`) built from data the stored
-/// prompt always carries — so a closed pane or an unreachable socket still
-/// names its group.
+/// The heading for a pane's prompt group: the pane's `nice_title()` — its
+/// herdr label when set, else its terminal title when meaningful — otherwise
+/// `{agent} {pane-suffix}` (`claude p8`) built from data the stored prompt
+/// always carries — so a closed pane or an unreachable socket still names
+/// its group.
 fn pane_label(pane_id: &str, agent: &str, index: Option<&PaneIndex>) -> String {
     if let Some(info) = index.and_then(|i| i.get(pane_id))
         && let Some(title) = info.nice_title()
@@ -283,9 +299,10 @@ fn pane_label(pane_id: &str, agent: &str, index: Option<&PaneIndex>) -> String {
     }
 }
 
-/// The title chain: the agent pane's terminal title when meaningful, then the
-/// git branch, then the oldest surviving captured prompt. `None` when nothing
-/// has resolved yet — the caller retries on the next heartbeat.
+/// The title chain: the agent pane's `nice_title()` (its herdr label when
+/// set, else its terminal title when meaningful), then the git branch, then
+/// the oldest surviving captured prompt. `None` when nothing has resolved
+/// yet — the caller retries on the next heartbeat.
 fn pick_title(
     agent_pane: Option<&PaneInfo>,
     branch: Option<&str>,
@@ -303,25 +320,45 @@ fn pick_title(
     oldest_prompt.map(str::trim).filter(|p| !p.is_empty()).map(|p| p.to_string())
 }
 
-/// The agent pane `maybe_autotitle` reads from for this tab: the pane with
-/// the LOWEST pane id among panes on the tab that have reported a non-empty
-/// agent. `PaneIndex` is a `HashMap`, so iterating `.values().find(...)`
+/// The agent pane `maybe_autotitle` reads from for this tab, among panes on
+/// the tab that have reported a non-empty agent.
+///
+/// The PRIMARY key is whether the pane carries a herdr `label`: a labelled
+/// pane always beats an unlabelled one, however the ids sort. A label is the
+/// user deliberately naming that pane, and honoring it is this phase's whole
+/// promise — "rename a pane, the note's title follows". Selecting by id alone
+/// broke that on any multi-pane tab: an idle unlabelled pane with a lower id
+/// reports the generic terminal title `Claude Code`, `nice_title` rejects it,
+/// source 1 misses, and `maybe_autotitle`'s no-demotion rule then pins the
+/// note to the git branch — after which the rename can NEVER reach the note on
+/// any later beat. `label` is absent from `pane.list` until a pane is named,
+/// so unlabelled is the normal state and this is the common case, not a corner
+/// one. A blank/whitespace label does not count, matching `nice_title`.
+///
+/// The SECONDARY key is the lowest pane id, which is what makes the choice
+/// deterministic. `PaneIndex` is a `HashMap`, so iterating `.values().find(...)`
 /// picks whichever pane the hash happens to visit first — arbitrary, and
 /// varying per process, on exactly the tab shape this feature targets (a 2x2
 /// agent grid). Sorting by pane id makes the same tab state always yield the
-/// same pane, and so the same title/cwd.
+/// same pane, and so the same title/cwd — including when two panes are both
+/// labelled.
 ///
 /// herdr's synthetic `usage` pane carries a real `tab_id` and a non-empty
-/// agent, so it is skipped here exactly as `build_tab_index` skips it. Picking
-/// it would make its title source 1 and — worse — its cwd the one cwd this tab
-/// ever gets to spend on `git rev-parse`, since `git_tried` records the cwd
-/// before the spawn.
+/// agent, so it is skipped here exactly as `build_tab_index` skips it — and the
+/// skip is a filter, so it holds even if that pane somehow carries a label.
+/// Picking it would make its title source 1 and — worse — its cwd the one cwd
+/// this tab ever gets to spend on `git rev-parse`, since `git_tried` caches the
+/// result for that cwd once the spawn returns — so the wrong cwd would
+/// permanently claim the tab's one attempt.
 fn pick_agent_pane<'a>(index: &'a PaneIndex, tab: &str) -> Option<&'a PaneInfo> {
     index
         .iter()
         .filter(|(_, p)| p.tab_id == tab && !p.agent.trim().is_empty() && p.agent != "usage")
         .map(|(id, p)| (id.as_str(), p))
-        .min_by_key(|(id, _)| *id)
+        // `false` sorts before `true`, so "has a label" ranks ahead of "has none".
+        .min_by_key(|(id, p)| {
+            (p.label.as_deref().map(str::trim).filter(|l| !l.is_empty()).is_none(), *id)
+        })
         .map(|(_, p)| p)
 }
 
@@ -368,10 +405,18 @@ pub struct App {
     /// Heading per group, index-aligned with `prompts`. Resolved from one
     /// `pane.list` call at refresh time so the draw path stays I/O-free.
     prompt_labels: Vec<String>,
-    /// Cwds where `git rev-parse` has already been tried and failed. Without
-    /// this, a tab that is not a repo would spawn git on every heartbeat for
-    /// the life of the pane.
-    git_tried: std::collections::HashSet<String>,
+    /// Branch lookups already made, keyed by cwd: `Some(branch)` cached from a
+    /// success, `None` cached from a failure. Caching the SUCCESS matters
+    /// because the empty-title path re-runs on EVERY heartbeat until
+    /// something fills it (`maybe_autotitle`'s no-demotion rule means a note
+    /// whose title is already set never asks the branch again at all) — so
+    /// without it, a tab that stays untitled for several beats (no pane
+    /// candidate yet, no prompt captured yet) would spawn `git` again on
+    /// every one of those beats, not just the first. Caching the FAILURE is
+    /// what bounds the spawn on the other side: without it a tab that is not
+    /// a repo would spawn `git` every 5 seconds for the life of the pane. See
+    /// `git_branch` for what a hang costs.
+    git_tried: std::collections::HashMap<String, Option<String>>,
     confirm_clear: bool,
     dirty: bool,
     last_edit: Instant,
@@ -417,7 +462,7 @@ impl App {
             follow_box: false,
             prompts: Vec::new(),
             prompt_labels: Vec::new(),
-            git_tried: std::collections::HashSet::new(),
+            git_tried: std::collections::HashMap::new(),
             confirm_clear: false,
             dirty: false,
             last_edit: Instant::now(),
@@ -633,17 +678,14 @@ impl App {
             .map(|p| p.text.clone())
     }
 
-    /// `git rev-parse --abbrev-ref HEAD` in `cwd`, at most once per cwd for
-    /// the life of this process. On Windows the child is spawned with
-    /// CREATE_NO_WINDOW so a console never flashes over the TUI.
-    ///
-    /// A successful call records the cwd as tried too — including a detached
-    /// HEAD, which comes back as `Some("HEAD")` here and is only rejected
-    /// later, by `pick_title`. So a pane whose cwd is on a detached HEAD the
-    /// first time this runs gets the branch source permanently disabled for
-    /// the rest of the pane's life, even if a real branch is checked out
-    /// afterwards. That is the intended shape of "at most once per cwd", not
-    /// an oversight.
+    /// `git rev-parse --abbrev-ref HEAD` in `cwd`, cached in `git_tried` so
+    /// the subprocess runs at most once per cwd for the life of this process
+    /// — both a success AND a failure are cached, and a repeat call for the
+    /// same cwd returns the cached answer instead of spawning again. A
+    /// detached HEAD comes back as `Some("HEAD")` here and is rejected
+    /// downstream, by `pick_title` — not here — every time it is asked, cache
+    /// hit or not. On Windows the child is spawned with CREATE_NO_WINDOW so a
+    /// console never flashes over the TUI.
     ///
     /// `cmd.output()` is a BLOCKING wait with no timeout, run on the event-loop
     /// thread from inside `heartbeat()`. The once-per-cwd bound is what keeps
@@ -657,8 +699,8 @@ impl App {
     /// process is the ceiling that keeps that chain from being reachable
     /// repeatedly — anyone loosening it needs to add a timeout first.
     fn git_branch(&mut self, cwd: &str) -> Option<String> {
-        if !self.git_tried.insert(cwd.to_string()) {
-            return None;
+        if let Some(cached) = self.git_tried.get(cwd) {
+            return cached.clone();
         }
         let mut cmd = std::process::Command::new("git");
         cmd.args(["rev-parse", "--abbrev-ref", "HEAD"]).current_dir(cwd);
@@ -667,66 +709,108 @@ impl App {
             use std::os::windows::process::CommandExt;
             cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         }
-        let out = cmd.output().ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let branch = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        (!branch.is_empty()).then_some(branch)
+        let branch = cmd
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .filter(|b| !b.is_empty());
+        self.git_tried.insert(cwd.to_string(), branch.clone());
+        branch
     }
 
-    /// Whether this note is a candidate for auto-titling at all — every guard
-    /// that can be answered without touching the socket. Split out of
-    /// `maybe_autotitle` so `heartbeat` can ask it BEFORE deciding whether a
-    /// `pane.list` round-trip is worth making.
-    /// A note with NOTHING in it is excluded, through the exact predicate the
-    /// delete-on-save rule uses (`state::is_blank`, checked by `persist_at`)
-    /// rather than a second emptiness test — so the two stay in lockstep by
-    /// construction. Deriving a title into an empty note makes it non-blank,
-    /// which stops the delete rule firing: a tab you only toggled Notes into
-    /// would leave a `{"text":"","title":"main"}` orphan forever (tab ids are
-    /// never reused), the `l` dashboard would fill with identical empty rows,
-    /// prompt capture's gate 4 ("a note file exists for this tab") would arm
-    /// permanently, and an overlay self-delete would be undone by the very
-    /// next heartbeat re-deriving the title. `is_blank` also matches the
-    /// pristine seed template, which is wanted here: seeded-but-untyped stays
-    /// deletable.
+    /// Whether a title should be derived on this beat. `title_auto` is the
+    /// freeze switch — only typing a title with `r` clears it. There is
+    /// deliberately no "title is empty" condition: an auto title TRACKS its
+    /// source, so renaming a pane updates the note within one heartbeat even
+    /// if the branch name had already landed.
+    ///
+    /// A note with NOTHING in it is still excluded, through the exact
+    /// predicate the delete-on-save rule uses (`state::is_blank`, checked by
+    /// `persist_at`) rather than a second emptiness test — so the two stay in
+    /// lockstep by construction. Deriving a title into an empty note makes it
+    /// non-blank, which stops the delete rule firing: a tab you only toggled
+    /// Notes into would leave a `{"text":"","title":"main"}` orphan forever
+    /// (tab ids are never reused), the `l` dashboard would fill with
+    /// identical empty rows, prompt capture's gate 4 ("a note file exists for
+    /// this tab") would arm permanently, and an overlay self-delete would be
+    /// undone by the very next heartbeat re-deriving the title. `is_blank`
+    /// also matches the pristine seed template, which is wanted here:
+    /// seeded-but-untyped stays deletable.
     fn autotitle_wanted(&self) -> bool {
         self.persist
             && self.showing_tab_note()
             && self.note.title_auto
-            && self.note.title.trim().is_empty()
             && !state::is_blank(&self.note)
     }
 
-    /// Derive a title for an untitled, auto-titled note. Runs on the
-    /// heartbeat; stops for good once a title is set, because `title` is then
-    /// non-empty. `title_auto` stays true — it records that the title was
-    /// derived, not that one is still pending.
+    /// Derive a title for an auto-titled note, and keep re-deriving it on
+    /// every beat `autotitle_wanted` allows — renaming a pane's title (or its
+    /// branch, or its prompts) updates the note within one heartbeat rather
+    /// than freezing at whatever the first successful derivation found.
+    /// `title_auto` stays true throughout — it records that the title is
+    /// derived, not that one is still pending — and only typing a title with
+    /// `r` clears it, which is the sole way to stop this from running again.
+    ///
+    /// An EXISTING title may only be REPLACED by a pane-derived candidate
+    /// (source 1, below) — never demoted to the branch or a captured prompt.
+    /// An EMPTY title (trimmed — a whitespace-only title from a hand-edited
+    /// or legacy file is "empty" here exactly as `title_auto`'s own
+    /// missing-field default treats it, `state::parse`) still runs the full
+    /// chain, because filling one is the whole feature. Without that split,
+    /// re-deriving every beat can demote a good title on its own, with no
+    /// rename involved:
+    ///   - `heartbeat` collapses `index` to `None` on any transient
+    ///     `pane.list` failure, which silently drops sources 1 and 2 for that
+    ///     one beat only; the chain would fall through to whatever prompt
+    ///     happens to be oldest, then flip back on the next good beat.
+    ///   - an agent going idle reports the generic terminal title `Claude
+    ///     Code`, which `nice_title` rejects; without the split the chain
+    ///     would fall to the branch, then bounce back to the pane title the
+    ///     next time the agent goes busy.
+    ///
+    /// Both flaps pass the compare-before-write guard below legitimately —
+    /// the derived value really did change — so demotion has to be refused
+    /// one layer up, not caught by that guard.
     ///
     /// `index` is a `pane.list` snapshot the caller already holds (the
     /// heartbeat shares one with the prompt labels); `None` is the offline
     /// path — sources 1 and 2 are simply unavailable and a captured prompt is
-    /// the only one left.
+    /// the only one left (and only reachable at all while the title is still
+    /// empty).
     fn maybe_autotitle(&mut self, index: Option<&PaneIndex>) {
         if !self.autotitle_wanted() {
             return;
         }
         let Some(tab) = state::tab_env() else { return };
         let agent_pane = index.and_then(|i| pick_agent_pane(i, &tab));
-        let cwd = agent_pane.and_then(|p| p.cwd.clone());
-        // Source 1 first, without spawning anything: when the agent pane's
-        // terminal title already resolves, `pick_title` never falls through
-        // to the branch, so a `git` subprocess would be spawned and its
-        // result thrown away every time this is the winning source (the
-        // common case). Only compute the branch — and only then bear its
-        // process-spawn cost — once source 1 has actually missed. Asked
-        // through the SAME `nice_title` that `pick_title` uses, so the two
-        // can never disagree about whether source 1 hit.
+        // Source 1, computed separately from the rest of the chain: it is
+        // what decides whether the branch is worth spawning for below, AND
+        // (per the no-demotion rule above) the ONLY source ever allowed to
+        // replace a title that is already set. Asked through the SAME
+        // `nice_title` that `pick_title` uses, so the two can never disagree
+        // about whether source 1 hit.
         let source1 = agent_pane.and_then(PaneInfo::nice_title);
-        let branch = if source1.is_none() { cwd.and_then(|c| self.git_branch(&c)) } else { None };
-        let oldest = self.oldest_prompt_text();
-        if let Some(title) = pick_title(agent_pane, branch.as_deref(), oldest.as_deref()) {
+        let title = if self.note.title.trim().is_empty() {
+            let cwd = agent_pane.and_then(|p| p.cwd.clone());
+            // Only compute the branch — and only then bear its process-spawn
+            // cost — once source 1 has actually missed: when source 1 hits,
+            // `pick_title` never falls through to it and the result would
+            // just be thrown away.
+            let branch = if source1.is_none() { cwd.and_then(|c| self.git_branch(&c)) } else { None };
+            let oldest = self.oldest_prompt_text();
+            pick_title(agent_pane, branch.as_deref(), oldest.as_deref())
+        } else {
+            source1
+        };
+        // Only write — and only `touch()` — when the derived value actually
+        // differs from what is already there. Without this, every heartbeat
+        // would dirty the note, the 2s autosave would fire forever, `updated`
+        // would keep bumping and the header age would reset to `just now` on
+        // a loop, even when nothing about the source has changed.
+        if let Some(title) = title
+            && title != self.note.title
+        {
             self.note.title = title;
             self.touch();
         }
@@ -2367,6 +2451,7 @@ mod tests {
             tab_id: "wD:t2".into(),
             title: title.map(|s| s.to_string()),
             cwd: cwd.map(|s| s.to_string()),
+            label: None,
         }
     }
 
@@ -2407,6 +2492,54 @@ mod tests {
         );
         assert_eq!(pick_title(Some(&generic), Some("   "), Some("a prompt")).as_deref(), Some("a prompt"));
         assert_eq!(pick_title(Some(&generic), Some("br"), Some("   ")).as_deref(), Some("br"));
+    }
+
+    #[test]
+    fn autotitle_wanted_no_longer_requires_an_empty_title() {
+        // An auto title tracks its source; only typing one freezes it.
+        let mut a = app("a real body");
+        a.persist = true;
+        a.note.title = "20260728-team-solutions".into();
+        a.note.title_auto = true;
+        assert!(a.autotitle_wanted(), "a derived title is still derivable");
+        a.note.title_auto = false;
+        assert!(!a.autotitle_wanted(), "a typed title is frozen");
+    }
+
+    #[test]
+    fn autotitle_wanted_still_refuses_a_blank_note() {
+        // Phase C's rule: deriving into a blank note would defeat the
+        // delete-on-save rule and leave an orphan file forever.
+        let mut a = app("");
+        a.persist = true;
+        a.note.title_auto = true;
+        assert!(!a.autotitle_wanted());
+    }
+
+    #[test]
+    fn git_branch_caches_a_success_and_reuses_it() {
+        // While a title is still empty, `maybe_autotitle` asks the branch
+        // again on every heartbeat (a note whose title is already set never
+        // asks at all — see the no-demotion rule there). Without caching the
+        // success, an untitled tab with no pane candidate yet would spawn
+        // `git` again on every one of those beats, not just the first.
+        let mut a = app("body");
+        let cwd = std::env::current_dir().unwrap().display().to_string();
+        let first = a.git_branch(&cwd);
+        assert!(first.is_some(), "the crate root is a git repo");
+        assert!(a.git_tried.contains_key(&cwd), "the attempt is remembered");
+        assert_eq!(a.git_branch(&cwd), first, "second call returns the cached answer");
+        assert_eq!(a.git_tried.len(), 1, "still one entry, still one spawn");
+    }
+
+    #[test]
+    fn git_branch_still_caches_a_failure_as_none() {
+        let mut a = app("body");
+        let cwd = "C:\\definitely\\not\\a\\repo\\anywhere";
+        assert_eq!(a.git_branch(cwd), None);
+        assert_eq!(a.git_tried.get(cwd), Some(&None), "the failure is cached, not retried");
+        assert_eq!(a.git_branch(cwd), None);
+        assert_eq!(a.git_tried.len(), 1);
     }
 
     #[test]
@@ -2478,11 +2611,14 @@ mod tests {
         assert!(a.note.title_auto, "title_auto stays true — it records derivation, not pending-ness");
         assert!(a.dirty, "a derived title must autosave, same as any other edit");
 
-        // Case 2: a title that is already set (derived or typed) is never
-        // re-derived, even though the prompt is still sitting right there.
+        // Case 2: the title IS re-derived every beat now — this is not a
+        // "title is set, skip" guard. With `index: None` there is no
+        // pane-derived candidate to replace it with (an existing title may
+        // only be replaced by one — see `maybe_autotitle`), so nothing is
+        // written and the unchanged value must not touch the note either way.
         a.dirty = false;
         a.maybe_autotitle(None);
-        assert_eq!(a.note.title, "why is auth flaky", "an already-titled note is untouched");
+        assert_eq!(a.note.title, "why is auth flaky", "no pane candidate -> the existing title survives");
         assert!(!a.dirty, "no mutation means no new dirty flag");
 
         // Case 3: `title_auto = false` (a manually typed title) is untouched
@@ -2507,6 +2643,285 @@ mod tests {
 
         restore_env(prev);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn maybe_autotitle_fills_an_empty_title_from_the_oldest_prompt_and_then_refuses_to_replace_it() {
+        // Same harness as
+        // `maybe_autotitle_derives_from_the_oldest_prompt_and_is_gated_by_title_state_and_active_note`:
+        // temp store, HERDR_* under ENV_LOCK, dead socket so only the prompt
+        // source is reachable — there is no `pane.list` anywhere in this
+        // test, so `index` is always `None` and a pane-derived candidate
+        // (source 1) never exists here. That is deliberate: per the
+        // no-demotion rule (`maybe_autotitle`), the branch and the captured
+        // prompt may only FILL a title that is still empty, never replace
+        // one that is already set — only a pane-derived candidate can do
+        // that (covered by the `maybe_autotitle_*_demotes_*`/`*_follows_*`
+        // tests below, which supply a real `PaneIndex`).
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("notes-autotitle-rederive-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config-base");
+        std::fs::create_dir_all(&cfg).unwrap();
+
+        state::persist_at(
+            &dir.join("w1_t1.json"),
+            &Note { text: "a real body".into(), ..Default::default() },
+            "w1:t1",
+            100,
+        );
+        let key = state::id_key("w1:t1").unwrap();
+        let older_pane_key = state::id_key("w1:p5").unwrap();
+        let older_file = crate::prompts::prompts_file(&dir, &key, &older_pane_key);
+        crate::prompts::append_at(
+            &older_file,
+            crate::prompts::Prompt {
+                ts: 7,
+                pane: "w1:p5".into(),
+                agent: "claude".into(),
+                text: "why is auth flaky".into(),
+            },
+        );
+
+        let sock = dir.join("no-such.sock");
+        let prev = swap_env(&[
+            ("HERDR_PLUGIN_STATE_DIR", Some(dir.as_os_str())),
+            ("HERDR_TAB_ID", Some(std::ffi::OsStr::new("w1:t1"))),
+            ("HERDR_PANE_ID", None),
+            ("HERDR_SOCKET_PATH", Some(sock.as_os_str())),
+            (CONFIG_BASE_VAR, Some(cfg.as_os_str())),
+        ]);
+
+        let mut a = App::new();
+        assert!(a.note.title.trim().is_empty(), "fixture loads untitled");
+        assert!(a.note.title_auto, "fixture loads auto");
+
+        // 1. First beat: the title is still empty, so the full chain runs
+        // and fills it from the oldest prompt; `dirty` is set.
+        a.load_prompts();
+        a.maybe_autotitle(None);
+        assert_eq!(a.note.title, "why is auth flaky");
+        assert!(a.dirty, "a derived title must autosave");
+
+        // 2. Clear `dirty`, beat again with nothing changed: the title is
+        // now set, `index` is `None` (no pane candidate), and `dirty` must
+        // STAY false — otherwise every heartbeat dirties the note, the 2s
+        // autosave fires forever, `updated` keeps bumping and the header age
+        // resets to `just now` on a loop.
+        a.dirty = false;
+        a.load_prompts();
+        a.maybe_autotitle(None);
+        assert_eq!(a.note.title, "why is auth flaky", "no pane candidate -> the existing title survives");
+        assert!(!a.dirty, "no candidate means no write, so no new dirty flag");
+
+        // 3. Append a NEWER prompt whose text differs, in a DIFFERENT pane's
+        // file. The title must stay put regardless — with the title already
+        // set and no pane candidate reachable, the prompt chain is never
+        // even consulted (see the no-demotion rule in `maybe_autotitle`).
+        let newer_pane_key = state::id_key("w1:p6").unwrap();
+        let newer_file = crate::prompts::prompts_file(&dir, &key, &newer_pane_key);
+        crate::prompts::append_at(
+            &newer_file,
+            crate::prompts::Prompt {
+                ts: 50,
+                pane: "w1:p6".into(),
+                agent: "claude".into(),
+                text: "add the rate limiter".into(),
+            },
+        );
+        a.dirty = false;
+        a.load_prompts();
+        a.maybe_autotitle(None);
+        assert_eq!(a.note.title, "why is auth flaky", "an existing title is immune to any prompt-only change");
+        assert!(!a.dirty);
+
+        // 4. Remove the older prompt file so the newer one becomes the
+        // oldest SURVIVING prompt across the tab — under the old (pre-
+        // no-demotion) behavior this would have replaced the title. It must
+        // NOT: an existing title may only be replaced by a pane-derived
+        // candidate (source 1), never by the branch or a captured prompt,
+        // and there is still no pane candidate here (`index: None`).
+        std::fs::remove_file(&older_file).unwrap();
+        a.load_prompts();
+        a.maybe_autotitle(None);
+        assert_eq!(a.note.title, "why is auth flaky", "the prompt chain can fill an empty title, never replace one");
+        assert!(!a.dirty, "no demotion means no autosave churn");
+
+        restore_env(prev);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn maybe_autotitle_fills_a_whitespace_only_title_the_same_as_an_empty_one() {
+        // `state::parse`'s `title_auto` missing-field default is
+        // `title.trim().is_empty()` (`src/state.rs`), so a whitespace-only
+        // title from a hand-edited or legacy file reads as auto/derivable.
+        // `maybe_autotitle`'s empty-vs-set split has to agree: a bare
+        // `.is_empty()` there would read "   " as already SET, permanently
+        // blocking the branch/prompt from ever filling it (only a
+        // pane-derived candidate could, and none exists here).
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = swap_env(&[("HERDR_TAB_ID", Some(std::ffi::OsStr::new("w1:t1")))]);
+
+        let mut a = app("a real body");
+        a.persist = true;
+        a.note.title = "   ".into();
+        a.note.title_auto = true;
+        a.prompts = vec![crate::prompts::PromptGroup {
+            pane: "w1:p5".into(),
+            prompts: vec![crate::prompts::Prompt {
+                ts: 1,
+                pane: "w1:p5".into(),
+                agent: "claude".into(),
+                text: "why is auth flaky".into(),
+            }],
+        }];
+
+        a.maybe_autotitle(None);
+        assert_eq!(a.note.title, "why is auth flaky", "a whitespace-only title must still be fillable");
+        assert!(a.dirty, "filling a title is a real edit");
+
+        restore_env(prev);
+    }
+
+    #[test]
+    fn maybe_autotitle_never_demotes_an_existing_title_when_the_index_is_lost() {
+        // `heartbeat` collapses `index` to `None` on any transient
+        // `pane.list` failure. Without the no-demotion rule, re-derive would
+        // fall all the way through to the captured prompt on that one beat —
+        // discarding a good pane-derived title — and flip back the next time
+        // the socket answers. Only the tab-id env var matters here: no disk,
+        // no socket, `index` and `self.prompts` are supplied directly.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = swap_env(&[("HERDR_TAB_ID", Some(std::ffi::OsStr::new("w1:t1")))]);
+
+        let mut a = app("a real body");
+        a.persist = true;
+        a.note.title = "auth-refactor".into();
+        a.note.title_auto = true;
+        a.prompts = vec![crate::prompts::PromptGroup {
+            pane: "w1:p5".into(),
+            prompts: vec![crate::prompts::Prompt {
+                ts: 1,
+                pane: "w1:p5".into(),
+                agent: "claude".into(),
+                text: "why is auth flaky".into(),
+            }],
+        }];
+
+        a.maybe_autotitle(None);
+        assert_eq!(a.note.title, "auth-refactor", "a lost index must not demote an existing title");
+        assert!(!a.dirty, "no demotion means no autosave churn");
+
+        restore_env(prev);
+    }
+
+    #[test]
+    fn maybe_autotitle_keeps_a_label_derived_title_when_the_pane_goes_generic() {
+        // The same pane, still present in the index, but its terminal title
+        // has gone idle-generic (`Claude Code`, rejected by `nice_title`) and
+        // it carries no label. Without the no-demotion rule this falls
+        // through to the branch/prompt chain and the label-derived title is
+        // lost until the agent goes busy again.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = swap_env(&[("HERDR_TAB_ID", Some(std::ffi::OsStr::new("w1:t1")))]);
+
+        let mut idx = PaneIndex::new();
+        idx.insert("w1:p5".into(), PaneInfo {
+            agent: "claude".into(),
+            tab_id: "w1:t1".into(),
+            title: Some("Claude Code".into()),
+            cwd: None,
+            label: None,
+        });
+
+        let mut a = app("a real body");
+        a.persist = true;
+        a.note.title = "auth-refactor".into(); // previously derived from the pane's label
+        a.note.title_auto = true;
+        a.prompts = vec![crate::prompts::PromptGroup {
+            pane: "w1:p5".into(),
+            prompts: vec![crate::prompts::Prompt {
+                ts: 1,
+                pane: "w1:p5".into(),
+                agent: "claude".into(),
+                text: "why is auth flaky".into(),
+            }],
+        }];
+
+        a.maybe_autotitle(Some(&idx));
+        assert_eq!(a.note.title, "auth-refactor", "a generic terminal title must not demote a label-derived title");
+        assert!(!a.dirty);
+
+        restore_env(prev);
+    }
+
+    #[test]
+    fn maybe_autotitle_still_follows_a_new_pane_label_over_an_existing_title() {
+        // The case the user actually asked for: a note titled from the
+        // branch (or a prompt), and a pane label subsequently appears. The
+        // no-demotion rule only blocks the branch/prompt from REPLACING an
+        // existing title — a pane-derived candidate (source 1) must still
+        // win, on the very next beat.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = swap_env(&[("HERDR_TAB_ID", Some(std::ffi::OsStr::new("w1:t1")))]);
+
+        let mut idx = PaneIndex::new();
+        idx.insert("w1:p5".into(), PaneInfo {
+            agent: "claude".into(),
+            tab_id: "w1:t1".into(),
+            title: Some("Claude Code".into()),
+            cwd: None,
+            label: Some("checkout-tests".into()),
+        });
+
+        let mut a = app("a real body");
+        a.persist = true;
+        a.note.title = "20260728-team-solutions".into(); // previously derived from the branch
+        a.note.title_auto = true;
+
+        a.maybe_autotitle(Some(&idx));
+        assert_eq!(a.note.title, "checkout-tests", "a new pane label still replaces an existing non-pane title");
+        assert!(a.dirty, "a genuine pane-derived change must autosave");
+
+        restore_env(prev);
+    }
+
+    #[test]
+    fn maybe_autotitle_does_not_dirty_when_the_pane_label_still_matches_the_title() {
+        // The compare-before-write guard (`title != self.note.title`) is
+        // what stops a labelled pane with a STABLE label from `touch()`ing
+        // the note on every single heartbeat forever — source 1 resolves to
+        // the same string every beat, so without the guard `updated` would
+        // keep bumping and the header age would reset to `just now` on a
+        // loop. None of the other autotitle tests reach this: they either
+        // start from an empty title (nothing to compare against) or change
+        // the pane's candidate (so the guard sees a genuine difference) —
+        // this is the only one where a live, reachable `Some` candidate
+        // equals the note's current title.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = swap_env(&[("HERDR_TAB_ID", Some(std::ffi::OsStr::new("w1:t1")))]);
+
+        let mut idx = PaneIndex::new();
+        idx.insert("w1:p5".into(), PaneInfo {
+            agent: "claude".into(),
+            tab_id: "w1:t1".into(),
+            title: None,
+            cwd: None,
+            label: Some("auth-refactor".into()),
+        });
+
+        let mut a = app("a real body");
+        a.persist = true;
+        a.note.title = "auth-refactor".into(); // already derived from this very label
+        a.note.title_auto = true;
+
+        a.maybe_autotitle(Some(&idx));
+        assert_eq!(a.note.title, "auth-refactor");
+        assert!(!a.dirty, "an unchanged pane-derived candidate must not touch() the note");
+
+        restore_env(prev);
     }
 
     #[test]
@@ -2642,20 +3057,23 @@ mod tests {
         // herdr reports a synthetic `usage` pane carrying a real `tab_id`.
         // `build_tab_index` already skips it; picking it here would make ITS
         // terminal title source 1 and — worse — ITS cwd the one cwd the tab
-        // ever gets to spend on `git rev-parse` (`git_tried` records the cwd
-        // before the spawn, so the wrong cwd consumes the single attempt).
+        // ever gets to spend on `git rev-parse` (`git_tried` caches the
+        // result once the spawn returns, so the wrong cwd would permanently
+        // consume the single attempt).
         let mut idx = PaneIndex::new();
         idx.insert("w1:p1".into(), PaneInfo {
             agent: "usage".into(),
             tab_id: "w1:t1".into(),
             title: Some("Usage".into()),
             cwd: Some("C:\\wrong".into()),
+            label: None,
         });
         idx.insert("w1:p3".into(), PaneInfo {
             agent: "claude".into(),
             tab_id: "w1:t1".into(),
             title: Some("Real Work".into()),
             cwd: Some("C:\\repo".into()),
+            label: None,
         });
         let p = pick_agent_pane(&idx, "w1:t1").expect("the real agent pane is still a candidate");
         assert_eq!(p.title.as_deref(), Some("Real Work"), "the usage pane sorts lower but must be skipped");
@@ -2668,6 +3086,7 @@ mod tests {
             tab_id: "w1:t1".into(),
             title: Some("Usage".into()),
             cwd: Some("C:\\wrong".into()),
+            label: None,
         });
         assert!(pick_agent_pane(&only_usage, "w1:t1").is_none());
     }
@@ -2691,18 +3110,21 @@ mod tests {
                 tab_id: "w1:t1".into(),
                 title: Some("Zeta".into()),
                 cwd: Some("C:\\zeta".into()),
+                label: None,
             });
             idx.insert("w1:p2".into(), PaneInfo {
                 agent: "codex".into(),
                 tab_id: "w1:t1".into(),
                 title: Some("Alpha".into()),
                 cwd: Some("C:\\alpha".into()),
+                label: None,
             });
             idx.insert("w1:p5".into(), PaneInfo {
                 agent: "claude".into(),
                 tab_id: "w1:t1".into(),
                 title: Some("Mid".into()),
                 cwd: Some("C:\\mid".into()),
+                label: None,
             });
             // A pane on a DIFFERENT tab, and a bare shell pane (no agent yet)
             // on the SAME tab: neither may ever be picked.
@@ -2711,12 +3133,14 @@ mod tests {
                 tab_id: "w1:t9".into(),
                 title: Some("Other tab".into()),
                 cwd: None,
+                label: None,
             });
             idx.insert("w1:p0".into(), PaneInfo {
                 agent: String::new(),
                 tab_id: "w1:t1".into(),
                 title: Some("Shell".into()),
                 cwd: None,
+                label: None,
             });
             idx
         };
@@ -2738,6 +3162,133 @@ mod tests {
             let idx = build();
             let picked = pick_agent_pane(&idx, "w1:t1").expect("a candidate exists");
             assert_eq!(picked.title.as_deref(), Some("Alpha"), "lowest pane id (w1:p2) wins, every trial");
+        }
+    }
+
+    #[test]
+    fn pick_agent_pane_prefers_a_labelled_pane_over_a_lower_id() {
+        // The tab shape this phase targets: one idle, unlabelled agent pane
+        // with a LOWER id than the pane the user deliberately renamed. Picking
+        // by id alone returns the idle one, whose terminal title is the generic
+        // `Claude Code` — `nice_title` rejects it, source 1 misses, and the
+        // no-demotion rule then locks the note to the git branch forever, so
+        // the rename can never reach the note on any later beat.
+        let mut idx = PaneIndex::new();
+        idx.insert("wF:p3".into(), PaneInfo {
+            agent: "claude".into(),
+            tab_id: "wF:t1".into(),
+            title: Some("Claude Code".into()),
+            cwd: Some("C:\\repo".into()),
+            label: None,
+        });
+        idx.insert("wF:p7".into(), PaneInfo {
+            agent: "claude".into(),
+            tab_id: "wF:t1".into(),
+            title: Some("Claude Code".into()),
+            cwd: Some("C:\\repo".into()),
+            label: Some("auth-refactor".into()),
+        });
+        // Many trials: `PaneIndex` is a `HashMap`, so a selection that happened
+        // to be right once must be right every time.
+        for _ in 0..100 {
+            let p = pick_agent_pane(&idx, "wF:t1").expect("a candidate exists");
+            assert_eq!(
+                p.nice_title().as_deref(),
+                Some("auth-refactor"),
+                "the pane the user NAMED wins over the lower id"
+            );
+        }
+        // A label that is only whitespace is not a label — same as `nice_title`
+        // treats it — so the lowest id still wins.
+        idx.insert("wF:p7".into(), PaneInfo {
+            agent: "claude".into(),
+            tab_id: "wF:t1".into(),
+            title: Some("Claude Code".into()),
+            cwd: Some("C:\\repo".into()),
+            label: Some("   ".into()),
+        });
+        let p = pick_agent_pane(&idx, "wF:t1").expect("a candidate exists");
+        assert_eq!(p.label.as_deref(), None, "blank label does not count as labelled");
+    }
+
+    #[test]
+    fn pick_agent_pane_breaks_a_two_label_tie_by_pane_id() {
+        // Two labelled panes: the label is the PRIMARY key, but determinism
+        // still comes from the pane id, so the same tab state always yields the
+        // same title/cwd across processes.
+        let build = || {
+            let mut idx = PaneIndex::new();
+            idx.insert("wF:p9".into(), PaneInfo {
+                agent: "claude".into(),
+                tab_id: "wF:t1".into(),
+                title: None,
+                cwd: Some("C:\\zeta".into()),
+                label: Some("zeta-work".into()),
+            });
+            idx.insert("wF:p4".into(), PaneInfo {
+                agent: "codex".into(),
+                tab_id: "wF:t1".into(),
+                title: None,
+                cwd: Some("C:\\alpha".into()),
+                label: Some("alpha-work".into()),
+            });
+            idx
+        };
+        for _ in 0..200 {
+            let idx = build();
+            let p = pick_agent_pane(&idx, "wF:t1").expect("a candidate exists");
+            assert_eq!(p.nice_title().as_deref(), Some("alpha-work"), "lowest id among labelled panes");
+        }
+    }
+
+    #[test]
+    fn pick_agent_pane_still_takes_the_lowest_id_when_nothing_is_labelled() {
+        // The pre-label behavior, unchanged: no labels anywhere means the
+        // tiebreak IS the selection.
+        let build = || {
+            let mut idx = PaneIndex::new();
+            for (id, title) in [("wF:p8", "Zeta"), ("wF:p2", "Alpha"), ("wF:p5", "Mid")] {
+                idx.insert(id.into(), PaneInfo {
+                    agent: "claude".into(),
+                    tab_id: "wF:t1".into(),
+                    title: Some(title.into()),
+                    cwd: None,
+                    label: None,
+                });
+            }
+            idx
+        };
+        for _ in 0..200 {
+            let idx = build();
+            let p = pick_agent_pane(&idx, "wF:t1").expect("a candidate exists");
+            assert_eq!(p.title.as_deref(), Some("Alpha"), "lowest pane id, every trial");
+        }
+    }
+
+    #[test]
+    fn pick_agent_pane_skips_a_labelled_usage_pane() {
+        // The `usage` skip must survive the label preference: herdr's synthetic
+        // pane carrying a label (or a labelled pane id happening to sort low)
+        // must never become source 1 or spend the tab's one `git rev-parse`.
+        let mut idx = PaneIndex::new();
+        idx.insert("wF:p1".into(), PaneInfo {
+            agent: "usage".into(),
+            tab_id: "wF:t1".into(),
+            title: Some("Usage".into()),
+            cwd: Some("C:\\wrong".into()),
+            label: Some("usage-pane".into()),
+        });
+        idx.insert("wF:p6".into(), PaneInfo {
+            agent: "claude".into(),
+            tab_id: "wF:t1".into(),
+            title: Some("Real Work".into()),
+            cwd: Some("C:\\repo".into()),
+            label: None,
+        });
+        for _ in 0..100 {
+            let p = pick_agent_pane(&idx, "wF:t1").expect("the real agent pane is still a candidate");
+            assert_eq!(p.nice_title().as_deref(), Some("Real Work"), "a labelled usage pane is still skipped");
+            assert_eq!(p.cwd.as_deref(), Some("C:\\repo"), "and so is its cwd");
         }
     }
 
@@ -2770,17 +3321,6 @@ mod tests {
             },
         ];
         assert_eq!(a.oldest_prompt_text().as_deref(), Some("p6"), "oldest across all groups");
-    }
-
-    #[test]
-    fn the_git_branch_is_attempted_at_most_once_per_cwd() {
-        // An unresolvable tab would otherwise spawn git every 5s forever.
-        let mut a = app("body");
-        let cwd = "C:\\definitely\\not\\a\\repo\\anywhere";
-        assert_eq!(a.git_branch(cwd), None);
-        assert!(a.git_tried.contains(cwd), "the failure is remembered");
-        assert_eq!(a.git_branch(cwd), None, "second call is a no-op");
-        assert_eq!(a.git_tried.len(), 1);
     }
 
     #[test]
@@ -3213,6 +3753,98 @@ mod tests {
             v["agent"] = serde_json::Value::String(a.to_string());
         }
         v
+    }
+
+    fn pane_json_labelled(
+        pane_id: &str,
+        tab_id: &str,
+        agent: Option<&str>,
+        title: &str,
+        cwd: &str,
+        label: Option<&str>,
+    ) -> serde_json::Value {
+        let mut v = pane_json(pane_id, tab_id, agent, title, cwd);
+        if let Some(l) = label {
+            v["label"] = serde_json::Value::String(l.to_string());
+        }
+        v
+    }
+
+    #[test]
+    fn build_pane_index_reads_the_label_when_present() {
+        // herdr omits `label` entirely until one is set — which is exactly how
+        // phase C came to claim the field did not exist.
+        let panes = vec![
+            pane_json_labelled("wD:pE", "wD:t3", Some("claude"), "Claude Code", "C:\\repo", Some("test-1")),
+            pane_json("wD:pG", "wD:t3", Some("claude"), "Claude Code", "C:\\repo"),
+        ];
+        let idx = build_pane_index(&panes);
+        assert_eq!(idx.get("wD:pE").unwrap().label.as_deref(), Some("test-1"));
+        assert_eq!(idx.get("wD:pG").unwrap().label, None, "absent key -> None");
+    }
+
+    #[test]
+    fn nice_title_prefers_the_label_over_the_terminal_title() {
+        let info = PaneInfo {
+            agent: "claude".into(),
+            tab_id: "wD:t3".into(),
+            title: Some("HM-54271 Importer".into()),
+            cwd: None,
+            label: Some("test-1".into()),
+        };
+        assert_eq!(info.nice_title().as_deref(), Some("test-1"));
+    }
+
+    #[test]
+    fn a_label_bypasses_the_meaningful_title_rejections() {
+        // The rejection list exists because the TERMINAL title is machine-set.
+        // A label is typed on purpose, so a path-shaped or tool-shaped label is
+        // the user's choice and must be honored.
+        for label in ["src/app.rs", "Claude Code", "build.exe", "C:\\repo\\thing"] {
+            let info = PaneInfo {
+                agent: "claude".into(),
+                tab_id: "wD:t3".into(),
+                title: Some("Claude Code".into()),
+                cwd: None,
+                label: Some(label.into()),
+            };
+            assert_eq!(info.nice_title().as_deref(), Some(label), "label {label:?}");
+        }
+    }
+
+    #[test]
+    fn a_blank_label_falls_through_to_the_terminal_title() {
+        for label in [Some(""), Some("   "), None] {
+            let info = PaneInfo {
+                agent: "claude".into(),
+                tab_id: "wD:t3".into(),
+                title: Some("HM-54271 Importer".into()),
+                cwd: None,
+                label: label.map(|s| s.to_string()),
+            };
+            assert_eq!(info.nice_title().as_deref(), Some("HM-54271 Importer"), "label {label:?}");
+        }
+    }
+
+    #[test]
+    fn a_label_is_trimmed() {
+        let info = PaneInfo {
+            agent: "claude".into(),
+            tab_id: "wD:t3".into(),
+            title: None,
+            cwd: None,
+            label: Some("  test-1  ".into()),
+        };
+        assert_eq!(info.nice_title().as_deref(), Some("test-1"));
+    }
+
+    #[test]
+    fn pane_label_heads_a_group_with_the_label() {
+        let panes = vec![pane_json_labelled(
+            "wD:pE", "wD:t3", Some("claude"), "Claude Code", "C:\\repo", Some("test-1"),
+        )];
+        let idx = build_pane_index(&panes);
+        assert_eq!(pane_label("wD:pE", "claude", Some(&idx)), "test-1");
     }
 
     #[test]

@@ -134,17 +134,21 @@ built in.
 Notes can show the last few prompts you typed into each Claude Code pane
 sharing the tab, so you don't lose track of what you asked for while you're
 jotting things down beside it. A `UserPromptSubmit` hook writes each prompt
-(first line, truncated) to a small per-pane file; the pane groups them by
-agent pane and renders one heading per pane above the note in preview, each
-with its own last 3 prompts numbered underneath — a four-agent tab keeps
-twelve prompts on screen, not three shared between all of them.
+(first line, truncated) to a small per-pane file as soon as a Notes pane is
+open in the tab — capture no longer waits for the note to have any content
+first — and the pane groups them by agent pane and renders one heading per
+pane above the note in preview, each with its own last 3 prompts numbered
+underneath — a four-agent tab keeps twelve prompts on screen, not three
+shared between all of them.
 
 An untitled note also picks up an automatic title as soon as one is
-available: the agent pane's terminal title when it says something
-meaningful, else its git branch, else the oldest prompt still on file. Press
-`r` to set a title by hand at any point — that freezes it, so auto-titling
-never overwrites it again — and clearing it back to empty with `r` hands the
-note back to auto-titling.
+available: the agent pane's herdr label when one has been set, else its
+terminal title when it says something meaningful, else its git branch, else
+the oldest prompt still on file. It keeps re-checking on every heartbeat, so
+renaming a pane updates an already-derived title too, not just an empty one.
+Press `r` to set a title by hand at any point — that freezes it, so
+auto-titling never overwrites it again — and clearing it back to empty with
+`r` hands the note back to auto-titling.
 
 Install the hook into your global Claude Code settings:
 
@@ -190,9 +194,12 @@ Known limits, from the design doc:
   `UserPromptSubmit`. On a mixed grid, only the Claude panes will have
   history. This is a gap in the ecosystem, not something this design can
   close.
-- **The note must exist first.** Open Notes in a tab, write something, and
-  only then do prompts start accumulating. "I opened Notes and see no
-  prompts" is the expected behavior on a fresh tab, not a bug.
+- **Opening Notes is enough — the note no longer needs content first.** A
+  live Notes pane in the tab passes the capture gate on its own; the note
+  file only has to exist when Notes isn't currently open in that tab. One
+  side effect: a tab where Notes was opened but nothing was ever typed can
+  leave an orphaned `<tab>__<pane>.prompts.json` with no note file beside
+  it.
 - **Pane files orphan** when their pane closes, exactly as note files orphan
   when their tab closes. Tab and pane ids are never reused, so an orphan is a
   dead file rather than a stale-content risk.
