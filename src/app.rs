@@ -17,7 +17,7 @@ use ratatui::widgets::{
 };
 use unicode_width::UnicodeWidthChar;
 
-use crate::markdown::{self, render_markdown, render_markdown_mapped};
+use crate::markdown::{self, render_markdown};
 use crate::state::{self, METADATA_SOURCE, Mode, Note, PANE_LABEL};
 use crate::template;
 
@@ -397,6 +397,20 @@ pub struct App {
     /// — draw clears it once applied — so a cursor merely existing does not
     /// fight manual scrolling (`Up`/`Dn`/`g`/`G`/PgUp/PgDn) on every frame.
     follow_box: bool,
+    /// Prefix→URL templates for issue keys, loaded ONCE (see `App::new`).
+    /// Default-empty in `with_note`, so unit tests never read the store dir.
+    tickets: crate::tickets::Config,
+    /// Ticket keys found by the last preview draw, in document order. The draw
+    /// is the single scan that both styles the keys and lists them, so nav and
+    /// highlight cannot disagree. The loop always draws before reading a key,
+    /// so this is never consulted stale.
+    ticket_hits: Vec<markdown::TicketHit>,
+    /// Ordinal into `ticket_hits` — which key `o` would open. Mutually
+    /// exclusive with `box_cursor`: one cursor at a time keeps `esc` and
+    /// `space` unambiguous.
+    ticket_cursor: Option<usize>,
+    /// One-shot scroll-follow, same contract as `follow_box`.
+    follow_ticket: bool,
     /// The tab's captured prompts, grouped per agent pane and newest group
     /// first, each with the heading resolved at refresh time. Refreshed on the
     /// heartbeat rather than per draw. Rendered above the note, never part of
@@ -447,6 +461,9 @@ impl App {
         // real store dir (`refresh_prompts` early-returns on !persist anyway —
         // this is belt and braces).
         app.refresh_prompts();
+        // Real disk read, so it belongs beside `refresh_prompts` here rather
+        // than in `with_note` — the test constructor must stay hermetic.
+        app.tickets = crate::tickets::Config::load();
         app
     }
 
@@ -460,6 +477,10 @@ impl App {
             preview_scroll: 0,
             box_cursor: None,
             follow_box: false,
+            tickets: crate::tickets::Config::default(),
+            ticket_hits: Vec::new(),
+            ticket_cursor: None,
+            follow_ticket: false,
             prompts: Vec::new(),
             prompt_labels: Vec::new(),
             git_tried: std::collections::HashMap::new(),
@@ -546,11 +567,13 @@ impl App {
             };
         }
         self.note.mode = Mode::Preview;
-        // Everything per-DOCUMENT resets: a scroll offset and a checkbox
-        // ordinal both mean nothing in the other note. Anything added to this
-        // struct that describes a position INSIDE the note belongs here too.
+        // Everything per-DOCUMENT resets: a scroll offset, a checkbox ordinal
+        // and a ticket ordinal all mean nothing in the other note. Anything
+        // added to this struct that describes a position INSIDE the note
+        // belongs here too.
         self.preview_scroll = 0;
-        self.clear_box_cursor();
+        self.clear_cursors();
+        self.ticket_hits.clear();
         self.dirty = false;
         // The prompt block belongs to the TAB note only, so it has to be
         // dropped going out and rebuilt coming back — immediately, not on the
@@ -853,7 +876,7 @@ impl App {
                 // A cursor ordinal outlives the text it indexed: benign only
                 // while `cursor_line()` returns None on empty text, and no
                 // longer benign the moment text comes back (`e` re-seeds).
-                self.clear_box_cursor();
+                self.clear_cursors();
                 self.save();
             }
             self.confirm_clear = false;
@@ -878,15 +901,26 @@ impl App {
             KeyCode::Char('e') | KeyCode::Enter => self.enter_edit(true),
             KeyCode::Up => self.preview_scroll = self.preview_scroll.saturating_sub(1),
             KeyCode::Down => self.preview_scroll = self.preview_scroll.saturating_add(1),
-            KeyCode::Char('j') => self.move_box(1),
-            KeyCode::Char('k') => self.move_box(-1),
-            KeyCode::Char(' ') => self.toggle_box(),
-            // The only way out of the checkbox cursor. Without it the
+            KeyCode::Char('j') => {
+                self.clear_ticket_cursor();
+                self.move_box(1)
+            }
+            KeyCode::Char('k') => {
+                self.clear_ticket_cursor();
+                self.move_box(-1)
+            }
+            KeyCode::Char(' ') => {
+                self.clear_ticket_cursor();
+                self.toggle_box()
+            }
+            KeyCode::Char('n') => self.move_ticket(1),
+            KeyCode::Char('N') => self.move_ticket(-1),
+            // The only way out of either preview cursor. Without it the
             // highlight is a mode you can enter and not leave — the other
             // exits are all side effects (swap documents, `x` clear, edit the
-            // last box away). Esc is otherwise unbound here and still must
-            // never quit the TUI.
-            KeyCode::Esc => self.clear_box_cursor(),
+            // last box/ticket away). Esc is otherwise unbound here and still
+            // must never quit the TUI.
+            KeyCode::Esc => self.clear_cursors(),
             KeyCode::PageUp => self.preview_scroll = self.preview_scroll.saturating_sub(page),
             KeyCode::PageDown => self.preview_scroll = self.preview_scroll.saturating_add(page),
             // g/G because herdr `pane send-keys` rejects Home/End.
@@ -1091,7 +1125,7 @@ impl App {
                             // Same rule as the rename path: a wiped title is
                             // derivable again, in memory as well as on disk.
                             self.note.title_auto = self.note.title.is_empty();
-                            self.clear_box_cursor();
+                            self.clear_cursors();
                         }
                         ov.entries.remove(idx);
                     }
@@ -1129,6 +1163,49 @@ impl App {
     fn clear_box_cursor(&mut self) {
         self.box_cursor = None;
         self.follow_box = false;
+    }
+
+    /// Re-clamps the ticket ordinal against the hits the last draw found, and
+    /// drops it when there are none. Called from the draw, since the hit list
+    /// is a draw product and an edit can delete a key.
+    fn clamp_ticket_cursor(&mut self) {
+        let n = self.ticket_hits.len();
+        self.ticket_cursor = match self.ticket_cursor {
+            Some(c) if n > 0 => Some(c.min(n - 1)),
+            _ => None,
+        };
+    }
+
+    fn clear_ticket_cursor(&mut self) {
+        self.ticket_cursor = None;
+        self.follow_ticket = false;
+    }
+
+    /// Drops BOTH preview cursors. Every path that swaps or wipes the buffer
+    /// calls this rather than either single clear, so a cursor added later
+    /// cannot be missed by a document swap — the recurring bug class in this
+    /// crate (see the `toggle_global` / `global.json` gotchas).
+    fn clear_cursors(&mut self) {
+        self.clear_box_cursor();
+        self.clear_ticket_cursor();
+    }
+
+    /// Steps the ticket cursor over the last draw's hits. From no cursor, `n`
+    /// lands on the first key and `N` on the last. Clamps at both ends; does
+    /// nothing when the note has no configured keys.
+    fn move_ticket(&mut self, delta: isize) {
+        self.clamp_ticket_cursor();
+        let n = self.ticket_hits.len();
+        if n == 0 {
+            return; // clamp already dropped the cursor
+        }
+        self.clear_box_cursor(); // one cursor at a time
+        self.ticket_cursor = Some(match self.ticket_cursor {
+            None if delta > 0 => 0,
+            None => n - 1,
+            Some(c) => c.saturating_add_signed(delta).min(n - 1),
+        });
+        self.follow_ticket = true;
     }
 
     /// Steps the checkbox cursor. From no cursor, `j` lands on the first box
@@ -1387,16 +1464,25 @@ impl App {
         // only exit from that cursor, and advertising it unconditionally
         // would spend scarce columns on a key that does nothing. It costs
         // `l list` its place in the narrow cursor form — while you are stuck
-        // in a cursor, the way out beats the way to the dashboard.
+        // in a cursor, the way out beats the way to the dashboard. A third
+        // pair covers the ticket cursor: while it is live, `o` (open in
+        // browser — Task 5) and `esc drop` are the whole point, so the short
+        // ticket form drops even `e edit` to keep both inside the 37-column
+        // floor that every short form must still fit `q quit` under.
         const PREVIEW_HINTS: &str =
-            " e edit  j/k spc tick  r title  l list  Up/Dn scroll  x clear  q quit";
+            " e edit  j/k spc tick  n ticket  r title  l list  Up/Dn scroll  x clear  q quit";
         const PREVIEW_HINTS_SHORT: &str = " e edit  j/k spc tick  l list  q quit";
         const PREVIEW_HINTS_CURSOR: &str =
             " e edit  j/k spc tick  esc drop  r title  l list  Up/Dn scroll  x clear  q quit";
         const PREVIEW_HINTS_CURSOR_SHORT: &str = " e edit  j/k spc tick  esc drop  q quit";
+        const PREVIEW_HINTS_TICKET: &str =
+            " e edit  n/N ticket  o open  esc drop  r title  l list  Up/Dn scroll  q quit";
+        const PREVIEW_HINTS_TICKET_SHORT: &str = " n/N ticket  o open  esc drop  q quit";
         let hints = match self.note.mode {
             Mode::Preview => {
-                let (full, short) = if self.box_cursor.is_some() {
+                let (full, short) = if self.ticket_cursor.is_some() {
+                    (PREVIEW_HINTS_TICKET, PREVIEW_HINTS_TICKET_SHORT)
+                } else if self.box_cursor.is_some() {
                     (PREVIEW_HINTS_CURSOR, PREVIEW_HINTS_CURSOR_SHORT)
                 } else {
                     (PREVIEW_HINTS, PREVIEW_HINTS_SHORT)
@@ -1454,6 +1540,8 @@ impl App {
         // what `map` contains.
         let (mut lines, map): (Vec<Line<'static>>, Vec<Option<usize>>) =
             if self.note.text.trim().is_empty() {
+                // No text, so no keys — and no stale hits left behind for `o`.
+                self.ticket_hits.clear();
                 let mut lines = block;
                 lines.extend(empty_help().lines().map(|l| {
                     Line::from(Span::styled(l.to_string(), Style::default().add_modifier(Modifier::DIM)))
@@ -1461,7 +1549,12 @@ impl App {
                 let map = vec![None; lines.len()];
                 (lines, map)
             } else {
-                let (mut lines, mut map) = render_markdown_mapped(&self.note.text, text_w);
+                let (mut lines, mut map, mut hits) = markdown::render_markdown_tickets(
+                    &self.note.text,
+                    text_w,
+                    &self.tickets,
+                    self.ticket_cursor,
+                );
                 // The block's rows map to NO source line, so the checkbox cursor can
                 // never land on one and the highlight/scroll-follow keep pointing at
                 // real note lines. Edit mode never reaches here.
@@ -1473,9 +1566,18 @@ impl App {
                     let mut merged_map = vec![None; n];
                     merged_map.append(&mut map);
                     map = merged_map;
+                    // Hit rows index the FINAL list, so they shift with it —
+                    // the block is never scanned for tickets, only prepended.
+                    for hit in &mut hits {
+                        hit.row += n;
+                    }
                 }
+                self.ticket_hits = hits;
                 (lines, map)
             };
+        // The hit list is a draw product; an edit may have deleted the key the
+        // ordinal pointed at.
+        self.clamp_ticket_cursor();
         let total = lines.len();
         let max = total.saturating_sub(usize::from(area.height));
         if let Some(src) = self.cursor_line() {
@@ -1503,6 +1605,22 @@ impl App {
                 }
                 self.follow_box = false;
             }
+        }
+        // Same one-shot contract as `follow_box`: only right after `n`/`N`
+        // moved the cursor, never merely because a cursor exists — otherwise
+        // every other scroll key looks broken while a ticket is selected.
+        if self.follow_ticket {
+            if let Some(row) =
+                self.ticket_cursor.and_then(|c| self.ticket_hits.get(c)).map(|h| h.row)
+            {
+                let h = usize::from(area.height).max(1);
+                if row < self.preview_scroll {
+                    self.preview_scroll = row;
+                } else if row >= self.preview_scroll + h {
+                    self.preview_scroll = row + 1 - h;
+                }
+            }
+            self.follow_ticket = false;
         }
         self.preview_scroll = clamp_scroll(self.preview_scroll, total, usize::from(area.height));
         let scroll = u16::try_from(self.preview_scroll).unwrap_or(u16::MAX);
@@ -4464,5 +4582,166 @@ mod tests {
         assert!(screen.contains("Release"), "the name must not collapse to a column or two: {screen}");
         assert!(screen.contains("acme-app"), "session context still fits: {screen}");
         assert!(!screen.contains("2/3"), "the progress count is the first thing dropped: {screen}");
+    }
+
+    // ----- ticket cursor: n/N navigation -----------------------------------
+
+    fn ticket_app(text: &str) -> App {
+        let mut a = app(text);
+        a.tickets = crate::tickets::Config::from_json(
+            r#"{"HM":"https://example.test/browse/{key}"}"#,
+        );
+        a
+    }
+
+    #[test]
+    fn n_and_n_upper_walk_the_ticket_cursor_and_clamp() {
+        let mut a = ticket_app("first HM-1\nsecond HM-2\n");
+        rendered(&mut a, 40, 10);
+        assert_eq!(a.ticket_cursor, None, "no cursor until you ask for one");
+        a.on_key(key(KeyCode::Char('n')));
+        assert_eq!(a.ticket_cursor, Some(0));
+        a.on_key(key(KeyCode::Char('n')));
+        assert_eq!(a.ticket_cursor, Some(1));
+        a.on_key(key(KeyCode::Char('n')));
+        assert_eq!(a.ticket_cursor, Some(1), "clamps at the last ticket");
+        a.on_key(key(KeyCode::Char('N')));
+        assert_eq!(a.ticket_cursor, Some(0));
+        a.on_key(key(KeyCode::Char('N')));
+        assert_eq!(a.ticket_cursor, Some(0), "clamps at the first ticket");
+    }
+
+    #[test]
+    fn n_does_nothing_without_configured_tickets() {
+        let mut a = app("HM-1 here"); // no config injected
+        rendered(&mut a, 40, 10);
+        a.on_key(key(KeyCode::Char('n')));
+        assert_eq!(a.ticket_cursor, None);
+        assert!(a.ticket_hits.is_empty());
+    }
+
+    #[test]
+    fn the_two_cursors_are_mutually_exclusive() {
+        let mut a = ticket_app("[ ] task HM-1\n[ ] other\n");
+        rendered(&mut a, 40, 10);
+        a.on_key(key(KeyCode::Char('j')));
+        assert_eq!(a.box_cursor, Some(0));
+        a.on_key(key(KeyCode::Char('n')));
+        assert_eq!(a.ticket_cursor, Some(0));
+        assert_eq!(a.box_cursor, None, "n drops the checkbox cursor");
+        a.on_key(key(KeyCode::Char('j')));
+        assert_eq!(a.box_cursor, Some(0));
+        assert_eq!(a.ticket_cursor, None, "j drops the ticket cursor");
+    }
+
+    #[test]
+    fn esc_drops_both_cursors() {
+        let mut a = ticket_app("[ ] task HM-1\n");
+        rendered(&mut a, 40, 10);
+        a.on_key(key(KeyCode::Char('n')));
+        a.on_key(key(KeyCode::Esc));
+        assert_eq!(a.ticket_cursor, None);
+        assert!(!a.follow_ticket, "and the pending scroll-follow with it");
+        assert_eq!(a.box_cursor, None);
+    }
+
+    #[test]
+    fn clearing_the_note_drops_the_ticket_cursor() {
+        // A stale ordinal is harmless only while there is no text under it.
+        let mut a = ticket_app("HM-1\n");
+        rendered(&mut a, 40, 10);
+        a.on_key(key(KeyCode::Char('n')));
+        assert_eq!(a.ticket_cursor, Some(0));
+        a.on_key(key(KeyCode::Char('x')));
+        a.on_key(key(KeyCode::Char('y')));
+        assert_eq!(a.ticket_cursor, None);
+    }
+
+    #[test]
+    fn an_edit_that_removes_a_ticket_reclamps_the_cursor() {
+        let mut a = ticket_app("HM-1 and HM-2\n");
+        rendered(&mut a, 40, 10);
+        a.on_key(key(KeyCode::Char('n')));
+        a.on_key(key(KeyCode::Char('n')));
+        assert_eq!(a.ticket_cursor, Some(1));
+        a.note.text = "HM-1 only\n".to_string();
+        rendered(&mut a, 40, 10);
+        assert_eq!(a.ticket_cursor, Some(0), "clamped to the surviving ticket");
+        a.note.text = "nothing here\n".to_string();
+        rendered(&mut a, 40, 10);
+        assert_eq!(a.ticket_cursor, None);
+    }
+
+    #[test]
+    fn the_prompt_block_offsets_ticket_rows() {
+        // Hit rows index the FINAL preview line list, so they must be shifted
+        // past the prompt block the same way `map` is.
+        let mut a = ticket_app("HM-1 here\n");
+        rendered(&mut a, 40, 20);
+        let without = a.ticket_hits[0].row;
+        a.prompts = vec![crate::prompts::PromptGroup {
+            pane: "w1:p5".into(),
+            prompts: vec![prompt(1, "look at HM-1")],
+        }];
+        a.prompt_labels = vec!["claude p5".into()];
+        rendered(&mut a, 40, 20);
+        assert_eq!(a.ticket_hits.len(), 1, "the block is not scanned for tickets");
+        assert!(a.ticket_hits[0].row > without, "row shifted past the block");
+    }
+
+    #[test]
+    fn an_empty_note_has_no_hits() {
+        let mut a = ticket_app("");
+        rendered(&mut a, 40, 10);
+        assert!(a.ticket_hits.is_empty());
+        assert_eq!(a.ticket_cursor, None);
+    }
+
+    #[test]
+    fn the_ticket_cursor_scrolls_itself_into_view_once() {
+        let mut a = ticket_app(&format!("{}HM-1 at the bottom\n", "filler\n".repeat(40)));
+        rendered(&mut a, 40, 10);
+        assert_eq!(a.preview_scroll, 0);
+        a.on_key(key(KeyCode::Char('n')));
+        rendered(&mut a, 40, 10);
+        assert!(a.preview_scroll > 0, "scrolled to the only ticket");
+        assert!(!a.follow_ticket, "one-shot: cleared after the draw");
+        let settled = a.preview_scroll;
+        a.on_key(key(KeyCode::Char('g')));
+        rendered(&mut a, 40, 10);
+        assert_eq!(a.preview_scroll, 0, "manual scrolling is not fought");
+        assert!(settled > 0);
+    }
+
+    #[test]
+    fn the_footer_advertises_the_ticket_keys_while_the_cursor_is_live() {
+        let mut a = ticket_app("HM-1\n");
+        rendered(&mut a, 90, 10);
+        a.on_key(key(KeyCode::Char('n')));
+        let screen = rendered(&mut a, 90, 10);
+        assert!(screen.contains("o open"), "{screen}");
+        assert!(screen.contains("esc drop"));
+    }
+
+    #[test]
+    fn every_short_footer_form_keeps_the_quit_hint() {
+        let mut a = ticket_app("HM-1\n");
+        rendered(&mut a, 40, 10);
+        a.on_key(key(KeyCode::Char('n')));
+        let screen = rendered(&mut a, 40, 10);
+        assert!(screen.contains("q quit"), "{screen}");
+    }
+
+    #[test]
+    fn the_cursor_ordinal_spans_source_lines() {
+        // Guards the render's ordinal formula: a per-line reset would highlight
+        // the wrong key on any multi-line note.
+        let mut a = ticket_app("HM-1 here\n\nHM-2 there\n");
+        rendered(&mut a, 40, 10);
+        a.on_key(key(KeyCode::Char('n')));
+        a.on_key(key(KeyCode::Char('n')));
+        assert_eq!(a.ticket_cursor, Some(1));
+        assert_eq!(a.ticket_hits[1].key, "HM-2");
+        assert!(a.ticket_hits[0].row < a.ticket_hits[1].row);
     }
 }
