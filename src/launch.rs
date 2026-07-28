@@ -411,6 +411,37 @@ mod tests {
     }
 
     #[test]
+    fn the_staleness_threshold_is_exclusive_at_exactly_the_limit() {
+        // `token_stale` compares with a strict `>`, so a token EXACTLY
+        // HEARTBEAT_STALE_SECS old is still fresh and one second older is not.
+        // Every other test brackets the edge (5s and 60s against a 20s limit),
+        // which leaves the boundary itself free to move unnoticed — and the
+        // launcher's live/corpse decision reads the same helper.
+        let at_limit = pane_list(&format!(
+            r#"{{"pane_id":"w1:p2","tab_id":"w1:t1","tokens":{{"herdr-notes":"{}"}}}}"#,
+            100 - HEARTBEAT_STALE_SECS
+        ));
+        assert_eq!(notes_pane_fresh(&at_limit, "w1:t1", 100), Some(true), "exactly at the limit is fresh");
+
+        let one_past = pane_list(&format!(
+            r#"{{"pane_id":"w1:p2","tab_id":"w1:t1","tokens":{{"herdr-notes":"{}"}}}}"#,
+            100 - HEARTBEAT_STALE_SECS - 1
+        ));
+        assert_eq!(notes_pane_fresh(&one_past, "w1:t1", 100), Some(false), "one second past is stale");
+    }
+
+    #[test]
+    fn a_token_from_the_future_is_not_stale() {
+        // Clock skew, or a hand-edited value: `token_stale` uses
+        // `saturating_sub`, so `now - ts` floors at 0 rather than wrapping to a
+        // huge number that would read as ancient.
+        let json = pane_list(
+            r#"{"pane_id":"w1:p2","tab_id":"w1:t1","tokens":{"herdr-notes":"9999999999"}}"#,
+        );
+        assert_eq!(notes_pane_fresh(&json, "w1:t1", 100), Some(true));
+    }
+
+    #[test]
     fn notes_pane_fresh_rejects_a_stale_token() {
         // 60s old against a 20s threshold.
         let json = pane_list(

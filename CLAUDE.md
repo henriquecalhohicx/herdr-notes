@@ -569,6 +569,27 @@ Learned building this plugin:
   compare before writing. Writing unconditionally dirties the note every
   beat, which autosaves forever, bumps `updated`, and resets the header age
   to `just now` on a loop.
+- There is ONE test mutex, `state::ENV_LOCK` (`pub(crate)`, `#[cfg(test)]`,
+  module scope in `state.rs`), and `state.rs`, `app.rs` and `ipc.rs` tests all
+  import it. Any test that touches a process-global `HERDR_*` var must take it
+  and restore what it set — restore BEFORE asserting, or a failing assert
+  leaks the value into every later test. Two per-module locks existed briefly
+  and did NOT cross-serialize: same-named statics in different modules are
+  different mutexes, and all tests compile into one binary that `cargo test`
+  runs on parallel threads. Mirroring the shape of the lock is not enough; it
+  has to be the same instance.
+- `ipc` tests can reach a REAL herdr socket. `socket_path()` falls back to the
+  platform default when `HERDR_SOCKET_PATH` is unset, so on a machine with a
+  live session an "unreachable socket" test silently performs production I/O
+  against it and the connect SUCCEEDS — which is how
+  `call_text_bounded_returns_promptly_when_there_is_no_socket` came to lose its
+  `is_err()` assertion for a while. Point the var at a nonexistent path under
+  `ENV_LOCK` rather than leaving it unset.
+- Pane ids sort LEXICOGRAPHICALLY wherever the code says "lowest pane id"
+  (`pick_agent_pane`, `load_for_tab`'s tie-break), so `w1:p10` orders before
+  `w1:p2`. Determinism is what those keys are for and that is unaffected, but
+  it is not numeric order — it only decides which of two equally-eligible
+  panes wins, so nothing depends on it beyond being stable.
 
 ## README screenshots (Alex's criteria — follow on every reshoot)
 

@@ -201,11 +201,39 @@ mod tests {
     fn call_text_bounded_reports_a_timeout_as_timed_out() {
         // A zero timeout can never be met, so this exercises the timeout arm
         // without needing a hung server.
+        //
+        // Isolated for the same reason as the test above: this returns
+        // immediately on the zero bound, but its worker thread keeps going and
+        // calls `socket_path()` after we are gone. With the var unset that
+        // resolves the platform default, so on a machine with a live herdr
+        // session the detached worker performed a real `pane.list` against it
+        // on every `cargo test`. Read-only, but a unit test should not be
+        // talking to whatever session happens to be running.
+        let _guard = crate::state::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os("HERDR_SOCKET_PATH");
+        let dead = std::env::temp_dir()
+            .join(format!("herdr-notes-no-such-socket-timeout-{}", std::process::id()));
+        // SAFETY: serialized by ENV_LOCK; restored below.
+        unsafe {
+            std::env::set_var("HERDR_SOCKET_PATH", &dead);
+        }
+
         let out = call_text_bounded(
             "pane.list",
             serde_json::json!({}),
             std::time::Duration::from_millis(0),
         );
+
+        // Restore BEFORE asserting, so a failing assert cannot leak the dead
+        // path into every later test that takes ENV_LOCK.
+        // SAFETY: serialized by ENV_LOCK.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("HERDR_SOCKET_PATH", v),
+                None => std::env::remove_var("HERDR_SOCKET_PATH"),
+            }
+        }
+
         let err = out.expect_err("zero timeout cannot succeed");
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "got {err:?}");
     }

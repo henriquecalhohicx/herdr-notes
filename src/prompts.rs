@@ -298,6 +298,27 @@ mod tests {
     }
 
     #[test]
+    fn condense_budgets_chars_not_display_columns_and_that_is_deliberate() {
+        // Everywhere else in this crate width math counts DISPLAY COLUMNS
+        // (`dwidth`/`truncate_w`), because CJK and emoji are double-width. This
+        // one function deliberately does not: `MAX_CHARS` is a storage budget,
+        // not a layout one, and `app::prompt_block` re-truncates by display
+        // width before anything reaches the screen.
+        //
+        // So a CJK prompt at the storage limit is about TWICE that many columns
+        // wide on disk. Pinned here so the divergence is a decision a future
+        // reader can find, rather than something they "fix" into the renderer's
+        // convention and quietly shrink what gets stored.
+        let out = condense(&"文".repeat(200));
+        assert_eq!(out.chars().count(), MAX_CHARS, "chars are the budget");
+        let columns: usize = out.chars().map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0)).sum();
+        assert!(
+            columns > MAX_CHARS,
+            "a CJK prompt at the char budget exceeds it in columns: {columns} > {MAX_CHARS}"
+        );
+    }
+
+    #[test]
     fn payload_prompt_reads_the_prompt_field() {
         assert_eq!(
             payload_prompt(r#"{"hook_event_name":"UserPromptSubmit","prompt":"do the thing"}"#).as_deref(),
