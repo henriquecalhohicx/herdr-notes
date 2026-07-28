@@ -16,6 +16,10 @@ use std::path::{Path, PathBuf};
 pub const RING: usize = 3;
 /// Characters kept per prompt, ellipsis included.
 pub const MAX_CHARS: usize = 120;
+/// Wall-clock bound on the capture gate's `pane.list` call. Well short of the
+/// hook's own `timeout: 5`, because a hook killed at its limit is a risk to the
+/// user's prompt and this path must never approach it.
+pub const GATE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(300);
 
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Prompt {
@@ -179,9 +183,22 @@ impl CaptureEnv {
 /// inside a prompt-submit hook.
 ///
 /// Gates, in order: the off switch, running inside herdr, filename-safe tab
-/// AND pane ids (no legacy fallback — prompts are per-tab or nothing), an
-/// existing note file for the tab, and a usable payload.
-pub fn capture(dir: Option<&Path>, env: &CaptureEnv, stdin: &str, now: u64) -> bool {
+/// AND pane ids (no legacy fallback — prompts are per-tab or nothing), a live
+/// Notes pane in this tab OR an existing note file, and a usable payload.
+///
+/// `notes_live` is injected so every gate stays testable without a socket:
+/// `Some(true)` a Notes pane in this tab is alive, `Some(false)` the socket
+/// answered and none is, `None` the socket could not be reached. It is
+/// ADDITIVE — it can only open the gate earlier, never close it on something
+/// that captures today — so a socket failure degrades to the note-file check
+/// rather than to silent no-capture.
+pub fn capture(
+    dir: Option<&Path>,
+    env: &CaptureEnv,
+    stdin: &str,
+    now: u64,
+    notes_live: Option<bool>,
+) -> bool {
     if env.no_capture || !env.in_herdr {
         return false;
     }
@@ -193,13 +210,10 @@ pub fn capture(dir: Option<&Path>, env: &CaptureEnv, stdin: &str, now: u64) -> b
     else {
         return false;
     };
-    // No note for this tab means the user has not opened Notes here; writing
-    // would leave a file behind for a tab that never wanted one. The path
-    // comes from `state::note_file_in` rather than being spelled again here:
-    // this runs in a SECOND process, and a note layout that grew a suffix or a
-    // subdirectory would otherwise stop capture silently, with no diagnostic
-    // anywhere (the hook prints nothing by design).
-    if !crate::state::note_file_in(dir, &tab_key).exists() {
+    // A live Notes pane means the user is looking at this tab's note right
+    // now, so capture without waiting for them to type something into it —
+    // an empty note is `state::is_blank` and therefore has no file at all.
+    if notes_live != Some(true) && !crate::state::note_file_in(dir, &tab_key).exists() {
         return false;
     }
     let Some(text) = payload_prompt(stdin) else {
@@ -212,14 +226,17 @@ pub fn capture(dir: Option<&Path>, env: &CaptureEnv, stdin: &str, now: u64) -> b
     true
 }
 
-/// `capture` against the real environment and store dir.
+/// `capture` against the real environment, store dir, and herdr socket.
 pub fn capture_from_env(stdin: &str) -> bool {
-    capture(
-        crate::state::store_dir().as_deref(),
-        &CaptureEnv::from_process(),
-        stdin,
-        crate::state::unix_now(),
-    )
+    let env = CaptureEnv::from_process();
+    let now = crate::state::unix_now();
+    // Bounded, and only worth asking when a tab id makes the answer meaningful.
+    let notes_live = env.tab_id.as_deref().and_then(|tab| {
+        crate::ipc::call_text_bounded("pane.list", serde_json::json!({}), GATE_TIMEOUT)
+            .ok()
+            .and_then(|json| crate::launch::notes_pane_fresh(&json, tab, now))
+    });
+    capture(crate::state::store_dir().as_deref(), &env, stdin, now, notes_live)
 }
 
 #[cfg(test)]
@@ -528,7 +545,7 @@ mod tests {
     #[test]
     fn capture_writes_a_condensed_entry_when_every_gate_passes() {
         let dir = store_with_note("gate_pass");
-        assert!(capture(Some(&dir), &env_ok(), r#"{"prompt":"fix the auth test\nsecond line"}"#, 99));
+        assert!(capture(Some(&dir), &env_ok(), r#"{"prompt":"fix the auth test\nsecond line"}"#, 99, None));
         let got = captured(&dir);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].text, "fix the auth test", "first line only");
@@ -542,7 +559,7 @@ mod tests {
     fn capture_gate_1_off_switch() {
         let dir = store_with_note("gate1");
         let env = CaptureEnv { no_capture: true, ..env_ok() };
-        assert!(!capture(Some(&dir), &env, r#"{"prompt":"x"}"#, 1));
+        assert!(!capture(Some(&dir), &env, r#"{"prompt":"x"}"#, 1, None));
         assert_eq!(captured(&dir), vec![]);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -551,7 +568,7 @@ mod tests {
     fn capture_gate_2_outside_herdr() {
         let dir = store_with_note("gate2");
         let env = CaptureEnv { in_herdr: false, ..env_ok() };
-        assert!(!capture(Some(&dir), &env, r#"{"prompt":"x"}"#, 1));
+        assert!(!capture(Some(&dir), &env, r#"{"prompt":"x"}"#, 1, None));
         assert_eq!(captured(&dir), vec![]);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -565,7 +582,7 @@ mod tests {
             CaptureEnv { pane_id: None, ..env_ok() },
             CaptureEnv { pane_id: Some("../escape".into()), ..env_ok() },
         ] {
-            assert!(!capture(Some(&dir), &env, r#"{"prompt":"x"}"#, 1));
+            assert!(!capture(Some(&dir), &env, r#"{"prompt":"x"}"#, 1, None));
         }
         assert_eq!(captured(&dir), vec![], "no legacy fallback: per-tab or nothing");
         let _ = std::fs::remove_dir_all(&dir);
@@ -576,7 +593,7 @@ mod tests {
         let dir = tempdir().join("gate4");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        assert!(!capture(Some(&dir), &env_ok(), r#"{"prompt":"x"}"#, 1));
+        assert!(!capture(Some(&dir), &env_ok(), r#"{"prompt":"x"}"#, 1, None));
         assert_eq!(captured(&dir), vec![], "no note, no capture, no file");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -585,7 +602,7 @@ mod tests {
     fn capture_gate_5_unusable_payloads() {
         let dir = store_with_note("gate5");
         for stdin in ["", "not json", r#"{}"#, r#"{"prompt":""}"#, r#"{"prompt":"  "}"#] {
-            assert!(!capture(Some(&dir), &env_ok(), stdin, 1), "stdin {stdin:?} must not write");
+            assert!(!capture(Some(&dir), &env_ok(), stdin, 1, None), "stdin {stdin:?} must not write");
         }
         assert_eq!(captured(&dir), vec![]);
         let _ = std::fs::remove_dir_all(&dir);
@@ -593,7 +610,7 @@ mod tests {
 
     #[test]
     fn capture_without_a_store_dir_is_a_noop() {
-        assert!(!capture(None, &env_ok(), r#"{"prompt":"x"}"#, 1));
+        assert!(!capture(None, &env_ok(), r#"{"prompt":"x"}"#, 1, None));
     }
 
     #[test]
@@ -601,12 +618,76 @@ mod tests {
         let dir = store_with_note("per_pane");
         let p5 = CaptureEnv { pane_id: Some("w1:p5".into()), ..env_ok() };
         let p6 = CaptureEnv { pane_id: Some("w1:p6".into()), ..env_ok() };
-        assert!(capture(Some(&dir), &p5, r#"{"prompt":"from p5"}"#, 10));
-        assert!(capture(Some(&dir), &p6, r#"{"prompt":"from p6"}"#, 20));
+        assert!(capture(Some(&dir), &p5, r#"{"prompt":"from p5"}"#, 10, None));
+        assert!(capture(Some(&dir), &p6, r#"{"prompt":"from p6"}"#, 20, None));
         assert!(prompts_file(&dir, "w1_t1", &crate::state::id_key("w1:p5").unwrap()).exists());
         assert!(prompts_file(&dir, "w1_t1", &crate::state::id_key("w1:p6").unwrap()).exists());
         let got = captured(&dir);
         assert_eq!(got.iter().map(|p| p.text.as_str()).collect::<Vec<_>>(), vec!["from p6", "from p5"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn capture_needs_no_note_file_when_a_notes_pane_is_live() {
+        // The whole point of the phase: opening Notes is enough, without
+        // typing anything into the note first.
+        let dir = tempdir().join("gate_live_pane");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(capture(Some(&dir), &env_ok(), r#"{"prompt":"from a live pane"}"#, 7, Some(true)));
+        let got = load_for_tab(&dir, &crate::state::id_key("w1:t1").unwrap());
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].prompts[0].text, "from a live pane");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn capture_falls_back_to_the_note_file_when_no_pane_is_live() {
+        // Socket answered "no live Notes pane": everything that captures today
+        // must keep capturing. The answer is additive, never subtractive.
+        let dir = store_with_note("gate_no_pane");
+        assert!(capture(Some(&dir), &env_ok(), r#"{"prompt":"still captured"}"#, 7, Some(false)));
+        assert_eq!(captured(&dir).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn capture_rejects_with_neither_a_live_pane_nor_a_note_file() {
+        let dir = tempdir().join("gate_neither");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for live in [Some(false), None] {
+            assert!(!capture(Some(&dir), &env_ok(), r#"{"prompt":"x"}"#, 7, live));
+        }
+        assert_eq!(load_for_tab(&dir, &crate::state::id_key("w1:t1").unwrap()), vec![]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn capture_falls_back_to_the_note_file_when_the_socket_failed() {
+        let dir = store_with_note("gate_socket_down");
+        assert!(capture(Some(&dir), &env_ok(), r#"{"prompt":"offline"}"#, 7, None));
+        assert_eq!(captured(&dir).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_live_pane_does_not_bypass_the_earlier_gates() {
+        // The off switch, the in-herdr check and the id checks all still bind
+        // regardless of what the socket says.
+        let dir = tempdir().join("gate_precedence");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for env in [
+            CaptureEnv { no_capture: true, ..env_ok() },
+            CaptureEnv { in_herdr: false, ..env_ok() },
+            CaptureEnv { tab_id: None, ..env_ok() },
+            CaptureEnv { pane_id: Some("../escape".into()), ..env_ok() },
+        ] {
+            assert!(!capture(Some(&dir), &env, r#"{"prompt":"x"}"#, 7, Some(true)));
+        }
+        // And a live pane still cannot rescue an unusable payload.
+        assert!(!capture(Some(&dir), &env_ok(), "not json", 7, Some(true)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

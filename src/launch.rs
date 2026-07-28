@@ -121,8 +121,6 @@ fn token_stale(tokens: &serde_json::Map<String, serde_json::Value>, key: &str, n
 /// just labeled, before that pane's TUI has reported anything. Both are wrong
 /// for the capture gate, which needs evidence the pane is running: a label
 /// outlives a dead pane, the token does not.
-// Not yet called outside tests — the capture-gate wiring lands in Task 3.
-#[allow(dead_code)]
 pub fn notes_pane_fresh(pane_list_json: &str, tab_id: &str, now: u64) -> Option<bool> {
     let msg = serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json)).ok()?;
     Some(msg.result.panes.iter().any(|p| {

@@ -74,8 +74,6 @@ fn exchange<S: std::io::Read + Write>(mut stream: S, request: &str) -> std::io::
 /// Windows the named pipe is opened as a plain `File`, which has no
 /// read-timeout API. The worker can outlive the bound; that is fine here
 /// because the hook process exits straight afterward and teardown reaps it.
-// Not yet called outside tests — the capture-gate wiring lands in Task 3.
-#[allow(dead_code)]
 pub fn call_text_bounded(
     method: &str,
     params: serde_json::Value,
