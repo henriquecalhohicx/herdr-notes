@@ -188,6 +188,143 @@ fn build_tab_index(
     TabIndex { live, ctx }
 }
 
+/// What the prompt block needs to know about a pane. Built from one
+/// `pane.list` call; every field is optional at the source, so a missing one
+/// degrades rather than dropping the pane.
+struct PaneInfo {
+    /// "" when herdr has not reported an agent on this pane yet — a bare
+    /// shell pane carries only `agent_status`.
+    agent: String,
+    tab_id: String,
+    title: Option<String>,
+    cwd: Option<String>,
+}
+
+impl PaneInfo {
+    /// This pane's terminal title when it actually says something
+    /// (`meaningful_title` against its own agent name). The ONE definition,
+    /// shared by `pane_label`, `pick_title` and `maybe_autotitle`'s source-1
+    /// probe — that probe exists only to decide whether to spawn `git`, so if
+    /// it ever drifted from `pick_title`'s copy the branch would be computed
+    /// needlessly or skipped when it should run.
+    fn nice_title(&self) -> Option<String> {
+        self.title.as_deref().and_then(|t| meaningful_title(t, &self.agent))
+    }
+}
+
+type PaneIndex = std::collections::HashMap<String, PaneInfo>;
+
+/// Titles herdr reports that name the tool rather than the work. Compared
+/// case-insensitively against the trimmed title.
+const GENERIC_TITLES: [&str; 4] = ["claude code", "claude", "codex", "codex cli"];
+
+/// One `pane.list` round-trip. `None` on any call or parse failure — every
+/// caller falls back, so the block works offline.
+fn pane_index() -> Option<PaneIndex> {
+    Some(build_pane_index(&fetch_array("pane.list", "panes")?))
+}
+
+/// Pure builder over an already-fetched `panes` array — no I/O, so it is
+/// unit-tested against captured live responses. An item with no `pane_id` is
+/// the only thing skipped; everything else degrades to a default.
+fn build_pane_index(panes: &[serde_json::Value]) -> PaneIndex {
+    let mut out = PaneIndex::new();
+    for p in panes {
+        let Some(pane_id) = p.get("pane_id").and_then(|v| v.as_str()) else { continue };
+        out.insert(
+            pane_id.to_string(),
+            PaneInfo {
+                agent: p.get("agent").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                tab_id: p.get("tab_id").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                title: p
+                    .get("terminal_title_stripped")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                cwd: p.get("cwd").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            },
+        );
+    }
+    out
+}
+
+/// A terminal title worth showing: trimmed, non-empty, not the tool naming
+/// itself (`Claude Code` on an idle pane), and not a filesystem path (a bare
+/// shell pane reports its `powershell.exe` path). `None` when it says nothing.
+fn meaningful_title(title: &str, agent: &str) -> Option<String> {
+    let t = title.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let lower = t.to_ascii_lowercase();
+    if GENERIC_TITLES.contains(&lower.as_str()) || lower == agent.trim().to_ascii_lowercase() {
+        return None;
+    }
+    if t.contains('/') || t.contains('\\') || lower.ends_with(".exe") {
+        return None;
+    }
+    Some(t.to_string())
+}
+
+/// The heading for a pane's prompt group: its terminal title when meaningful,
+/// otherwise `{agent} {pane-suffix}` (`claude p8`) built from data the stored
+/// prompt always carries — so a closed pane or an unreachable socket still
+/// names its group.
+fn pane_label(pane_id: &str, agent: &str, index: Option<&PaneIndex>) -> String {
+    if let Some(info) = index.and_then(|i| i.get(pane_id))
+        && let Some(title) = info.nice_title()
+    {
+        return title;
+    }
+    let suffix = pane_id.rsplit(':').next().unwrap_or(pane_id);
+    if agent.trim().is_empty() {
+        suffix.to_string()
+    } else {
+        format!("{agent} {suffix}")
+    }
+}
+
+/// The title chain: the agent pane's terminal title when meaningful, then the
+/// git branch, then the oldest surviving captured prompt. `None` when nothing
+/// has resolved yet — the caller retries on the next heartbeat.
+fn pick_title(
+    agent_pane: Option<&PaneInfo>,
+    branch: Option<&str>,
+    oldest_prompt: Option<&str>,
+) -> Option<String> {
+    if let Some(p) = agent_pane
+        && let Some(t) = p.nice_title()
+    {
+        return Some(t);
+    }
+    // A detached HEAD names nothing.
+    if let Some(b) = branch.map(str::trim).filter(|b| !b.is_empty() && *b != "HEAD") {
+        return Some(b.to_string());
+    }
+    oldest_prompt.map(str::trim).filter(|p| !p.is_empty()).map(|p| p.to_string())
+}
+
+/// The agent pane `maybe_autotitle` reads from for this tab: the pane with
+/// the LOWEST pane id among panes on the tab that have reported a non-empty
+/// agent. `PaneIndex` is a `HashMap`, so iterating `.values().find(...)`
+/// picks whichever pane the hash happens to visit first — arbitrary, and
+/// varying per process, on exactly the tab shape this feature targets (a 2x2
+/// agent grid). Sorting by pane id makes the same tab state always yield the
+/// same pane, and so the same title/cwd.
+///
+/// herdr's synthetic `usage` pane carries a real `tab_id` and a non-empty
+/// agent, so it is skipped here exactly as `build_tab_index` skips it. Picking
+/// it would make its title source 1 and — worse — its cwd the one cwd this tab
+/// ever gets to spend on `git rev-parse`, since `git_tried` records the cwd
+/// before the spawn.
+fn pick_agent_pane<'a>(index: &'a PaneIndex, tab: &str) -> Option<&'a PaneInfo> {
+    index
+        .iter()
+        .filter(|(_, p)| p.tab_id == tab && !p.agent.trim().is_empty() && p.agent != "usage")
+        .map(|(id, p)| (id.as_str(), p))
+        .min_by_key(|(id, _)| *id)
+        .map(|(_, p)| p)
+}
+
 /// One `method` round-trip, returning `result.<key>` as a JSON array — `None`
 /// on any socket/parse failure (best-effort, never panics; the overlay just
 /// shows Unknown context for every row when this fails).
@@ -223,11 +360,18 @@ pub struct App {
     /// — draw clears it once applied — so a cursor merely existing does not
     /// fight manual scrolling (`Up`/`Dn`/`g`/`G`/PgUp/PgDn) on every frame.
     follow_box: bool,
-    /// The tab's captured prompts, newest first — merged from every agent
-    /// pane's file by `prompts::load_for_tab`, refreshed on the heartbeat
-    /// rather than per draw (a directory scan every 500ms frame is waste).
-    /// Rendered above the note, never part of the edit buffer.
-    prompts: Vec<crate::prompts::Prompt>,
+    /// The tab's captured prompts, grouped per agent pane and newest group
+    /// first, each with the heading resolved at refresh time. Refreshed on the
+    /// heartbeat rather than per draw. Rendered above the note, never part of
+    /// the edit buffer.
+    prompts: Vec<crate::prompts::PromptGroup>,
+    /// Heading per group, index-aligned with `prompts`. Resolved from one
+    /// `pane.list` call at refresh time so the draw path stays I/O-free.
+    prompt_labels: Vec<String>,
+    /// Cwds where `git rev-parse` has already been tried and failed. Without
+    /// this, a tab that is not a repo would spawn git on every heartbeat for
+    /// the life of the pane.
+    git_tried: std::collections::HashSet<String>,
     confirm_clear: bool,
     dirty: bool,
     last_edit: Instant,
@@ -272,6 +416,8 @@ impl App {
             box_cursor: None,
             follow_box: false,
             prompts: Vec::new(),
+            prompt_labels: Vec::new(),
+            git_tried: std::collections::HashSet::new(),
             confirm_clear: false,
             dirty: false,
             last_edit: Instant::now(),
@@ -398,7 +544,20 @@ impl App {
         }
         self.last_beat = Instant::now();
         self.report_tokens();
-        self.refresh_prompts();
+        // Prompt labels and the auto-title both read the SAME `pane.list`
+        // snapshot. Fetching one each meant two round-trips on every beat —
+        // and for a tab that never resolves a title (no agent pane, or no
+        // prompts yet, both normal states) that doubling never ends. Load the
+        // prompt files first (no socket traffic), then decide ONCE whether
+        // anything actually needs a snapshot, then share it. `None` — nothing
+        // needed it, or the socket is unreachable — is the offline path both
+        // consumers already handle.
+        self.load_prompts();
+        let index = (!self.prompts.is_empty() || self.autotitle_wanted())
+            .then(pane_index)
+            .flatten();
+        self.label_prompts(index.as_ref());
+        self.maybe_autotitle(index.as_ref());
     }
 
     fn report_tokens(&self) {
@@ -416,21 +575,175 @@ impl App {
         );
     }
 
-    /// Re-read the tab's prompt files. Only the tab note has prompts — the
-    /// global note is not a tab. Gated on `persist` so unit tests never touch
-    /// the real store dir.
-    /// Clears FIRST, so every exit from this function leaves a consistent
-    /// block. The two `let … else` arms below are process-env-derived and so
-    /// constant for the pane's lifetime, meaning no stale value is reachable
-    /// today — but an asymmetric clear is a trap for the next change.
+    /// Re-read the tab's prompt files AND resolve their headings, fetching a
+    /// `pane.list` snapshot only when there is something to label. For the
+    /// callers that hold no snapshot to share (construction, `toggle_global`);
+    /// `heartbeat` drives `load_prompts` + `label_prompts` itself so it can
+    /// share one snapshot with `maybe_autotitle`.
     fn refresh_prompts(&mut self) {
+        self.load_prompts();
+        let index = (!self.prompts.is_empty()).then(pane_index).flatten();
+        self.label_prompts(index.as_ref());
+    }
+
+    /// Re-read the tab's prompt files into `self.prompts`. Only the tab note
+    /// has prompts — the global note is not a tab. Gated on `persist` so unit
+    /// tests never touch the real store dir. Deliberately does NO socket I/O:
+    /// labelling is a separate step so a caller can look at the loaded groups
+    /// before deciding whether a round-trip is worth making.
+    /// Clears FIRST (labels too, so the two can never be left mismatched), so
+    /// every exit from this function leaves a consistent block. The two
+    /// `let … else` arms below are process-env-derived and so constant for the
+    /// pane's lifetime, meaning no stale value is reachable today — but an
+    /// asymmetric clear is a trap for the next change.
+    fn load_prompts(&mut self) {
         self.prompts.clear();
+        self.prompt_labels.clear();
         if !self.persist || !self.showing_tab_note() {
             return;
         }
         let Some(dir) = state::store_dir() else { return };
         let Some(key) = state::tab_env().as_deref().and_then(state::id_key) else { return };
         self.prompts = crate::prompts::load_for_tab(&dir, &key);
+    }
+
+    /// Resolve one heading per loaded prompt group from an already-fetched
+    /// `pane.list` snapshot, index-aligned with `self.prompts`. `None` (socket
+    /// unreachable, or the caller judged the round-trip unnecessary) falls
+    /// every group back to `{agent} {pane-suffix}`.
+    fn label_prompts(&mut self, index: Option<&PaneIndex>) {
+        self.prompt_labels = self
+            .prompts
+            .iter()
+            .map(|g| {
+                let agent = g.prompts.first().map(|p| p.agent.as_str()).unwrap_or("");
+                pane_label(&g.pane, agent, index)
+            })
+            .collect();
+    }
+
+    /// The oldest captured prompt still on disk, across every group. The ring
+    /// evicts, so this is the oldest SURVIVING prompt, not necessarily the
+    /// first one ever sent.
+    fn oldest_prompt_text(&self) -> Option<String> {
+        self.prompts
+            .iter()
+            .flat_map(|g| g.prompts.iter())
+            .min_by_key(|p| p.ts)
+            .map(|p| p.text.clone())
+    }
+
+    /// `git rev-parse --abbrev-ref HEAD` in `cwd`, at most once per cwd for
+    /// the life of this process. On Windows the child is spawned with
+    /// CREATE_NO_WINDOW so a console never flashes over the TUI.
+    ///
+    /// A successful call records the cwd as tried too — including a detached
+    /// HEAD, which comes back as `Some("HEAD")` here and is only rejected
+    /// later, by `pick_title`. So a pane whose cwd is on a detached HEAD the
+    /// first time this runs gets the branch source permanently disabled for
+    /// the rest of the pane's life, even if a real branch is checked out
+    /// afterwards. That is the intended shape of "at most once per cwd", not
+    /// an oversight.
+    ///
+    /// `cmd.output()` is a BLOCKING wait with no timeout, run on the event-loop
+    /// thread from inside `heartbeat()`. The once-per-cwd bound is what keeps
+    /// that survivable, and it is why relaxing that bound is not a free
+    /// change: a cwd on a disconnected network share, or a repo with a stuck
+    /// index lock, stalls input, drawing AND the heartbeat's identity
+    /// re-stamp for as long as `git` hangs. Past 20s of no re-stamp the
+    /// launcher classifies this live pane as a corpse; the next toggle takes
+    /// the REPLACE path, and `herdr pane close` kills with no signal, losing
+    /// whatever is sitting in the dirty debounce buffer. One stall per cwd per
+    /// process is the ceiling that keeps that chain from being reachable
+    /// repeatedly — anyone loosening it needs to add a timeout first.
+    fn git_branch(&mut self, cwd: &str) -> Option<String> {
+        if !self.git_tried.insert(cwd.to_string()) {
+            return None;
+        }
+        let mut cmd = std::process::Command::new("git");
+        cmd.args(["rev-parse", "--abbrev-ref", "HEAD"]).current_dir(cwd);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        let out = cmd.output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let branch = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!branch.is_empty()).then_some(branch)
+    }
+
+    /// Whether this note is a candidate for auto-titling at all — every guard
+    /// that can be answered without touching the socket. Split out of
+    /// `maybe_autotitle` so `heartbeat` can ask it BEFORE deciding whether a
+    /// `pane.list` round-trip is worth making.
+    /// A note with NOTHING in it is excluded, through the exact predicate the
+    /// delete-on-save rule uses (`state::is_blank`, checked by `persist_at`)
+    /// rather than a second emptiness test — so the two stay in lockstep by
+    /// construction. Deriving a title into an empty note makes it non-blank,
+    /// which stops the delete rule firing: a tab you only toggled Notes into
+    /// would leave a `{"text":"","title":"main"}` orphan forever (tab ids are
+    /// never reused), the `l` dashboard would fill with identical empty rows,
+    /// prompt capture's gate 4 ("a note file exists for this tab") would arm
+    /// permanently, and an overlay self-delete would be undone by the very
+    /// next heartbeat re-deriving the title. `is_blank` also matches the
+    /// pristine seed template, which is wanted here: seeded-but-untyped stays
+    /// deletable.
+    fn autotitle_wanted(&self) -> bool {
+        self.persist
+            && self.showing_tab_note()
+            && self.note.title_auto
+            && self.note.title.trim().is_empty()
+            && !state::is_blank(&self.note)
+    }
+
+    /// Derive a title for an untitled, auto-titled note. Runs on the
+    /// heartbeat; stops for good once a title is set, because `title` is then
+    /// non-empty. `title_auto` stays true — it records that the title was
+    /// derived, not that one is still pending.
+    ///
+    /// `index` is a `pane.list` snapshot the caller already holds (the
+    /// heartbeat shares one with the prompt labels); `None` is the offline
+    /// path — sources 1 and 2 are simply unavailable and a captured prompt is
+    /// the only one left.
+    fn maybe_autotitle(&mut self, index: Option<&PaneIndex>) {
+        if !self.autotitle_wanted() {
+            return;
+        }
+        let Some(tab) = state::tab_env() else { return };
+        let agent_pane = index.and_then(|i| pick_agent_pane(i, &tab));
+        let cwd = agent_pane.and_then(|p| p.cwd.clone());
+        // Source 1 first, without spawning anything: when the agent pane's
+        // terminal title already resolves, `pick_title` never falls through
+        // to the branch, so a `git` subprocess would be spawned and its
+        // result thrown away every time this is the winning source (the
+        // common case). Only compute the branch — and only then bear its
+        // process-spawn cost — once source 1 has actually missed. Asked
+        // through the SAME `nice_title` that `pick_title` uses, so the two
+        // can never disagree about whether source 1 hit.
+        let source1 = agent_pane.and_then(PaneInfo::nice_title);
+        let branch = if source1.is_none() { cwd.and_then(|c| self.git_branch(&c)) } else { None };
+        let oldest = self.oldest_prompt_text();
+        if let Some(title) = pick_title(agent_pane, branch.as_deref(), oldest.as_deref()) {
+            self.note.title = title;
+            self.touch();
+        }
+    }
+
+    /// `prompts` zipped with their resolved headings, for the renderer. A
+    /// group whose label is missing (labels cleared, prompts not) falls back
+    /// to the raw pane id rather than dropping the group.
+    fn labelled_prompts(&self) -> Vec<(String, Vec<crate::prompts::Prompt>)> {
+        self.prompts
+            .iter()
+            .enumerate()
+            .map(|(i, g)| {
+                let label = self.prompt_labels.get(i).cloned().unwrap_or_else(|| g.pane.clone());
+                (label, g.prompts.clone())
+            })
+            .collect()
     }
 
     // ----- keys --------------------------------------------------------
@@ -508,6 +821,9 @@ impl App {
             KeyCode::Enter => {
                 if let Some(buf) = self.title_input.take() {
                     self.note.title = buf.trim().to_string();
+                    // Typing a title freezes it; clearing it hands the note
+                    // back to auto-titling on the next heartbeat.
+                    self.note.title_auto = self.note.title.is_empty();
                     self.save();
                 }
             }
@@ -660,6 +976,14 @@ impl App {
                         e.updated = state::unix_now();
                         if e.is_self && self.showing_tab_note() {
                             self.note.title = title;
+                            // `set_title` just wrote this same rule to DISK.
+                            // The in-memory buffer wins on the next `save()`,
+                            // so leaving it stale would either strand a
+                            // cleared title as still-manual (auto-titling
+                            // never resumes) or claim a typed one is still
+                            // derivable — and the next edit writes the stale
+                            // value back over the disk one, permanently.
+                            self.note.title_auto = self.note.title.is_empty();
                         }
                     }
                     ov.mode = OverlayMode::List;
@@ -680,6 +1004,9 @@ impl App {
                         if e.is_self && self.showing_tab_note() {
                             self.note.text.clear();
                             self.note.title.clear();
+                            // Same rule as the rename path: a wiped title is
+                            // derivable again, in memory as well as on disk.
+                            self.note.title_auto = self.note.title.is_empty();
                             self.clear_box_cursor();
                         }
                         ov.entries.remove(idx);
@@ -1022,32 +1349,49 @@ impl App {
         // without going through it, so the render site re-checks
         // `showing_tab_note()` itself rather than trusting that invariant to
         // still hold by the time we draw.
-        let block = if self.showing_tab_note() { prompt_block(&self.prompts, text_w) } else { Vec::new() };
-        if self.note.text.trim().is_empty() {
-            // The block is at most RING + 2 rows, so nothing scrolls here and
-            // both the zeroed scroll and the `None` hint stay correct.
-            self.preview_scroll = 0;
-            let mut lines = block;
-            lines.extend(empty_help().lines().map(|l| Line::from(l.to_string())));
-            frame.render_widget(
-                Paragraph::new(lines).style(Style::default().add_modifier(Modifier::DIM)),
-                area,
-            );
-            return None;
-        }
-        let (mut lines, mut map) = render_markdown_mapped(&self.note.text, text_w);
-        // The block's rows map to NO source line, so the checkbox cursor can
-        // never land on one and the highlight/scroll-follow keep pointing at
-        // real note lines. Edit mode never reaches here.
-        if !block.is_empty() {
-            let n = block.len();
-            let mut merged = block;
-            merged.append(&mut lines);
-            lines = merged;
-            let mut merged_map = vec![None; n];
-            merged_map.append(&mut map);
-            map = merged_map;
-        }
+        let block = if self.showing_tab_note() {
+            prompt_block(&self.labelled_prompts(), text_w)
+        } else {
+            Vec::new()
+        };
+        // The empty-note help used to be a fixed-height special case (forced
+        // `preview_scroll = 0`, no hint, no scrollbar) on the assumption the
+        // block could never exceed a couple of rows. Grouping removed that
+        // bound — a multi-agent tab's block alone can run well past the pane
+        // height — so a titled, body-less note in such a tab would push the
+        // help off screen with no key able to reach it. Both branches now
+        // build `(lines, map)` and share the exact same
+        // clamp/scroll/scrollbar/hint tail below; the help rows map to NO
+        // source line (same as the block's rows), which is safe here for a
+        // stronger reason than in the real-note branch: an empty note has no
+        // checkboxes at all (`markdown::checkbox_lines` on empty text is
+        // always empty), so `cursor_line()` is unconditionally `None` on this
+        // path and the highlight/follow block below is a no-op regardless of
+        // what `map` contains.
+        let (mut lines, map): (Vec<Line<'static>>, Vec<Option<usize>>) =
+            if self.note.text.trim().is_empty() {
+                let mut lines = block;
+                lines.extend(empty_help().lines().map(|l| {
+                    Line::from(Span::styled(l.to_string(), Style::default().add_modifier(Modifier::DIM)))
+                }));
+                let map = vec![None; lines.len()];
+                (lines, map)
+            } else {
+                let (mut lines, mut map) = render_markdown_mapped(&self.note.text, text_w);
+                // The block's rows map to NO source line, so the checkbox cursor can
+                // never land on one and the highlight/scroll-follow keep pointing at
+                // real note lines. Edit mode never reaches here.
+                if !block.is_empty() {
+                    let n = block.len();
+                    let mut merged = block;
+                    merged.append(&mut lines);
+                    lines = merged;
+                    let mut merged_map = vec![None; n];
+                    merged_map.append(&mut map);
+                    map = merged_map;
+                }
+                (lines, map)
+            };
         let total = lines.len();
         let max = total.saturating_sub(usize::from(area.height));
         if let Some(src) = self.cursor_line() {
@@ -1394,24 +1738,33 @@ fn fit_right(context: &str, progress: &str, age: &str, budget: usize) -> String 
     .unwrap_or_default()
 }
 
-/// The dim `Last Prompts` block rendered above the note: a heading, up to
-/// `RING` numbered entries truncated to the pane width, and a rule. Returns
-/// no rows at all when there is nothing to show, so the note keeps the space.
-fn prompt_block(prompts: &[crate::prompts::Prompt], width: usize) -> Vec<Line<'static>> {
-    if prompts.is_empty() {
-        return Vec::new();
-    }
+/// The dim per-agent prompt block rendered above the note: one heading per
+/// group, its prompts numbered from 1, a blank line between groups, and a
+/// rule at the end. Empty groups and an empty list render nothing at all, so
+/// the note keeps the space. There is deliberately no single "Last Prompts"
+/// heading — the agent's own label is the more informative one, and two
+/// heading levels in a five-row block is noise.
+fn prompt_block(
+    groups: &[(String, Vec<crate::prompts::Prompt>)],
+    width: usize,
+) -> Vec<Line<'static>> {
     let dim = Style::default().add_modifier(Modifier::DIM);
-    let mut out = vec![Line::from(Span::styled(
-        "Last Prompts",
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
-    ))];
-    for (i, p) in prompts.iter().enumerate() {
-        // The number and its separator cost 3 columns.
-        let body = truncate_w(&p.text, width.saturating_sub(3));
-        out.push(Line::from(Span::styled(format!("{}. {body}", i + 1), dim)));
+    let head = Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM);
+    let mut out: Vec<Line<'static>> = Vec::new();
+    for (label, prompts) in groups.iter().filter(|(_, p)| !p.is_empty()) {
+        if !out.is_empty() {
+            out.push(Line::raw(""));
+        }
+        out.push(Line::from(Span::styled(truncate_w(label, width), head)));
+        for (i, p) in prompts.iter().enumerate() {
+            // The number and its separator cost 3 columns.
+            let body = truncate_w(&p.text, width.saturating_sub(3));
+            out.push(Line::from(Span::styled(format!("{}. {body}", i + 1), dim)));
+        }
     }
-    out.push(Line::from(Span::styled("─".repeat(width), dim)));
+    if !out.is_empty() {
+        out.push(Line::from(Span::styled("─".repeat(width), dim)));
+    }
     out
 }
 
@@ -1476,6 +1829,20 @@ mod tests {
         crate::prompts::Prompt { ts, pane: "w1:p5".into(), agent: "claude".into(), text: text.into() }
     }
 
+    fn group(label: &str, texts: &[&str]) -> (String, Vec<crate::prompts::Prompt>) {
+        let prompts = texts
+            .iter()
+            .enumerate()
+            .map(|(i, t)| crate::prompts::Prompt {
+                ts: (100 - i) as u64,
+                pane: "w1:p5".into(),
+                agent: "claude".into(),
+                text: (*t).into(),
+            })
+            .collect();
+        (label.to_string(), prompts)
+    }
+
     /// The env var `state::config_base()` reads. Tests that drive real
     /// persistence must redirect the MIGRATION SOURCE as well as the store
     /// dir: the tab note and (since the global note got the same one-time
@@ -1516,9 +1883,11 @@ mod tests {
     #[test]
     fn preview_renders_the_prompt_block_above_the_note() {
         let mut a = app("## Status\nmid-refactor");
-        a.prompts = vec![prompt(2, "add the rate limiter"), prompt(1, "why is auth flaky")];
+        a.prompts = vec![crate::prompts::PromptGroup {
+            pane: "w1:p5".into(),
+            prompts: vec![prompt(2, "add the rate limiter"), prompt(1, "why is auth flaky")],
+        }];
         let screen = rendered(&mut a, 60, 14);
-        assert!(screen.contains("Last Prompts"), "{screen}");
         assert!(screen.contains("add the rate limiter"), "{screen}");
         let block_at = screen.find("add the rate limiter").unwrap();
         let note_at = screen.find("mid-refactor").unwrap();
@@ -1527,21 +1896,26 @@ mod tests {
 
     #[test]
     fn the_prompt_block_is_absent_without_prompts() {
+        // No groups -> no heading, no rows, and no trailing rule (the only
+        // marker `prompt_block` ever emits with no prompts to number); this
+        // fixture's note text has no markdown hr of its own to confuse it.
         let mut a = app("## Status\nmid-refactor");
-        assert!(!rendered(&mut a, 60, 14).contains("Last Prompts"));
+        assert!(!rendered(&mut a, 60, 14).contains('─'));
     }
 
     #[test]
     fn the_prompt_block_never_shows_on_the_global_note_or_in_edit_mode() {
         let mut a = app("## Status\nmid-refactor");
-        a.prompts = vec![prompt(1, "add the rate limiter")];
+        a.prompts =
+            vec![crate::prompts::PromptGroup { pane: "w1:p5".into(), prompts: vec![prompt(1, "add the rate limiter")] }];
         a.active = ActiveNote::Global;
-        assert!(!rendered(&mut a, 60, 14).contains("Last Prompts"), "global is not a tab");
+        assert!(!rendered(&mut a, 60, 14).contains("add the rate limiter"), "global is not a tab");
 
         let mut b = app("## Status\nmid-refactor");
-        b.prompts = vec![prompt(1, "add the rate limiter")];
+        b.prompts =
+            vec![crate::prompts::PromptGroup { pane: "w1:p5".into(), prompts: vec![prompt(1, "add the rate limiter")] }];
         b.on_key(key(KeyCode::Char('e')));
-        assert!(!rendered(&mut b, 60, 14).contains("Last Prompts"), "the edit buffer is yours alone");
+        assert!(!rendered(&mut b, 60, 14).contains("add the rate limiter"), "the edit buffer is yours alone");
     }
 
     #[test]
@@ -1552,9 +1926,9 @@ mod tests {
         // nothing but the help forever and capture looks broken.
         let mut a = app("");
         a.note.title = "Auth refactor".into();
-        a.prompts = vec![prompt(1, "why is auth flaky")];
+        a.prompts =
+            vec![crate::prompts::PromptGroup { pane: "w1:p5".into(), prompts: vec![prompt(1, "why is auth flaky")] }];
         let screen = rendered(&mut a, 60, 24);
-        assert!(screen.contains("Last Prompts"), "{screen}");
         assert!(screen.contains("why is auth flaky"), "{screen}");
         assert!(screen.contains("(empty note"), "the quick-start help must survive: {screen}");
         let block_at = screen.find("why is auth flaky").unwrap();
@@ -1564,12 +1938,39 @@ mod tests {
         // The showing_tab_note() gate applies on this path exactly as it does
         // on the rendered-note one.
         let mut b = app("");
-        b.prompts = vec![prompt(1, "why is auth flaky")];
+        b.prompts =
+            vec![crate::prompts::PromptGroup { pane: "w1:p5".into(), prompts: vec![prompt(1, "why is auth flaky")] }];
         b.active = ActiveNote::Global;
         assert!(
-            !rendered(&mut b, 60, 24).contains("Last Prompts"),
+            !rendered(&mut b, 60, 24).contains("why is auth flaky"),
             "the global note is not a tab, empty or not"
         );
+    }
+
+    #[test]
+    fn the_empty_note_help_stays_reachable_behind_a_tall_prompt_block() {
+        // Four agents give a block far taller than RING + 2, so the branch
+        // that used to force preview_scroll = 0 would push the help off
+        // screen with no key able to reach it.
+        let mut a = app("");
+        a.note.title = "Titled but bodyless".into();
+        a.prompts = (0..4)
+            .map(|i| crate::prompts::PromptGroup {
+                pane: format!("w1:p{i}"),
+                prompts: (0..3)
+                    .map(|j| crate::prompts::Prompt {
+                        ts: (i * 10 + j) as u64,
+                        pane: format!("w1:p{i}"),
+                        agent: "claude".into(),
+                        text: format!("prompt {i}-{j}"),
+                    })
+                    .collect(),
+            })
+            .collect();
+        let _ = rendered(&mut a, 60, 12);
+        a.on_key(key(KeyCode::Char('G')));
+        let screen = rendered(&mut a, 60, 12);
+        assert!(a.preview_scroll > 0, "G must scroll the tall empty-note view: {screen}");
     }
 
     #[test]
@@ -1581,7 +1982,10 @@ mod tests {
         // below is what actually exercises the map's two real consumers (the
         // REVERSED highlight and the follow-scroll arithmetic).
         let mut a = app("[ ] first\n[ ] second");
-        a.prompts = vec![prompt(2, "add the rate limiter"), prompt(1, "why is auth flaky")];
+        a.prompts = vec![crate::prompts::PromptGroup {
+            pane: "w1:p5".into(),
+            prompts: vec![prompt(2, "add the rate limiter"), prompt(1, "why is auth flaky")],
+        }];
         let _ = rendered(&mut a, 60, 14);
         a.on_key(key(KeyCode::Char('j')));
         assert_eq!(a.box_cursor, Some(0));
@@ -1597,20 +2001,76 @@ mod tests {
     }
 
     #[test]
-    fn prompt_block_truncates_by_display_columns() {
-        // Through `rendered()` this cannot fail — the TestBackend buffer is
-        // exactly w cells wide and Paragraph clips at the edge, so even an
-        // untruncated block would look fine. Call the builder directly, and
-        // use double-width chars: storage truncates by CHAR count, so a
-        // 120-char CJK prompt is ~240 columns and only this render-side
-        // truncation keeps it inside the pane.
-        let wide = prompt(1, &"文".repeat(80));
+    fn prompt_block_heads_each_group_with_its_label() {
+        let groups = vec![
+            group("HM-54271 Importer", &["add the rate limiter", "why is auth flaky"]),
+            group("claude pB", &["run the migration"]),
+        ];
+        let rows: Vec<String> = prompt_block(&groups, 60).iter().map(line_text).collect();
+        let joined = rows.join("\n");
+        assert!(joined.contains("HM-54271 Importer"), "{joined}");
+        assert!(joined.contains("claude pB"), "{joined}");
+        assert!(joined.contains("1. add the rate limiter"), "{joined}");
+        assert!(joined.contains("2. why is auth flaky"), "{joined}");
+        // The discriminating assertion: group two's FIRST row restarts at 1.
+        // Continuous cross-group numbering (the bug this guards against)
+        // would render this row "3. run the migration" instead, since it is
+        // the third prompt overall.
+        assert!(
+            joined.contains("1. run the migration"),
+            "numbering restarts per group, not continues across them: {joined}"
+        );
+        assert!(
+            rows.iter().position(|r| r.contains("HM-54271")).unwrap()
+                < rows.iter().position(|r| r.contains("claude pB")).unwrap(),
+            "group order is preserved: {joined}"
+        );
+        // A blank separator sits between the two groups, and nowhere else —
+        // not before the first heading.
+        assert_eq!(
+            rows.first().map(String::as_str),
+            Some("HM-54271 Importer"),
+            "no leading blank before the first group: {joined}"
+        );
+        let heading2 = rows.iter().position(|r| r == "claude pB").unwrap();
+        assert_eq!(rows[heading2 - 1], "", "a blank line separates the groups: {joined}");
+        assert!(!joined.contains("Last Prompts"), "the single heading is gone: {joined}");
+    }
+
+    #[test]
+    fn prompt_block_is_empty_without_groups() {
+        assert!(prompt_block(&[], 60).is_empty());
+        assert!(prompt_block(&[("solo".into(), vec![])], 60).is_empty(), "a group with no prompts renders nothing");
+    }
+
+    #[test]
+    fn prompt_block_truncates_labels_and_bodies_by_display_columns() {
+        // Storage truncates by CHAR count, so a 120-char CJK prompt is ~240
+        // columns; only this render-side truncation keeps it in the pane. The
+        // heading is user-supplied too and gets the same treatment.
+        let groups = vec![group(&"文".repeat(80), &[&"文".repeat(80)])];
         for width in [12usize, 30, 60] {
-            for line in prompt_block(std::slice::from_ref(&wide), width) {
+            for line in prompt_block(&groups, width) {
                 let text = line_text(&line);
                 assert!(dwidth(&text) <= width, "row {text:?} is {} cols, want <= {width}", dwidth(&text));
             }
         }
+    }
+
+    #[test]
+    fn preview_renders_grouped_prompts_above_the_note() {
+        let mut a = app("## Status\nmid-refactor");
+        a.prompts = vec![crate::prompts::PromptGroup {
+            pane: "w1:p5".into(),
+            prompts: vec![crate::prompts::Prompt {
+                ts: 2, pane: "w1:p5".into(), agent: "claude".into(), text: "add the rate limiter".into(),
+            }],
+        }];
+        let screen = rendered(&mut a, 60, 14);
+        assert!(screen.contains("add the rate limiter"), "{screen}");
+        let block_at = screen.find("add the rate limiter").unwrap();
+        let note_at = screen.find("mid-refactor").unwrap();
+        assert!(block_at < note_at, "the block sits above the note: {screen}");
     }
 
     #[test]
@@ -1619,10 +2079,11 @@ mod tests {
         // NOT evidence that `prompt_block` truncates: `rendered()`'s
         // TestBackend buffer is exactly `w` cells wide and `Paragraph` clips
         // at the edge, so this would pass even with no truncation at all.
-        // `prompt_block_truncates_by_display_columns` above is what actually
-        // proves the truncation.
+        // `prompt_block_truncates_labels_and_bodies_by_display_columns` above
+        // is what actually proves the truncation.
         let mut a = app("## Status\nmid-refactor");
-        a.prompts = vec![prompt(1, &"z".repeat(200))];
+        a.prompts =
+            vec![crate::prompts::PromptGroup { pane: "w1:p5".into(), prompts: vec![prompt(1, &"z".repeat(200))] }];
         let screen = rendered(&mut a, 30, 14);
         for line in screen.lines() {
             assert!(dwidth(line.trim_end()) <= 30, "row overflows the pane: {line:?}");
@@ -1644,7 +2105,10 @@ mod tests {
         let _ = rendered(&mut bare, 60, 14);
 
         let mut with_block = app(&text);
-        with_block.prompts = vec![prompt(2, "add the rate limiter"), prompt(1, "why is auth flaky")];
+        with_block.prompts = vec![crate::prompts::PromptGroup {
+            pane: "w1:p5".into(),
+            prompts: vec![prompt(2, "add the rate limiter"), prompt(1, "why is auth flaky")],
+        }];
         for _ in 0..40 {
             with_block.on_key(key(KeyCode::Char('j')));
         }
@@ -1653,7 +2117,7 @@ mod tests {
         // Matches draw_preview's own `text_w` derivation: area.width - 1 for
         // the scrollbar column, with the 60-wide `rendered()` call above.
         let text_w = usize::from(60u16).saturating_sub(1).max(1);
-        let block_rows = prompt_block(&with_block.prompts, text_w).len();
+        let block_rows = prompt_block(&with_block.labelled_prompts(), text_w).len();
         assert!(block_rows > 0, "the fixture must actually produce a block");
         assert_eq!(
             with_block.preview_scroll,
@@ -1862,6 +2326,461 @@ mod tests {
         a.on_key(key(KeyCode::Esc));
         assert_eq!(a.note.title, "Hi", "Esc discards the title edit");
         assert!(!a.on_key(key(KeyCode::Esc)), "Esc still never quits");
+    }
+
+    #[test]
+    fn typing_a_title_freezes_it_and_clearing_re_enables_auto() {
+        let mut a = app("body");
+        assert!(a.note.title_auto, "an untitled note starts derivable");
+        a.on_key(key(KeyCode::Char('r')));
+        for c in "HM-1".chars() {
+            a.on_key(key(KeyCode::Char(c)));
+        }
+        a.on_key(key(KeyCode::Enter));
+        assert_eq!(a.note.title, "HM-1");
+        assert!(!a.note.title_auto, "a typed title is frozen");
+
+        a.on_key(key(KeyCode::Char('r')));
+        for _ in 0..8 {
+            a.on_key(key(KeyCode::Backspace));
+        }
+        a.on_key(key(KeyCode::Enter));
+        assert_eq!(a.note.title, "");
+        assert!(a.note.title_auto, "clearing hands it back to auto");
+    }
+
+    #[test]
+    fn escaping_the_title_editor_leaves_the_flag_alone() {
+        let mut a = app("body");
+        a.note.title = "Mine".into();
+        a.note.title_auto = false;
+        a.on_key(key(KeyCode::Char('r')));
+        a.on_key(key(KeyCode::Char('x')));
+        a.on_key(key(KeyCode::Esc));
+        assert_eq!(a.note.title, "Mine");
+        assert!(!a.note.title_auto);
+    }
+
+    fn info(agent: &str, title: Option<&str>, cwd: Option<&str>) -> PaneInfo {
+        PaneInfo {
+            agent: agent.into(),
+            tab_id: "wD:t2".into(),
+            title: title.map(|s| s.to_string()),
+            cwd: cwd.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn pick_title_prefers_a_meaningful_terminal_title() {
+        let p = info("claude", Some("HM-54271 Importer"), Some("C:\\repo"));
+        assert_eq!(
+            pick_title(Some(&p), Some("some-branch"), Some("a prompt")).as_deref(),
+            Some("HM-54271 Importer")
+        );
+    }
+
+    #[test]
+    fn pick_title_falls_through_to_the_branch_then_the_prompt() {
+        // Generic title -> branch wins.
+        let generic = info("claude", Some("Claude Code"), Some("C:\\repo"));
+        assert_eq!(
+            pick_title(Some(&generic), Some("20260727-team-solutions"), Some("a prompt")).as_deref(),
+            Some("20260727-team-solutions")
+        );
+        // No branch either -> the prompt.
+        assert_eq!(pick_title(Some(&generic), None, Some("a prompt")).as_deref(), Some("a prompt"));
+        // Nothing at all.
+        assert_eq!(pick_title(Some(&generic), None, None), None);
+        // No agent pane in the tab: branch and prompt still work.
+        assert_eq!(pick_title(None, Some("br"), Some("a prompt")).as_deref(), Some("br"));
+        assert_eq!(pick_title(None, None, Some("a prompt")).as_deref(), Some("a prompt"));
+        assert_eq!(pick_title(None, None, None), None);
+    }
+
+    #[test]
+    fn pick_title_rejects_a_detached_head_and_blank_sources() {
+        let generic = info("claude", Some("Claude Code"), Some("C:\\repo"));
+        assert_eq!(
+            pick_title(Some(&generic), Some("HEAD"), Some("a prompt")).as_deref(),
+            Some("a prompt"),
+            "a detached HEAD is not a name"
+        );
+        assert_eq!(pick_title(Some(&generic), Some("   "), Some("a prompt")).as_deref(), Some("a prompt"));
+        assert_eq!(pick_title(Some(&generic), Some("br"), Some("   ")).as_deref(), Some("br"));
+    }
+
+    #[test]
+    fn maybe_autotitle_derives_from_the_oldest_prompt_and_is_gated_by_title_state_and_active_note() {
+        // The `app()` helper builds with `persist = false`, so
+        // `maybe_autotitle`'s FIRST guard (`if !self.persist`) returns before
+        // `title_auto`/`title` are ever read — a test built on it would pass
+        // whether or not the rest of the function does anything at all.
+        // Real coverage needs a real `persist = true` App, following
+        // `prompts_load_at_construction_and_on_every_global_toggle`'s harness
+        // exactly: a temp store dir, `HERDR_*` env under `ENV_LOCK`, and a
+        // dead socket so `pane_index()` returns `None` — with sources 1 and 2
+        // (terminal title, git branch) unavailable, a captured prompt is the
+        // only reachable source, which is exactly what this exercises.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("notes-autotitle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config-base");
+        std::fs::create_dir_all(&cfg).unwrap();
+
+        // The note needs a BODY: an empty one is blank, and a blank note is
+        // never auto-titled (it would stop `persist_at` deleting it and leave
+        // an orphan file — see
+        // `autotitle_never_titles_a_blank_note_so_it_stays_deletable`). This
+        // fixture used to be `Note::default()`, which `persist_at` declines to
+        // write at all, so every case below ran against a blank buffer.
+        state::persist_at(
+            &dir.join("w1_t1.json"),
+            &Note { text: "a real body".into(), ..Default::default() },
+            "w1:t1",
+            100,
+        );
+        state::persist_at(
+            &dir.join("global.json"),
+            &Note { text: "GLOBAL BODY".into(), ..Default::default() },
+            "",
+            100,
+        );
+        let key = state::id_key("w1:t1").unwrap();
+        let pane_key = state::id_key("w1:p5").unwrap();
+        crate::prompts::append_at(
+            &crate::prompts::prompts_file(&dir, &key, &pane_key),
+            crate::prompts::Prompt {
+                ts: 7,
+                pane: "w1:p5".into(),
+                agent: "claude".into(),
+                text: "why is auth flaky".into(),
+            },
+        );
+
+        let sock = dir.join("no-such.sock");
+        let prev = swap_env(&[
+            ("HERDR_PLUGIN_STATE_DIR", Some(dir.as_os_str())),
+            ("HERDR_TAB_ID", Some(std::ffi::OsStr::new("w1:t1"))),
+            ("HERDR_PANE_ID", None),
+            ("HERDR_SOCKET_PATH", Some(sock.as_os_str())),
+            (CONFIG_BASE_VAR, Some(cfg.as_os_str())),
+        ]);
+
+        let mut a = App::new();
+        assert!(a.note.title.trim().is_empty(), "fixture loads untitled");
+        assert!(a.note.title_auto, "fixture loads auto");
+        assert!(!a.dirty, "construction alone must not dirty the note");
+
+        // Case 1: untitled + auto + a prompt on disk -> derived from it.
+        a.maybe_autotitle(None);
+        assert_eq!(a.note.title, "why is auth flaky");
+        assert!(a.note.title_auto, "title_auto stays true — it records derivation, not pending-ness");
+        assert!(a.dirty, "a derived title must autosave, same as any other edit");
+
+        // Case 2: a title that is already set (derived or typed) is never
+        // re-derived, even though the prompt is still sitting right there.
+        a.dirty = false;
+        a.maybe_autotitle(None);
+        assert_eq!(a.note.title, "why is auth flaky", "an already-titled note is untouched");
+        assert!(!a.dirty, "no mutation means no new dirty flag");
+
+        // Case 3: `title_auto = false` (a manually typed title) is untouched
+        // even with an empty title — the FIRST guard catches it before the
+        // prompt is ever looked at.
+        a.note.title.clear();
+        a.note.title_auto = false;
+        a.dirty = false;
+        a.maybe_autotitle(None);
+        assert!(a.note.title.trim().is_empty(), "a manual (title_auto=false) note is never auto-titled");
+        assert!(!a.dirty);
+
+        // Case 4: the pane showing the GLOBAL note is untouched even when
+        // untitled and auto — the global note is not a tab, so it must never
+        // pick up a tab's prompt.
+        a.note.title_auto = true;
+        a.active = ActiveNote::Global;
+        a.dirty = false;
+        a.maybe_autotitle(None);
+        assert!(a.note.title.trim().is_empty(), "the global note is never auto-titled from tab sources");
+        assert!(!a.dirty);
+
+        restore_env(prev);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn one_heartbeat_loads_prompts_and_derives_a_title_from_one_shared_index() {
+        // `refresh_prompts` and `maybe_autotitle` used to fetch `pane.list`
+        // independently, every 5s, forever — for a tab that never resolves a
+        // title (no agent pane, or no prompts yet) that doubling is permanent,
+        // not one heartbeat. The heartbeat now fetches at most ONE snapshot
+        // and threads it into both. The round-trip COUNT is not observable
+        // from here (the socket is deliberately dead); what this pins is that
+        // the threaded path still does both jobs in a single beat.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("notes-heartbeat-share-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config-base");
+        std::fs::create_dir_all(&cfg).unwrap();
+
+        let key = state::id_key("w1:t1").unwrap();
+        state::persist_at(
+            &dir.join(format!("{key}.json")),
+            &Note { text: "real body".into(), ..Default::default() },
+            "w1:t1",
+            100,
+        );
+        let pane_key = state::id_key("w1:p5").unwrap();
+        crate::prompts::append_at(
+            &crate::prompts::prompts_file(&dir, &key, &pane_key),
+            crate::prompts::Prompt {
+                ts: 7,
+                pane: "w1:p5".into(),
+                agent: "claude".into(),
+                text: "why is auth flaky".into(),
+            },
+        );
+
+        let sock = dir.join("no-such.sock");
+        let prev = swap_env(&[
+            ("HERDR_PLUGIN_STATE_DIR", Some(dir.as_os_str())),
+            ("HERDR_TAB_ID", Some(std::ffi::OsStr::new("w1:t1"))),
+            ("HERDR_PANE_ID", None),
+            ("HERDR_SOCKET_PATH", Some(sock.as_os_str())),
+            (CONFIG_BASE_VAR, Some(cfg.as_os_str())),
+        ]);
+
+        let mut a = App::new();
+        a.note.title.clear();
+        a.note.title_auto = true;
+        a.prompts.clear();
+        a.prompt_labels.clear();
+        a.last_beat = Instant::now().checked_sub(HEARTBEAT_EVERY * 2).unwrap();
+        a.heartbeat();
+        assert_eq!(a.prompts.len(), 1, "the beat reloaded the prompt block");
+        assert_eq!(a.prompt_labels.len(), a.prompts.len(), "and labelled it (offline fallback)");
+        assert_eq!(a.prompt_labels[0], "claude p5", "no socket -> {{agent}} {{pane-suffix}}");
+        assert_eq!(a.note.title, "why is auth flaky", "the same beat derived the title");
+
+        restore_env(prev);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn autotitle_never_titles_a_blank_note_so_it_stays_deletable() {
+        // Deriving a title into a note with NOTHING in it makes it non-blank,
+        // so `persist_at`'s delete rule stops firing and every tab that merely
+        // toggled Notes on leaves a `{"text":"","title":"main"}` orphan behind
+        // — permanently, because tab ids are never reused. Same harness as the
+        // gate test below: temp store, dead socket, one prompt on disk as the
+        // only reachable title source.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("notes-autotitle-blank-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config-base");
+        std::fs::create_dir_all(&cfg).unwrap();
+
+        let key = state::id_key("w1:t1").unwrap();
+        let pane_key = state::id_key("w1:p5").unwrap();
+        crate::prompts::append_at(
+            &crate::prompts::prompts_file(&dir, &key, &pane_key),
+            crate::prompts::Prompt {
+                ts: 7,
+                pane: "w1:p5".into(),
+                agent: "claude".into(),
+                text: "why is auth flaky".into(),
+            },
+        );
+
+        let sock = dir.join("no-such.sock");
+        let prev = swap_env(&[
+            ("HERDR_PLUGIN_STATE_DIR", Some(dir.as_os_str())),
+            ("HERDR_TAB_ID", Some(std::ffi::OsStr::new("w1:t1"))),
+            ("HERDR_PANE_ID", None),
+            ("HERDR_SOCKET_PATH", Some(sock.as_os_str())),
+            (CONFIG_BASE_VAR, Some(cfg.as_os_str())),
+        ]);
+
+        let note_file = dir.join(format!("{key}.json"));
+        let mut a = App::new();
+        assert!(state::is_blank(&a.note), "fixture: nothing typed, no title");
+        assert!(a.note.title_auto);
+
+        a.maybe_autotitle(None);
+        assert!(
+            a.note.title.trim().is_empty(),
+            "an empty note must not be auto-titled — the title alone would keep the file alive"
+        );
+        assert!(!a.dirty, "no derivation means nothing to autosave");
+        a.save();
+        assert!(!note_file.exists(), "an untouched tab must leave NO note file on disk");
+
+        // `is_blank` also matches the pristine seed template exactly, so a
+        // seeded-but-untyped note is deletable too and must stay untitled.
+        a.note.text = crate::template::DEFAULT.to_string();
+        a.maybe_autotitle(None);
+        assert!(a.note.title.trim().is_empty(), "the pristine seed template counts as blank");
+        a.save();
+        assert!(!note_file.exists(), "a seeded-but-untyped note still writes no file");
+
+        // The moment there IS something in the note, the title resolves.
+        a.note.text = "actual work".into();
+        a.maybe_autotitle(None);
+        assert_eq!(a.note.title, "why is auth flaky", "a note with content IS titled");
+        a.save();
+        assert!(note_file.exists(), "and now it persists");
+
+        restore_env(prev);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pick_agent_pane_skips_the_synthetic_usage_pane() {
+        // herdr reports a synthetic `usage` pane carrying a real `tab_id`.
+        // `build_tab_index` already skips it; picking it here would make ITS
+        // terminal title source 1 and — worse — ITS cwd the one cwd the tab
+        // ever gets to spend on `git rev-parse` (`git_tried` records the cwd
+        // before the spawn, so the wrong cwd consumes the single attempt).
+        let mut idx = PaneIndex::new();
+        idx.insert("w1:p1".into(), PaneInfo {
+            agent: "usage".into(),
+            tab_id: "w1:t1".into(),
+            title: Some("Usage".into()),
+            cwd: Some("C:\\wrong".into()),
+        });
+        idx.insert("w1:p3".into(), PaneInfo {
+            agent: "claude".into(),
+            tab_id: "w1:t1".into(),
+            title: Some("Real Work".into()),
+            cwd: Some("C:\\repo".into()),
+        });
+        let p = pick_agent_pane(&idx, "w1:t1").expect("the real agent pane is still a candidate");
+        assert_eq!(p.title.as_deref(), Some("Real Work"), "the usage pane sorts lower but must be skipped");
+        assert_eq!(p.cwd.as_deref(), Some("C:\\repo"), "and so must its cwd");
+
+        // A tab holding ONLY a usage pane has no agent pane at all.
+        let mut only_usage = PaneIndex::new();
+        only_usage.insert("w1:p1".into(), PaneInfo {
+            agent: "usage".into(),
+            tab_id: "w1:t1".into(),
+            title: Some("Usage".into()),
+            cwd: Some("C:\\wrong".into()),
+        });
+        assert!(pick_agent_pane(&only_usage, "w1:t1").is_none());
+    }
+
+    #[test]
+    fn pick_agent_pane_is_deterministic_by_lowest_pane_id() {
+        // `PaneIndex` is a `HashMap`, so before this fix, picking a tab's
+        // agent pane via `.values().find(...)` visited panes in whatever
+        // order the hash happened to put them in — arbitrary, and different
+        // per process, on exactly the tab shape this feature targets (two or
+        // more agent panes in one tab). Demonstrated empirically below rather
+        // than asserted on faith: rebuilding the SAME entries many times and
+        // taking the naive first match disagrees with the lowest-pane-id
+        // choice across enough trials, in this very run — so a test pinned to
+        // one title would have failed against the old code intermittently,
+        // not passed by luck of a single build.
+        let build = || {
+            let mut idx = PaneIndex::new();
+            idx.insert("w1:p9".into(), PaneInfo {
+                agent: "claude".into(),
+                tab_id: "w1:t1".into(),
+                title: Some("Zeta".into()),
+                cwd: Some("C:\\zeta".into()),
+            });
+            idx.insert("w1:p2".into(), PaneInfo {
+                agent: "codex".into(),
+                tab_id: "w1:t1".into(),
+                title: Some("Alpha".into()),
+                cwd: Some("C:\\alpha".into()),
+            });
+            idx.insert("w1:p5".into(), PaneInfo {
+                agent: "claude".into(),
+                tab_id: "w1:t1".into(),
+                title: Some("Mid".into()),
+                cwd: Some("C:\\mid".into()),
+            });
+            // A pane on a DIFFERENT tab, and a bare shell pane (no agent yet)
+            // on the SAME tab: neither may ever be picked.
+            idx.insert("w1:p1".into(), PaneInfo {
+                agent: "claude".into(),
+                tab_id: "w1:t9".into(),
+                title: Some("Other tab".into()),
+                cwd: None,
+            });
+            idx.insert("w1:p0".into(), PaneInfo {
+                agent: String::new(),
+                tab_id: "w1:t1".into(),
+                title: Some("Shell".into()),
+                cwd: None,
+            });
+            idx
+        };
+
+        let mut naive_titles = std::collections::HashSet::new();
+        for _ in 0..300 {
+            let idx = build();
+            let naive = idx.values().find(|p| p.tab_id == "w1:t1" && !p.agent.trim().is_empty());
+            naive_titles.insert(naive.and_then(|p| p.title.clone()));
+        }
+        assert!(
+            naive_titles.len() > 1,
+            "sanity check: the naive `.values().find` selection must actually vary across \
+             HashMap instances for this to be a real regression test rather than a coincidence \
+             — got {naive_titles:?}"
+        );
+
+        for _ in 0..300 {
+            let idx = build();
+            let picked = pick_agent_pane(&idx, "w1:t1").expect("a candidate exists");
+            assert_eq!(picked.title.as_deref(), Some("Alpha"), "lowest pane id (w1:p2) wins, every trial");
+        }
+    }
+
+    #[test]
+    fn autotitle_uses_the_oldest_surviving_prompt() {
+        // The ring holds RING, so the genuinely-first prompt is gone after
+        // enough submissions — the oldest SURVIVING one is what source 3 gives.
+        let mut a = app("body");
+        a.prompts = vec![crate::prompts::PromptGroup {
+            pane: "w1:p5".into(),
+            prompts: vec![
+                crate::prompts::Prompt { ts: 30, pane: "w1:p5".into(), agent: "claude".into(), text: "newest".into() },
+                crate::prompts::Prompt { ts: 10, pane: "w1:p5".into(), agent: "claude".into(), text: "oldest".into() },
+            ],
+        }];
+        assert_eq!(a.oldest_prompt_text().as_deref(), Some("oldest"));
+    }
+
+    #[test]
+    fn oldest_prompt_text_spans_every_group() {
+        let mut a = app("body");
+        a.prompts = vec![
+            crate::prompts::PromptGroup {
+                pane: "w1:p5".into(),
+                prompts: vec![crate::prompts::Prompt { ts: 30, pane: "w1:p5".into(), agent: "claude".into(), text: "p5".into() }],
+            },
+            crate::prompts::PromptGroup {
+                pane: "w1:p6".into(),
+                prompts: vec![crate::prompts::Prompt { ts: 5, pane: "w1:p6".into(), agent: "claude".into(), text: "p6".into() }],
+            },
+        ];
+        assert_eq!(a.oldest_prompt_text().as_deref(), Some("p6"), "oldest across all groups");
+    }
+
+    #[test]
+    fn the_git_branch_is_attempted_at_most_once_per_cwd() {
+        // An unresolvable tab would otherwise spawn git every 5s forever.
+        let mut a = app("body");
+        let cwd = "C:\\definitely\\not\\a\\repo\\anywhere";
+        assert_eq!(a.git_branch(cwd), None);
+        assert!(a.git_tried.contains(cwd), "the failure is remembered");
+        assert_eq!(a.git_branch(cwd), None, "second call is a no-op");
+        assert_eq!(a.git_tried.len(), 1);
     }
 
     #[test]
@@ -2110,6 +3029,58 @@ mod tests {
     }
 
     #[test]
+    fn overlay_clearing_own_row_title_hands_the_in_memory_note_back_to_auto() {
+        // `state::set_title` writes `title_auto = title.is_empty()` to DISK.
+        // The in-memory buffer wins on the next `save()`, so leaving it stale
+        // means the README's "clear the title to hand it back to auto-titling"
+        // silently does nothing, and the next edit writes the stale
+        // `title_auto:false` back over the disk value, making it permanent.
+        let mut a = app("body");
+        a.note.title = "Mine".into();
+        a.note.title_auto = false; // hand-typed
+        let mut e = entry_with_tab("Mine", state::TabStatus::Live, "w1:t1");
+        e.is_self = true;
+        a.overlay = Some(Overlay::from_entries(vec![e]));
+        a.on_key(key(KeyCode::Char('r')));
+        for _ in 0.."Mine".len() {
+            a.on_key(key(KeyCode::Backspace));
+        }
+        a.on_key(key(KeyCode::Enter));
+        assert_eq!(a.note.title, "", "the buffer's title is cleared");
+        assert!(a.note.title_auto, "and the buffer agrees with what set_title wrote to disk");
+    }
+
+    #[test]
+    fn overlay_renaming_own_row_marks_the_in_memory_note_manual() {
+        // The mirror case: a typed title is manual on disk, so the buffer must
+        // not keep claiming the note is still derivable.
+        let mut a = app("body");
+        assert!(a.note.title_auto, "starts derivable");
+        let mut e = entry_with_tab("", state::TabStatus::Live, "w1:t1");
+        e.is_self = true;
+        a.overlay = Some(Overlay::from_entries(vec![e]));
+        a.on_key(key(KeyCode::Char('r')));
+        a.on_key(key(KeyCode::Char('Z')));
+        a.on_key(key(KeyCode::Enter));
+        assert_eq!(a.note.title, "Z");
+        assert!(!a.note.title_auto, "a typed title is manual in memory too");
+    }
+
+    #[test]
+    fn overlay_deleting_own_row_leaves_the_in_memory_note_auto() {
+        let mut a = app("body");
+        a.note.title = "Mine".into();
+        a.note.title_auto = false;
+        let mut e = entry_with_tab("Mine", state::TabStatus::Live, "w1:t1");
+        e.is_self = true;
+        a.overlay = Some(Overlay::from_entries(vec![e]));
+        a.on_key(key(KeyCode::Char('d')));
+        a.on_key(key(KeyCode::Char('y')));
+        assert_eq!(a.note.title, "");
+        assert!(a.note.title_auto, "a wiped note is derivable again, in memory as well as on disk");
+    }
+
+    #[test]
     fn overlay_rows_show_todo_progress() {
         let mut a = app("body");
         let mut e = entry_with_tab("Busy Tab", state::TabStatus::Live, "w1:t1");
@@ -2231,6 +3202,81 @@ mod tests {
         assert!(idx.ctx.is_empty(), "no resolvable workspace label -> no context, not a crash");
     }
 
+    fn pane_json(pane_id: &str, tab_id: &str, agent: Option<&str>, title: &str, cwd: &str) -> serde_json::Value {
+        let mut v = serde_json::json!({
+            "pane_id": pane_id,
+            "tab_id": tab_id,
+            "terminal_title_stripped": title,
+            "cwd": cwd,
+        });
+        if let Some(a) = agent {
+            v["agent"] = serde_json::Value::String(a.to_string());
+        }
+        v
+    }
+
+    #[test]
+    fn build_pane_index_keeps_agent_panes_and_their_fields() {
+        // Shapes captured from a live `pane.list` on herdr 0.7.4.
+        let panes = vec![
+            pane_json("wD:p8", "wD:t2", Some("claude"), "Claude Code", "C:\\repo"),
+            pane_json("wD:pB", "wD:t2", None, "C:\\WINDOWS\\powershell.exe", "C:\\repo"),
+        ];
+        let idx = build_pane_index(&panes);
+        let p8 = idx.get("wD:p8").expect("agent pane indexed");
+        assert_eq!(p8.agent, "claude");
+        assert_eq!(p8.tab_id, "wD:t2");
+        assert_eq!(p8.title.as_deref(), Some("Claude Code"));
+        assert_eq!(p8.cwd.as_deref(), Some("C:\\repo"));
+        let shell = idx.get("wD:pB").expect("shell panes are indexed too");
+        assert_eq!(shell.agent, "", "no agent reported yet");
+    }
+
+    #[test]
+    fn build_pane_index_skips_items_missing_a_pane_id() {
+        let panes = vec![serde_json::json!({"tab_id": "wD:t2", "agent": "claude"})];
+        assert!(build_pane_index(&panes).is_empty());
+    }
+
+    #[test]
+    fn meaningful_title_rejects_generic_names_and_paths() {
+        assert_eq!(meaningful_title("HM-54271 Generic Importer", "claude").as_deref(), Some("HM-54271 Generic Importer"));
+        assert_eq!(meaningful_title("  spaced  ", "claude").as_deref(), Some("spaced"), "trimmed");
+        assert_eq!(meaningful_title("", "claude"), None);
+        assert_eq!(meaningful_title("   ", "claude"), None);
+        assert_eq!(meaningful_title("Claude Code", "claude"), None);
+        assert_eq!(meaningful_title("claude code", "claude"), None, "case-insensitive");
+        assert_eq!(meaningful_title("CLAUDE", "claude"), None);
+        assert_eq!(meaningful_title("Codex", "codex"), None);
+        assert_eq!(meaningful_title("C:\\WINDOWS\\powershell.exe", ""), None, "path-shaped");
+        assert_eq!(meaningful_title("/usr/bin/bash", ""), None);
+        assert_eq!(meaningful_title("something.exe", ""), None);
+        assert_eq!(meaningful_title("SOMETHING.EXE", ""), None, "suffix is case-insensitive");
+    }
+
+    #[test]
+    fn pane_label_prefers_a_meaningful_title() {
+        let panes = vec![pane_json("wD:p8", "wD:t2", Some("claude"), "HM-54271 Importer", "C:\\repo")];
+        let idx = build_pane_index(&panes);
+        assert_eq!(pane_label("wD:p8", "claude", Some(&idx)), "HM-54271 Importer");
+    }
+
+    #[test]
+    fn pane_label_falls_back_to_agent_and_pane_suffix() {
+        let panes = vec![pane_json("wD:p8", "wD:t2", Some("claude"), "Claude Code", "C:\\repo")];
+        let idx = build_pane_index(&panes);
+        // Generic title -> fallback.
+        assert_eq!(pane_label("wD:p8", "claude", Some(&idx)), "claude p8");
+        // Pane closed since capture -> not in the index at all.
+        assert_eq!(pane_label("wD:p9", "claude", Some(&idx)), "claude p9");
+        // Socket unreachable -> no index at all.
+        assert_eq!(pane_label("wD:p8", "claude", None), "claude p8");
+        // A pane id with no colon still yields something.
+        assert_eq!(pane_label("odd", "claude", None), "claude odd");
+        // No agent recorded either.
+        assert_eq!(pane_label("wD:p8", "", None), "p8");
+    }
+
     #[test]
     fn prompts_load_at_construction_and_on_every_global_toggle() {
         // The block used to be populated ONLY by the 5s-throttled heartbeat,
@@ -2278,24 +3324,43 @@ mod tests {
             (CONFIG_BASE_VAR, Some(cfg.as_os_str())),
         ]);
 
+        // The socket path is deliberately dead (`no-such.sock`), so
+        // `pane_index()` returns `None` and every group's label falls back to
+        // `{agent} {pane-suffix}` — the same fallback `pane_label` is unit
+        // tested against directly elsewhere. Derived rather than hardcoded so
+        // this test tracks that fallback's actual shape instead of guessing it.
+        let expected_label = pane_label("w1:p5", "claude", None);
+
         // Construction — not the first heartbeat — populates the block.
         let mut a = App::new();
         assert_eq!(a.note.text, "TAB BODY");
         assert_eq!(
-            a.prompts.iter().map(|p| p.text.as_str()).collect::<Vec<_>>(),
+            a.prompts.iter().flat_map(|g| g.prompts.iter()).map(|p| p.text.as_str()).collect::<Vec<_>>(),
             vec!["why is auth flaky"],
             "the prompt block must be populated at construction, not up to 5s later"
         );
+        assert_eq!(
+            a.prompt_labels,
+            vec![expected_label.clone()],
+            "labels are resolved at construction too, index-aligned with prompts"
+        );
 
-        // Tab -> Global: the global note is not a tab and carries no prompts.
+        // Tab -> Global: the global note is not a tab and carries no prompts
+        // or labels — both vectors clear symmetrically.
         a.toggle_global();
         assert_eq!(a.active, ActiveNote::Global);
         assert!(a.prompts.is_empty(), "the global note carries no prompts");
+        assert!(a.prompt_labels.is_empty(), "the global note carries no labels either");
 
         // Global -> Tab: the block is back at once, again without a heartbeat.
         a.toggle_global();
         assert_eq!(a.active, ActiveNote::Tab);
         assert_eq!(a.prompts.len(), 1, "returning to the tab note refreshes the block immediately");
+        assert_eq!(
+            a.prompt_labels,
+            vec![expected_label],
+            "labels are refreshed and re-aligned on the way back too"
+        );
 
         restore_env(prev);
         let _ = std::fs::remove_dir_all(&dir);

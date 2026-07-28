@@ -131,12 +131,20 @@ built in.
 
 ## Prompt capture
 
-Notes can show the last few prompts you typed into a Claude Code pane sharing
-the tab, so you don't lose track of what you asked for while you're jotting
-things down beside it. A `UserPromptSubmit` hook writes each prompt (first
-line, truncated) to a small per-pane file; the pane merges every agent pane's
-file for the tab and renders a dim "Last Prompts" block above the note in
-preview.
+Notes can show the last few prompts you typed into each Claude Code pane
+sharing the tab, so you don't lose track of what you asked for while you're
+jotting things down beside it. A `UserPromptSubmit` hook writes each prompt
+(first line, truncated) to a small per-pane file; the pane groups them by
+agent pane and renders one heading per pane above the note in preview, each
+with its own last 3 prompts numbered underneath — a four-agent tab keeps
+twelve prompts on screen, not three shared between all of them.
+
+An untitled note also picks up an automatic title as soon as one is
+available: the agent pane's terminal title when it says something
+meaningful, else its git branch, else the oldest prompt still on file. Press
+`r` to set a title by hand at any point — that freezes it, so auto-titling
+never overwrites it again — and clearing it back to empty with `r` hands the
+note back to auto-titling.
 
 Install the hook into your global Claude Code settings:
 
