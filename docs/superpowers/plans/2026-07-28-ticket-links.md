@@ -685,15 +685,18 @@ git commit -m "feat(markdown): underline configured ticket keys, return their ro
 
 ---
 
-### Task 4: app state and `n`/`N` navigation
+### Task 4: cursor state, `n`/`N` navigation, and the preview draw
+
+State and draw wiring ship together deliberately: `ticket_hits` is a draw
+product, so nav cannot be tested — or committed green — until the draw fills it.
 
 **Files:**
-- Modify: `src/app.rs` (struct fields ~394-435, `with_note` ~453-481, `App::new` ~438-451, `toggle_global` ~535-560, confirm-clear arm ~849-861, `on_key_preview` ~871-901, cursor helpers ~1106-1160)
+- Modify: `src/app.rs` (struct fields ~394-435, `with_note` ~453-481, `App::new` ~438-451, `toggle_global` ~535-560, confirm-clear arm ~849-861, `on_key_preview` ~871-901, cursor helpers ~1106-1160, footer consts ~1391-1405, `draw_preview` ~1423-1512)
 - Test: inline test module in `src/app.rs`
 
 **Interfaces:**
 - Consumes: `markdown::TicketHit`, `markdown::render_markdown_tickets` (Task 3), `tickets::Config` (Task 1).
-- Produces (private to `App`, used by Task 5 and Task 6): fields `tickets: tickets::Config`, `ticket_hits: Vec<markdown::TicketHit>`, `ticket_cursor: Option<usize>`, `follow_ticket: bool`; methods `fn move_ticket(&mut self, delta: isize)`, `fn clear_ticket_cursor(&mut self)`, `fn clear_cursors(&mut self)`, `fn clamp_ticket_cursor(&mut self)`.
+- Produces (private to `App`, used by Task 5): fields `tickets: tickets::Config`, `ticket_hits: Vec<markdown::TicketHit>`, `ticket_cursor: Option<usize>`, `follow_ticket: bool`; methods `fn move_ticket(&mut self, delta: isize)`, `fn clear_ticket_cursor(&mut self)`, `fn clear_cursors(&mut self)`, `fn clamp_ticket_cursor(&mut self)`. `ticket_hits` is refreshed by every preview draw with rows already offset past the prompt block.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -785,6 +788,66 @@ Add to `app.rs`'s test module. `app(text)` and `rendered(app, w, h)` already exi
         rendered(&mut a, 40, 10);
         assert_eq!(a.ticket_cursor, None);
     }
+
+    #[test]
+    fn the_prompt_block_offsets_ticket_rows() {
+        // Hit rows index the FINAL line list, so they must be shifted past the
+        // prompt block the same way `map` is.
+        let mut a = ticket_app("HM-1 here\n");
+        rendered(&mut a, 40, 20);
+        let without = a.ticket_hits[0].row;
+        a.prompts = vec![crate::prompts::PromptGroup {
+            pane: "w1:p5".into(),
+            prompts: vec![prompt(1, "look at HM-1")],
+        }];
+        a.prompt_labels = vec!["claude p5".into()];
+        rendered(&mut a, 40, 20);
+        assert_eq!(a.ticket_hits.len(), 1, "the block is not scanned for tickets");
+        assert!(a.ticket_hits[0].row > without, "row shifted past the block");
+    }
+
+    #[test]
+    fn an_empty_note_has_no_hits() {
+        let mut a = ticket_app("");
+        rendered(&mut a, 40, 10);
+        assert!(a.ticket_hits.is_empty());
+        assert_eq!(a.ticket_cursor, None);
+    }
+
+    #[test]
+    fn the_ticket_cursor_scrolls_itself_into_view_once() {
+        let mut a = ticket_app(&format!("{}HM-1 at the bottom\n", "filler\n".repeat(40)));
+        rendered(&mut a, 40, 10);
+        assert_eq!(a.preview_scroll, 0);
+        a.on_key(key(KeyCode::Char('n')));
+        rendered(&mut a, 40, 10);
+        assert!(a.preview_scroll > 0, "scrolled to the only ticket");
+        assert!(!a.follow_ticket, "one-shot: cleared after the draw");
+        let settled = a.preview_scroll;
+        a.on_key(key(KeyCode::Char('g')));
+        rendered(&mut a, 40, 10);
+        assert_eq!(a.preview_scroll, 0, "manual scrolling is not fought");
+        assert!(settled > 0);
+    }
+
+    #[test]
+    fn the_footer_advertises_the_ticket_keys_while_the_cursor_is_live() {
+        let mut a = ticket_app("HM-1\n");
+        rendered(&mut a, 90, 10);
+        a.on_key(key(KeyCode::Char('n')));
+        let screen = rendered(&mut a, 90, 10);
+        assert!(screen.contains("o open"), "{screen}");
+        assert!(screen.contains("esc drop"));
+    }
+
+    #[test]
+    fn every_short_footer_form_keeps_the_quit_hint() {
+        let mut a = ticket_app("HM-1\n");
+        rendered(&mut a, 40, 10);
+        a.on_key(key(KeyCode::Char('n')));
+        let screen = rendered(&mut a, 40, 10);
+        assert!(screen.contains("q quit"), "{screen}");
+    }
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -792,7 +855,7 @@ Add to `app.rs`'s test module. `app(text)` and `rendered(app, w, h)` already exi
 Run: `cargo test --lib app 2>&1 | head -20`
 Expected: FAIL — `no field ticket_cursor on type App`.
 
-- [ ] **Step 3: Write the implementation**
+- [ ] **Step 3: Write the state and navigation implementation**
 
 Add the fields to `struct App`, after `follow_box`:
 
@@ -906,100 +969,7 @@ Replace the `clear_box_cursor()` call in the confirm-clear arm (~line 856) and i
 
 Also update `toggle_global`'s "Everything per-DOCUMENT resets" comment to name the ticket cursor and hit list.
 
-- [ ] **Step 4: Run the tests to verify they pass**
-
-Run: `cargo test --lib`
-Expected: PASS. Note `an_edit_that_removes_a_ticket_reclamps_the_cursor` and `clearing_the_note_drops_the_ticket_cursor` also need Task 5's draw wiring — if they fail on the clamp, complete Task 5 and re-run before committing. (`ticket_hits` is only refreshed by the draw.)
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add src/app.rs
-git commit -m "feat(notes): ticket cursor state and n/N navigation"
-```
-
----
-
-### Task 5: draw wiring and the footer hint
-
-**Files:**
-- Modify: `src/app.rs` (`draw_preview` ~1423-1512, footer consts ~1391-1405)
-- Test: inline test module in `src/app.rs`
-
-**Interfaces:**
-- Consumes: Task 3's `render_markdown_tickets`/`TicketHit`, Task 4's fields and `clamp_ticket_cursor`.
-- Produces: `self.ticket_hits` refreshed on every preview draw with rows already offset past the prompt block; `follow_ticket` honoured then cleared.
-
-- [ ] **Step 1: Write the failing tests**
-
-```rust
-    #[test]
-    fn the_prompt_block_offsets_ticket_rows() {
-        // Hit rows index the FINAL line list, so they must be shifted past the
-        // prompt block the same way `map` is.
-        let mut a = ticket_app("HM-1 here\n");
-        rendered(&mut a, 40, 20);
-        let without = a.ticket_hits[0].row;
-        a.prompts = vec![crate::prompts::PromptGroup {
-            pane: "w1:p5".into(),
-            prompts: vec![prompt(1, "look at HM-1")],
-        }];
-        a.prompt_labels = vec!["claude p5".into()];
-        rendered(&mut a, 40, 20);
-        assert_eq!(a.ticket_hits.len(), 1, "the block is not scanned for tickets");
-        assert!(a.ticket_hits[0].row > without, "row shifted past the block");
-    }
-
-    #[test]
-    fn an_empty_note_has_no_hits() {
-        let mut a = ticket_app("");
-        rendered(&mut a, 40, 10);
-        assert!(a.ticket_hits.is_empty());
-        assert_eq!(a.ticket_cursor, None);
-    }
-
-    #[test]
-    fn the_ticket_cursor_scrolls_itself_into_view_once() {
-        let mut a = ticket_app(&format!("{}HM-1 at the bottom\n", "filler\n".repeat(40)));
-        rendered(&mut a, 40, 10);
-        assert_eq!(a.preview_scroll, 0);
-        a.on_key(key(KeyCode::Char('n')));
-        rendered(&mut a, 40, 10);
-        assert!(a.preview_scroll > 0, "scrolled to the only ticket");
-        assert!(!a.follow_ticket, "one-shot: cleared after the draw");
-        let settled = a.preview_scroll;
-        a.on_key(key(KeyCode::Char('g')));
-        rendered(&mut a, 40, 10);
-        assert_eq!(a.preview_scroll, 0, "manual scrolling is not fought");
-        assert!(settled > 0);
-    }
-
-    #[test]
-    fn the_footer_advertises_the_ticket_keys_while_the_cursor_is_live() {
-        let mut a = ticket_app("HM-1\n");
-        rendered(&mut a, 90, 10);
-        a.on_key(key(KeyCode::Char('n')));
-        let screen = rendered(&mut a, 90, 10);
-        assert!(screen.contains("o open"), "{screen}");
-        assert!(screen.contains("esc drop"));
-    }
-
-    #[test]
-    fn every_short_footer_form_keeps_the_quit_hint() {
-        let mut a = ticket_app("HM-1\n");
-        rendered(&mut a, 40, 10);
-        a.on_key(key(KeyCode::Char('n')));
-        let screen = rendered(&mut a, 40, 10);
-        assert!(screen.contains("q quit"), "{screen}");
-    }
-```
-
-- [ ] **Step 2: Run the tests to verify they fail**
-
-Run: `cargo test --lib the_prompt_block_offsets_ticket_rows the_footer_advertises 2>&1 | head -30`
-Expected: FAIL — hits empty / `o open` absent from the screen.
-
-- [ ] **Step 3: Write the implementation**
+- [ ] **Step 4: Write the draw and footer implementation**
 
 In `draw_preview`, the empty-note branch clears the hit list and the real-note branch collects it. Replace the `(mut lines, map)` construction with:
 
@@ -1096,23 +1066,23 @@ Footer: add a third pair and extend the selection. Replace the hint block with:
 
 Extend the comment above those consts to record the new form and that the ticket short form drops `e edit` to keep `o open` and `esc drop` (the two keys that matter while a ticket is selected) inside the 37-column floor.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test --lib`
-Expected: PASS, including Task 4's two clamp tests.
+Expected: PASS — all eleven new tests plus every pre-existing one.
 Run: `cargo clippy --all-targets -- -D warnings`
 Expected: clean.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add src/app.rs
-git commit -m "feat(notes): wire ticket hits through the preview draw and footer"
+git commit -m "feat(notes): ticket cursor, n/N navigation, preview draw and footer"
 ```
 
 ---
 
-### Task 6: `o` opens the browser, plus docs and live verification
+### Task 5: `o` opens the browser, plus docs and live verification
 
 **Files:**
 - Modify: `src/tickets.rs` (add `open`), `src/app.rs` (`open_children` field, `o` key, heartbeat reaping), `README.md`, `CLAUDE.md`
