@@ -1537,11 +1537,16 @@ impl App {
         // without going through it, so the render site re-checks
         // `showing_tab_note()` itself rather than trusting that invariant to
         // still hold by the time we draw.
-        let block = if self.showing_tab_note() {
-            prompt_block(&self.labelled_prompts(), text_w)
+        let (block, block_hits) = if self.showing_tab_note() {
+            prompt_block(&self.labelled_prompts(), text_w, &self.tickets, self.link_cursor)
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
+        // The block sits above the note, so its hits are the FIRST ordinals and
+        // a body cursor is offset by however many the block holds. `None` here
+        // means "the cursor is in the block" — the block already applied its own
+        // REVERSED, so the body render must not claim the ordinal too.
+        let body_cursor = self.link_cursor.and_then(|c| c.checked_sub(block_hits.len()));
         // The empty-note help used to be a fixed-height special case (forced
         // `preview_scroll = 0`, no hint, no scrollbar) on the assumption the
         // block could never exceed a couple of rows. Grouping removed that
@@ -1558,8 +1563,11 @@ impl App {
         // what `map` contains.
         let (mut lines, map): (Vec<Line<'static>>, Vec<Option<usize>>) =
             if self.note.text.trim().is_empty() {
-                // No text, so no links — and no stale hits left behind for `o`.
-                self.link_hits.clear();
+                // No body, so no body links — but the block's hits survive: a
+                // titled, body-less note still accumulates prompts, and those
+                // prompts are the only links it has. Clearing here would drop
+                // them the instant the note itself goes empty.
+                self.link_hits = block_hits;
                 let mut lines = block;
                 lines.extend(empty_help().lines().map(|l| {
                     Line::from(Span::styled(l.to_string(), Style::default().add_modifier(Modifier::DIM)))
@@ -1571,7 +1579,7 @@ impl App {
                     &self.note.text,
                     text_w,
                     &self.tickets,
-                    self.link_cursor,
+                    body_cursor,
                 );
                 // The block's rows map to NO source line, so the checkbox cursor can
                 // never land on one and the highlight/scroll-follow keep pointing at
@@ -1590,7 +1598,12 @@ impl App {
                         hit.row += n;
                     }
                 }
-                self.link_hits = hits;
+                // Block hits occupy the FIRST ordinals; the body's own hits
+                // (already reversed by `render_markdown_links` at `body_cursor`)
+                // are appended after them, matching the offset computed above.
+                let mut all = block_hits;
+                all.extend(hits);
+                self.link_hits = all;
                 (lines, map)
             };
         // The hit list is a draw product; an edit may have deleted the target
@@ -2033,34 +2046,100 @@ fn render_hints(keep: &[(&str, u8)]) -> String {
     format!(" {}", joined.join("  "))
 }
 
+/// One prompt-block row: `text` truncated to `budget` display columns, with
+/// every link inside the RETAINED prefix split into its own underlined span
+/// (REVERSED when its ordinal is `cursor`). Hits are appended to `hits` with
+/// `row`.
+///
+/// Truncation is the hazard here: `truncate_w` appends NO ellipsis, so a cut
+/// `HM-54283` would read as a perfectly valid `HM-542` and `o` would open the
+/// wrong ticket. The scan therefore runs on the FULL text and keeps only hits
+/// that end inside the retained prefix — which is a byte prefix, so the
+/// offsets line up.
+#[allow(clippy::too_many_arguments)] // one row-render call site per block line; a struct would just rename these fields
+fn block_line(
+    number: &str,
+    text: &str,
+    budget: usize,
+    style: Style,
+    cfg: &crate::tickets::Config,
+    cursor: Option<usize>,
+    row: usize,
+    hits: &mut Vec<markdown::LinkHit>,
+) -> Line<'static> {
+    let kept = truncate_w(text, budget);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    if !number.is_empty() {
+        spans.push(Span::styled(number.to_string(), style));
+    }
+    let mut last = 0usize;
+    for (range, kind) in markdown::find_links(text, cfg) {
+        if range.end > kept.len() {
+            break;
+        }
+        if range.start > last {
+            spans.push(Span::styled(kept[last..range.start].to_string(), style));
+        }
+        let mut st = style.add_modifier(Modifier::UNDERLINED);
+        if cursor == Some(hits.len()) {
+            st = st.add_modifier(Modifier::REVERSED);
+        }
+        spans.push(Span::styled(kept[range.clone()].to_string(), st));
+        hits.push(markdown::LinkHit { text: kept[range.clone()].to_string(), kind, row });
+        last = range.end;
+    }
+    if last < kept.len() {
+        spans.push(Span::styled(kept[last..].to_string(), style));
+    }
+    Line::from(spans)
+}
+
 /// The dim per-agent prompt block rendered above the note: one heading per
 /// group, its prompts numbered from 1, a blank line between groups, and a
 /// rule at the end. Empty groups and an empty list render nothing at all, so
 /// the note keeps the space. There is deliberately no single "Last Prompts"
 /// heading — the agent's own label is the more informative one, and two
 /// heading levels in a five-row block is noise.
+///
+/// Returns the rows and every link found in them — rows here are 1:1 with
+/// lines (truncated, never wrapped), so a hit's row is its line index.
+/// `cursor` is an ordinal into THIS block's hits, which are the first ones
+/// in the pane's list.
 fn prompt_block(
     groups: &[(String, Vec<crate::prompts::Prompt>)],
     width: usize,
-) -> Vec<Line<'static>> {
+    cfg: &crate::tickets::Config,
+    cursor: Option<usize>,
+) -> (Vec<Line<'static>>, Vec<markdown::LinkHit>) {
     let dim = Style::default().add_modifier(Modifier::DIM);
     let head = Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM);
     let mut out: Vec<Line<'static>> = Vec::new();
+    let mut hits: Vec<markdown::LinkHit> = Vec::new();
     for (label, prompts) in groups.iter().filter(|(_, p)| !p.is_empty()) {
         if !out.is_empty() {
             out.push(Line::raw(""));
         }
-        out.push(Line::from(Span::styled(truncate_w(label, width), head)));
+        let row = out.len();
+        out.push(block_line("", label, width, head, cfg, cursor, row, &mut hits));
         for (i, p) in prompts.iter().enumerate() {
             // The number and its separator cost 3 columns.
-            let body = truncate_w(&p.text, width.saturating_sub(3));
-            out.push(Line::from(Span::styled(format!("{}. {body}", i + 1), dim)));
+            let row = out.len();
+            out.push(block_line(
+                &format!("{}. ", i + 1),
+                &p.text,
+                width.saturating_sub(3),
+                dim,
+                cfg,
+                cursor,
+                row,
+                &mut hits,
+            ));
         }
     }
     if !out.is_empty() {
         out.push(Line::from(Span::styled("─".repeat(width), dim)));
     }
-    out
+    (out, hits)
 }
 
 fn format_row(marker: &str, self_mark: &str, name: &str, right: &str, inner_width: usize) -> String {
@@ -2295,13 +2374,100 @@ mod tests {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
     }
 
+    /// The config `ticket_app` injects, for the free-function tests.
+    fn ticket_cfg() -> crate::tickets::Config {
+        crate::tickets::Config::from_json(r#"{"HM":"https://example.test/browse/{key}"}"#)
+    }
+
+    fn block_of(text: &str) -> (Vec<Line<'static>>, Vec<markdown::LinkHit>) {
+        let groups = vec![("claude p5".to_string(), vec![prompt(1, text)])];
+        prompt_block(&groups, 60, &ticket_cfg(), None)
+    }
+
+    #[test]
+    fn a_key_in_the_prompt_block_is_a_hit() {
+        let (_, hits) = block_of("look at HM-54283 today");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].text, "HM-54283");
+        assert_eq!(hits[0].kind, markdown::LinkKind::Ticket);
+    }
+
+    #[test]
+    fn a_key_cut_by_truncation_is_not_a_hit() {
+        // `truncate_w` appends NO ellipsis, so a cut key looks perfectly valid
+        // and `o` would open the wrong ticket.
+        let groups = vec![("claude p5".to_string(), vec![prompt(1, "padding HM-54283")])];
+        let (lines, hits) = prompt_block(&groups, 14, &ticket_cfg(), None);
+        assert!(hits.is_empty(), "{lines:?}");
+    }
+
+    #[test]
+    fn block_hits_come_before_body_hits() {
+        let mut a = ticket_app("body HM-2 here\n");
+        a.prompts = vec![crate::prompts::PromptGroup {
+            pane: "w1:p5".into(),
+            prompts: vec![prompt(1, "prompt HM-1 here")],
+        }];
+        a.prompt_labels = vec!["claude p5".into()];
+        rendered(&mut a, 60, 20);
+        assert_eq!(
+            a.link_hits.iter().map(|h| h.text.as_str()).collect::<Vec<_>>(),
+            ["HM-1", "HM-2"]
+        );
+        a.on_key(key(KeyCode::Char('n')));
+        assert_eq!(a.pending_open().as_deref(), Some("https://example.test/browse/HM-1"));
+        a.on_key(key(KeyCode::Char('n')));
+        assert_eq!(a.pending_open().as_deref(), Some("https://example.test/browse/HM-2"));
+    }
+
+    #[test]
+    fn the_highlight_and_the_open_target_agree_across_both_regions() {
+        // The one place two hit lists must agree on an order.
+        let mut a = ticket_app("body HM-2 here\n");
+        a.prompts = vec![crate::prompts::PromptGroup {
+            pane: "w1:p5".into(),
+            prompts: vec![prompt(1, "prompt HM-1 here")],
+        }];
+        a.prompt_labels = vec!["claude p5".into()];
+        rendered(&mut a, 60, 20);
+        for (ordinal, expected) in [(0usize, "HM-1"), (1, "HM-2")] {
+            a.link_cursor = Some(ordinal);
+            let mut term =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 20)).unwrap();
+            term.draw(|f| a.draw(f)).unwrap();
+            let buf = term.backend().buffer();
+            let reversed: String = (0..20)
+                .flat_map(|y| (0..60).map(move |x| (x, y)))
+                .filter_map(|(x, y)| buf.cell((x, y)))
+                .filter(|c| c.modifier.contains(Modifier::REVERSED))
+                .map(|c| c.symbol().to_string())
+                .collect();
+            assert!(reversed.contains(expected), "ordinal {ordinal}: reversed={reversed:?}");
+            assert!(a.pending_open().unwrap().ends_with(expected));
+        }
+    }
+
+    #[test]
+    fn a_titled_body_less_note_still_carries_its_block_hits() {
+        let mut a = ticket_app("");
+        a.note.title = "named".into();
+        a.prompts = vec![crate::prompts::PromptGroup {
+            pane: "w1:p5".into(),
+            prompts: vec![prompt(1, "prompt HM-1 here")],
+        }];
+        a.prompt_labels = vec!["claude p5".into()];
+        rendered(&mut a, 60, 20);
+        assert_eq!(a.link_hits.len(), 1, "the empty-note path must not drop block hits");
+    }
+
     #[test]
     fn prompt_block_heads_each_group_with_its_label() {
         let groups = vec![
             group("HM-54271 Importer", &["add the rate limiter", "why is auth flaky"]),
             group("claude pB", &["run the migration"]),
         ];
-        let rows: Vec<String> = prompt_block(&groups, 60).iter().map(line_text).collect();
+        let (lines, _) = prompt_block(&groups, 60, &ticket_cfg(), None);
+        let rows: Vec<String> = lines.iter().map(line_text).collect();
         let joined = rows.join("\n");
         assert!(joined.contains("HM-54271 Importer"), "{joined}");
         assert!(joined.contains("claude pB"), "{joined}");
@@ -2334,8 +2500,11 @@ mod tests {
 
     #[test]
     fn prompt_block_is_empty_without_groups() {
-        assert!(prompt_block(&[], 60).is_empty());
-        assert!(prompt_block(&[("solo".into(), vec![])], 60).is_empty(), "a group with no prompts renders nothing");
+        assert!(prompt_block(&[], 60, &ticket_cfg(), None).0.is_empty());
+        assert!(
+            prompt_block(&[("solo".into(), vec![])], 60, &ticket_cfg(), None).0.is_empty(),
+            "a group with no prompts renders nothing"
+        );
     }
 
     #[test]
@@ -2345,7 +2514,8 @@ mod tests {
         // heading is user-supplied too and gets the same treatment.
         let groups = vec![group(&"文".repeat(80), &[&"文".repeat(80)])];
         for width in [12usize, 30, 60] {
-            for line in prompt_block(&groups, width) {
+            let (lines, _) = prompt_block(&groups, width, &ticket_cfg(), None);
+            for line in lines {
                 let text = line_text(&line);
                 assert!(dwidth(&text) <= width, "row {text:?} is {} cols, want <= {width}", dwidth(&text));
             }
@@ -2412,7 +2582,7 @@ mod tests {
         // Matches draw_preview's own `text_w` derivation: area.width - 1 for
         // the scrollbar column, with the 60-wide `rendered()` call above.
         let text_w = usize::from(60u16).saturating_sub(1).max(1);
-        let block_rows = prompt_block(&with_block.labelled_prompts(), text_w).len();
+        let block_rows = prompt_block(&with_block.labelled_prompts(), text_w, &with_block.tickets, None).0.len();
         assert!(block_rows > 0, "the fixture must actually produce a block");
         assert_eq!(
             with_block.preview_scroll,
@@ -4869,19 +5039,24 @@ mod tests {
 
     #[test]
     fn the_prompt_block_offsets_ticket_rows() {
-        // Hit rows index the FINAL preview line list, so they must be shifted
-        // past the prompt block the same way `map` is.
+        // Hit rows index the FINAL preview line list, so a BODY hit must be
+        // shifted past the prompt block the same way `map` is. (The block is
+        // now scanned for tickets too, so a prompt referencing HM-2 adds a
+        // hit of its own ahead of the body's — that hit is asserted in
+        // `block_hits_come_before_body_hits`; this test's job is the body
+        // hit's row.)
         let mut a = ticket_app("HM-1 here\n");
         rendered(&mut a, 40, 20);
         let without = a.link_hits[0].row;
         a.prompts = vec![crate::prompts::PromptGroup {
             pane: "w1:p5".into(),
-            prompts: vec![prompt(1, "look at HM-1")],
+            prompts: vec![prompt(1, "look at HM-2")],
         }];
         a.prompt_labels = vec!["claude p5".into()];
         rendered(&mut a, 40, 20);
-        assert_eq!(a.link_hits.len(), 1, "the block is not scanned for tickets");
-        assert!(a.link_hits[0].row > without, "row shifted past the block");
+        assert_eq!(a.link_hits.len(), 2, "one block hit, one body hit");
+        let body_hit = a.link_hits.iter().find(|h| h.text == "HM-1").unwrap();
+        assert!(body_hit.row > without, "row shifted past the block");
     }
 
     #[test]
