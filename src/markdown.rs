@@ -11,6 +11,24 @@ const ACCENT: Color = Color::Cyan;
 const CODE: Color = Color::Yellow;
 const CHECK: Color = Color::Green;
 
+/// One configured issue key found while rendering: the key text and the
+/// rendered row its first character landed on. Document order == the order
+/// `n`/`N` walk.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TicketHit {
+    pub key: String,
+    pub row: usize,
+}
+
+/// Per-render ticket state: what to match, which hit is cursored, and the hits
+/// found so far. `hits.len()` doubles as the ordinal of the next hit, which is
+/// why detection and highlight can never disagree — one pass assigns both.
+struct TicketCtx<'a> {
+    cfg: &'a crate::tickets::Config,
+    cursor: Option<usize>,
+    hits: Vec<TicketHit>,
+}
+
 pub fn render_markdown(text: &str, width: usize) -> Vec<Line<'static>> {
     render_markdown_mapped(text, width).0
 }
@@ -21,9 +39,23 @@ pub fn render_markdown(text: &str, width: usize) -> Vec<Line<'static>> {
 /// input carries `None`. Lets the preview map a screen row back to the note
 /// text — needed by the checkbox cursor.
 pub fn render_markdown_mapped(text: &str, width: usize) -> (Vec<Line<'static>>, Vec<Option<usize>>) {
+    let cfg = crate::tickets::Config::default();
+    let (lines, map, _) = render_markdown_tickets(text, width, &cfg, None);
+    (lines, map)
+}
+
+/// `render_markdown_mapped` plus ticket links: keys configured in `cfg` are
+/// underlined (the `cursor`-th one also REVERSED) and returned as hits.
+pub fn render_markdown_tickets(
+    text: &str,
+    width: usize,
+    cfg: &crate::tickets::Config,
+    cursor: Option<usize>,
+) -> (Vec<Line<'static>>, Vec<Option<usize>>, Vec<TicketHit>) {
     let width = width.max(8);
     let mut out = Vec::new();
     let mut map: Vec<Option<usize>> = Vec::new();
+    let mut ctx = TicketCtx { cfg, cursor, hits: Vec::new() };
     let mut in_code = false;
     for (src, raw) in text.lines().enumerate() {
         let line = raw.trim_end();
@@ -34,9 +66,11 @@ pub fn render_markdown_mapped(text: &str, width: usize) -> (Vec<Line<'static>>, 
                 Style::default().fg(CODE).add_modifier(Modifier::DIM),
             )));
         } else if in_code {
+            // Fenced code is code: no linkification, exactly as
+            // `checkbox_lines` skips it.
             wrap_into(&mut out, vec![(line.to_string(), Style::default().fg(CODE))], width, 0);
         } else {
-            render_line(&mut out, line, width);
+            render_line(&mut out, &mut ctx, line, width);
         }
         // `out` only ever grows, so this fills exactly the rows this source
         // line just added.
@@ -46,10 +80,10 @@ pub fn render_markdown_mapped(text: &str, width: usize) -> (Vec<Line<'static>>, 
         out.push(Line::raw(""));
         map.push(None);
     }
-    (out, map)
+    (out, map, ctx.hits)
 }
 
-fn render_line(out: &mut Vec<Line<'static>>, line: &str, width: usize) {
+fn render_line(out: &mut Vec<Line<'static>>, ctx: &mut TicketCtx<'_>, line: &str, width: usize) {
     let trimmed = line.trim_start();
     if trimmed.is_empty() {
         out.push(Line::raw(""));
@@ -66,7 +100,7 @@ fn render_line(out: &mut Vec<Line<'static>>, line: &str, width: usize) {
             2 => Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             _ => Style::default().fg(ACCENT),
         };
-        wrap_into(out, parse_inline(trimmed[hashes..].trim_start(), style), width, 0);
+        emit(out, ctx, parse_inline(trimmed[hashes..].trim_start(), style), width, 0);
         return;
     }
 
@@ -82,7 +116,7 @@ fn render_line(out: &mut Vec<Line<'static>>, line: &str, width: usize) {
         let dim = Style::default().add_modifier(Modifier::DIM);
         let mut spans = vec![("▎ ".to_string(), dim)];
         spans.extend(parse_inline(rest.trim_start(), dim));
-        wrap_into(out, spans, width, 2);
+        emit(out, ctx, spans, width, 2);
         return;
     }
 
@@ -94,7 +128,7 @@ fn render_line(out: &mut Vec<Line<'static>>, line: &str, width: usize) {
         };
         let mut spans = vec![(format!("{pad}{glyph}"), style)];
         spans.extend(parse_inline(rest, Style::default()));
-        wrap_into(out, spans, width, indent + 4);
+        emit(out, ctx, spans, width, indent + 4);
         return;
     }
 
@@ -102,7 +136,7 @@ fn render_line(out: &mut Vec<Line<'static>>, line: &str, width: usize) {
         if let Some(rest) = trimmed.strip_prefix(bullet) {
             let mut spans = vec![(format!("{pad}• "), Style::default().fg(ACCENT))];
             spans.extend(parse_inline(rest, Style::default()));
-            wrap_into(out, spans, width, indent + 2);
+            emit(out, ctx, spans, width, indent + 2);
             return;
         }
     }
@@ -114,7 +148,7 @@ fn render_line(out: &mut Vec<Line<'static>>, line: &str, width: usize) {
             let num = &trimmed[..digits];
             let mut spans = vec![(format!("{pad}{num}. "), Style::default().fg(ACCENT))];
             spans.extend(parse_inline(body, Style::default()));
-            wrap_into(out, spans, width, indent + digits + 2);
+            emit(out, ctx, spans, width, indent + digits + 2);
             return;
         }
     }
@@ -124,7 +158,7 @@ fn render_line(out: &mut Vec<Line<'static>>, line: &str, width: usize) {
         spans.push((pad, Style::default()));
     }
     spans.extend(parse_inline(trimmed, Style::default()));
-    wrap_into(out, spans, width, 0);
+    emit(out, ctx, spans, width, 0);
 }
 
 /// `[ ] rest` / `[x] rest`, optionally behind a `- ` or `* ` bullet (the
@@ -197,7 +231,6 @@ pub fn toggle_checkbox(text: &str, line_idx: usize) -> Option<String> {
 /// The crate's ONE ticket scan. Anything that needs to know where the keys are
 /// goes through here, for the same reason the checkbox parser is single-homed:
 /// a second scan drifts.
-#[allow(dead_code)]
 pub fn find_tickets(s: &str, cfg: &crate::tickets::Config) -> Vec<std::ops::Range<usize>> {
     fn keyish(b: u8) -> bool {
         b.is_ascii_alphanumeric() || b == b'_'
@@ -298,22 +331,100 @@ fn find_double_star(chars: &[char], from: usize) -> Option<usize> {
     (from..chars.len().saturating_sub(1)).find(|&j| chars[j] == '*' && chars[j + 1] == '*')
 }
 
+/// `wrap_into` with the ticket pass in front of it: keys get their own styled
+/// span, and each one's rendered row is recorded as a hit. Bypassed entirely
+/// when no prefixes are configured, so the feature costs nothing when unused.
+fn emit(
+    out: &mut Vec<Line<'static>>,
+    ctx: &mut TicketCtx<'_>,
+    spans: Vec<(String, Style)>,
+    width: usize,
+    hang: usize,
+) {
+    if ctx.cfg.is_empty() {
+        wrap_into(out, spans, width, hang);
+        return;
+    }
+    let (spans, marks) = style_tickets(spans, ctx);
+    let base = out.len();
+    let offsets: Vec<usize> = marks.iter().map(|(off, _)| *off).collect();
+    let rows = wrap_into_marked(out, spans, width, hang, &offsets);
+    for ((_, key), row) in marks.into_iter().zip(rows) {
+        ctx.hits.push(TicketHit { key, row: base + row });
+    }
+}
+
+/// Splits every configured key out of `spans` into its own span — underlined,
+/// plus REVERSED when its ordinal is the cursored one — keeping whatever style
+/// the surrounding text already had (bold, code, dim quote). Returns the
+/// rebuilt spans and, per key, its char offset into the flattened sequence and
+/// its text. Char offsets rather than byte offsets because `wrap_into` works in
+/// chars.
+#[allow(clippy::type_complexity)]
+fn style_tickets(
+    spans: Vec<(String, Style)>,
+    ctx: &TicketCtx<'_>,
+) -> (Vec<(String, Style)>, Vec<(usize, String)>) {
+    let mut out: Vec<(String, Style)> = Vec::new();
+    let mut marks: Vec<(usize, String)> = Vec::new();
+    let mut chars = 0usize;
+    for (text, style) in spans {
+        let mut last = 0usize;
+        for range in find_tickets(&text, ctx.cfg) {
+            let head = &text[last..range.start];
+            if !head.is_empty() {
+                chars += head.chars().count();
+                out.push((head.to_string(), style));
+            }
+            let key = text[range.clone()].to_string();
+            let ordinal = ctx.hits.len() + marks.len();
+            let mut st = style.add_modifier(Modifier::UNDERLINED);
+            if ctx.cursor == Some(ordinal) {
+                st = st.add_modifier(Modifier::REVERSED);
+            }
+            marks.push((chars, key.clone()));
+            chars += key.chars().count();
+            out.push((key, st));
+            last = range.end;
+        }
+        let tail = &text[last..];
+        if !tail.is_empty() {
+            chars += tail.chars().count();
+            out.push((tail.to_string(), style));
+        }
+    }
+    (out, marks)
+}
+
 /// Greedy wrap at `width` display COLUMNS (breaking at the last space when
 /// possible), giving continuation lines `hang` columns of indent. Wide
 /// (CJK/emoji) chars count 2 so wrapped lines never overflow the no-wrap
 /// Paragraph and get clipped off the right edge.
 fn wrap_into(out: &mut Vec<Line<'static>>, spans: Vec<(String, Style)>, width: usize, hang: usize) {
+    wrap_into_marked(out, spans, width, hang, &[]);
+}
+
+/// `wrap_into`, plus for each char offset in `marks` the index — RELATIVE to
+/// the first row this call pushes — of the row that char landed on. A ticket
+/// key can be split by the wrap; the mark is its first char, so the hit points
+/// at the row the key starts on.
+fn wrap_into_marked(
+    out: &mut Vec<Line<'static>>,
+    spans: Vec<(String, Style)>,
+    width: usize,
+    hang: usize,
+    marks: &[usize],
+) -> Vec<usize> {
     let chars: Vec<(char, Style, usize)> = spans
         .iter()
-        .flat_map(|(t, s)| {
-            t.chars().map(|c| (c, *s, c.width().unwrap_or(0))).collect::<Vec<_>>()
-        })
+        .flat_map(|(t, s)| t.chars().map(|c| (c, *s, c.width().unwrap_or(0))).collect::<Vec<_>>())
         .collect();
+    // Char range per pushed row, so a mark can be mapped back afterwards.
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
     let mut start = 0;
     let mut first = true;
     loop {
         let budget = if first { width } else { width.saturating_sub(hang).max(4) };
-        // Longest slice from `start` that fits the column budget.
         let mut end = start;
         let mut cols = 0;
         while end < chars.len() && cols + chars[end].2 <= budget {
@@ -322,10 +433,10 @@ fn wrap_into(out: &mut Vec<Line<'static>>, spans: Vec<(String, Style)>, width: u
         }
         if end >= chars.len() {
             out.push(to_line(&chars[start..], if first { 0 } else { hang }));
-            return;
+            ranges.push((start, chars.len()));
+            break;
         }
-        if let Some(pos) =
-            chars[start..end].iter().rposition(|(c, _, _)| *c == ' ').filter(|&p| p > 0)
+        if let Some(pos) = chars[start..end].iter().rposition(|(c, _, _)| *c == ' ').filter(|&p| p > 0)
         {
             end = start + pos;
         }
@@ -334,15 +445,20 @@ fn wrap_into(out: &mut Vec<Line<'static>>, spans: Vec<(String, Style)>, width: u
             end = start + 1;
         }
         out.push(to_line(&chars[start..end], if first { 0 } else { hang }));
+        ranges.push((start, end));
         start = end;
         while start < chars.len() && chars[start].0 == ' ' {
             start += 1;
         }
         first = false;
         if start >= chars.len() {
-            return;
+            break;
         }
     }
+    marks
+        .iter()
+        .map(|m| ranges.iter().position(|(_, e)| m < e).unwrap_or(ranges.len().saturating_sub(1)))
+        .collect()
 }
 
 /// Consecutive same-styled chars collapse back into spans.
@@ -584,5 +700,100 @@ mod tests {
     fn punctuation_is_a_boundary() {
         assert_eq!(keys("(HM-2), [HM-3]."), ["HM-2", "HM-3"]);
         assert_eq!(keys("HM-4-final"), ["HM-4"]);
+    }
+
+    fn hit_style(lines: &[Line], key: &str) -> Style {
+        lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|s| s.content == key)
+            .expect("key should be its own span")
+            .style
+    }
+
+    #[test]
+    fn ticket_keys_render_as_their_own_underlined_span() {
+        let (lines, _, hits) =
+            render_markdown_tickets("To estimate HM-54561 today", 40, &cfg(), None);
+        assert_eq!(hits, vec![TicketHit { key: "HM-54561".into(), row: 0 }]);
+        let st = hit_style(&lines, "HM-54561");
+        assert!(st.add_modifier.contains(Modifier::UNDERLINED));
+        assert!(!st.add_modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn the_cursored_hit_is_reversed_and_only_it() {
+        let (lines, _, hits) =
+            render_markdown_tickets("HM-1 and CR-2", 40, &cfg(), Some(1));
+        assert_eq!(hits.len(), 2);
+        assert!(!hit_style(&lines, "HM-1").add_modifier.contains(Modifier::REVERSED));
+        assert!(hit_style(&lines, "CR-2").add_modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn hits_carry_the_row_they_landed_on() {
+        let text = "# Head\n\n- first HM-1\n- second CR-2";
+        let (_, _, hits) = render_markdown_tickets(text, 40, &cfg(), None);
+        let rows: Vec<usize> = hits.iter().map(|h| h.row).collect();
+        assert_eq!(hits.iter().map(|h| h.key.as_str()).collect::<Vec<_>>(), ["HM-1", "CR-2"]);
+        assert!(rows[0] < rows[1], "rows ascend with document order: {rows:?}");
+    }
+
+    #[test]
+    fn a_key_inside_bold_is_one_hit_and_stays_bold() {
+        let (lines, _, hits) = render_markdown_tickets("**HM-9** done", 40, &cfg(), None);
+        assert_eq!(hits.len(), 1, "markdown markers must not split the key");
+        let st = hit_style(&lines, "HM-9");
+        assert!(st.add_modifier.contains(Modifier::BOLD));
+        assert!(st.add_modifier.contains(Modifier::UNDERLINED));
+    }
+
+    #[test]
+    fn fenced_code_is_not_linkified() {
+        let text = "```\nHM-1\n```";
+        let (_, _, hits) = render_markdown_tickets(text, 40, &cfg(), None);
+        assert!(hits.is_empty(), "fenced code is code, like checkbox_lines treats it");
+    }
+
+    #[test]
+    fn a_wrapped_key_keeps_its_style_on_every_row() {
+        // Width 10 forces the key onto its own continuation row; the char-level
+        // wrap must carry the underline across.
+        let (lines, _, hits) =
+            render_markdown_tickets("aaaa bbbb cccc HM-12345", 10, &cfg(), None);
+        assert_eq!(hits.len(), 1);
+        let underlined: usize = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .filter(|s| s.style.add_modifier.contains(Modifier::UNDERLINED))
+            .map(|s| s.content.chars().count())
+            .sum();
+        assert_eq!(underlined, "HM-12345".chars().count());
+        assert!(hits[0].row < lines.len());
+    }
+
+    #[test]
+    fn a_key_inside_inline_code_is_still_one_hit() {
+        // The pass runs over the assembled span list, code spans included, so
+        // nav and styling agree on a backticked key.
+        let (lines, _, hits) = render_markdown_tickets("see `HM-8` please", 40, &cfg(), None);
+        assert_eq!(hits.len(), 1);
+        assert!(hit_style(&lines, "HM-8").add_modifier.contains(Modifier::UNDERLINED));
+    }
+
+    #[test]
+    fn an_empty_config_changes_nothing() {
+        let empty = crate::tickets::Config::default();
+        let (lines, map, hits) = render_markdown_tickets("HM-1 here", 40, &empty, None);
+        assert!(hits.is_empty());
+        let (base_lines, base_map) = render_markdown_mapped("HM-1 here", 40);
+        assert_eq!(lines.len(), base_lines.len());
+        assert_eq!(map, base_map);
+        assert!(
+            !lines
+                .iter()
+                .flat_map(|l| l.spans.iter())
+                .any(|s| s.style.add_modifier.contains(Modifier::UNDERLINED))
+        );
     }
 }
