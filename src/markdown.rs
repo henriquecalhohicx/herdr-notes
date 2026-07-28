@@ -231,7 +231,7 @@ pub fn toggle_checkbox(text: &str, line_idx: usize) -> Option<String> {
 /// The crate's ONE ticket scan. Anything that needs to know where the keys are
 /// goes through here, for the same reason the checkbox parser is single-homed:
 /// a second scan drifts.
-pub fn find_tickets(s: &str, cfg: &crate::tickets::Config) -> Vec<std::ops::Range<usize>> {
+fn find_ticket_ranges(s: &str, cfg: &crate::tickets::Config) -> Vec<std::ops::Range<usize>> {
     fn keyish(b: u8) -> bool {
         b.is_ascii_alphanumeric() || b == b'_'
     }
@@ -264,6 +264,114 @@ pub fn find_tickets(s: &str, cfg: &crate::tickets::Config) -> Vec<std::ops::Rang
         i += 1;
     }
     out
+}
+
+/// What an openable target IS: an issue key that resolves through the config,
+/// or a URL that is already the target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // Will be used in Task 2 (wiring through render/cursor)
+pub enum LinkKind {
+    Ticket,
+    Url,
+}
+
+/// Byte ranges of every openable target in `s` — configured issue keys and
+/// bare http(s) URLs — left to right and non-overlapping.
+///
+/// The crate's ONE link scan. Anything that needs to know where the links are
+/// goes through here, for the same reason the checkbox parser is single-homed:
+/// a second scan drifts.
+#[allow(dead_code)] // Will be used in Task 2 (wiring through render/cursor)
+pub fn find_links(
+    s: &str,
+    cfg: &crate::tickets::Config,
+) -> Vec<(std::ops::Range<usize>, LinkKind)> {
+    let mut merged: Vec<(std::ops::Range<usize>, LinkKind)> = find_url_ranges(s)
+        .into_iter()
+        .map(|r| (r, LinkKind::Url))
+        .chain(find_ticket_ranges(s, cfg).into_iter().map(|r| (r, LinkKind::Ticket)))
+        .collect();
+    // URLs sort ahead of a key starting at the same offset, so the overlap
+    // filter below keeps the URL: a key inside a URL path is part of that URL,
+    // not a second target.
+    merged.sort_by_key(|(r, kind)| (r.start, matches!(kind, LinkKind::Ticket)));
+    let mut out: Vec<(std::ops::Range<usize>, LinkKind)> = Vec::new();
+    for (range, kind) in merged {
+        if out.last().is_some_and(|(prev, _)| range.start < prev.end) {
+            continue; // swallowed by the target already taken
+        }
+        out.push((range, kind));
+    }
+    out
+}
+
+/// Byte ranges of bare `http://` / `https://` URLs. The scheme is matched
+/// case-insensitively, the URL runs to the next whitespace, and at least one
+/// non-whitespace character must follow `//` — a bare scheme is not a link.
+#[allow(dead_code)] // Used by find_links, allowed to warn during development
+fn find_url_ranges(s: &str) -> Vec<std::ops::Range<usize>> {
+    const SCHEMES: [&str; 2] = ["https://", "http://"];
+    let mut out: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut resume = 0usize;
+    for (i, _) in s.char_indices() {
+        if i < resume {
+            continue;
+        }
+        let rest = &s[i..];
+        let Some(scheme) = SCHEMES
+            .iter()
+            .find(|sc| {
+                rest.len() >= sc.len()
+                    && s.is_char_boundary(i + sc.len())
+                    && rest[..sc.len()].eq_ignore_ascii_case(sc)
+            })
+        else {
+            continue;
+        };
+        let body = i + scheme.len();
+        let end = s[body..].find(char::is_whitespace).map_or(s.len(), |off| body + off);
+        let end = trim_url_end(s, body, end);
+        if end == body {
+            continue; // nothing after `//`
+        }
+        out.push(i..end);
+        resume = end;
+    }
+    out
+}
+
+/// Trims trailing sentence punctuation from a URL, and a trailing `)`/`]`/`}`
+/// only when the URL holds no matching opener — so `(see https://x/y)` gives
+/// the bracket back to the prose while `https://x/a_(b)` keeps it.
+#[allow(dead_code)] // Used by find_url_ranges, allowed to warn during development
+fn trim_url_end(s: &str, start: usize, mut end: usize) -> usize {
+    let bytes = s.as_bytes();
+    while end > start {
+        // Always safe: end > start and we're indexing bytes
+        let last = bytes[end - 1];
+        let opener = match last {
+            b'.' | b',' | b';' | b':' | b'!' | b'?' | b'\'' | b'"' => {
+                end -= 1;
+                continue;
+            }
+            b')' => b'(',
+            b']' => b'[',
+            b'}' => b'{',
+            _ => break,
+        };
+        // Ensure we can safely slice at end - 1 (it must be a char boundary)
+        if !s.is_char_boundary(end - 1) {
+            break;
+        }
+        let inner = &s[start..end - 1];
+        let opens = inner.bytes().filter(|b| *b == opener).count();
+        let closes = inner.bytes().filter(|b| *b == last).count();
+        if opens > closes {
+            break; // balanced: the bracket belongs to the URL
+        }
+        end -= 1;
+    }
+    end
 }
 
 /// `---` / `***` / `___` (3+ of the same marker, spaces allowed between).
@@ -370,7 +478,7 @@ fn style_tickets(
     let mut chars = 0usize;
     for (text, style) in spans {
         let mut last = 0usize;
-        for range in find_tickets(&text, ctx.cfg) {
+        for range in find_ticket_ranges(&text, ctx.cfg) {
             let head = &text[last..range.start];
             if !head.is_empty() {
                 chars += head.chars().count();
@@ -668,7 +776,82 @@ mod tests {
     }
 
     fn keys(s: &str) -> Vec<String> {
-        find_tickets(s, &cfg()).into_iter().map(|r| s[r].to_string()).collect()
+        find_links(s, &cfg())
+            .into_iter()
+            .map(|(r, _)| s[r].to_string())
+            .collect()
+    }
+
+    fn links(s: &str) -> Vec<(String, LinkKind)> {
+        find_links(s, &cfg())
+            .into_iter()
+            .map(|(r, k)| (s[r].to_string(), k))
+            .collect()
+    }
+
+    #[test]
+    fn a_bare_url_is_a_link() {
+        assert_eq!(
+            links("see https://example.test/a/b?q=1 now"),
+            [("https://example.test/a/b?q=1".to_string(), LinkKind::Url)]
+        );
+    }
+
+    #[test]
+    fn the_scheme_is_matched_case_insensitively() {
+        assert_eq!(links("HTTPS://EXAMPLE.TEST/x").len(), 1);
+        assert_eq!(links("Http://example.test/x").len(), 1);
+    }
+
+    #[test]
+    fn a_scheme_with_no_host_is_not_a_link() {
+        assert!(links("https:// nothing").is_empty());
+        assert!(links("https://").is_empty());
+        assert!(links("ftp://example.test/x").is_empty());
+        assert!(links("file:///c:/secrets.txt").is_empty());
+    }
+
+    #[test]
+    fn trailing_sentence_punctuation_is_not_part_of_the_url() {
+        assert_eq!(links("go to https://example.test/x.")[0].0, "https://example.test/x");
+        assert_eq!(links("go to https://example.test/x, then")[0].0, "https://example.test/x");
+        assert_eq!(links("\"https://example.test/x\"")[0].0, "https://example.test/x");
+    }
+
+    #[test]
+    fn a_closing_bracket_goes_back_to_the_prose_only_when_unbalanced() {
+        assert_eq!(links("(see https://example.test/x)")[0].0, "https://example.test/x");
+        assert_eq!(links("https://example.test/a_(b)")[0].0, "https://example.test/a_(b)");
+    }
+
+    #[test]
+    fn a_ticket_key_inside_a_url_is_part_of_the_url() {
+        let got = links("https://jira.test/browse/HM-1 and HM-2");
+        assert_eq!(
+            got,
+            [
+                ("https://jira.test/browse/HM-1".to_string(), LinkKind::Url),
+                ("HM-2".to_string(), LinkKind::Ticket),
+            ]
+        );
+    }
+
+    #[test]
+    fn tickets_and_urls_come_back_in_document_order() {
+        let got = links("HM-1 then https://example.test/x then CR-2");
+        assert_eq!(
+            got.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(),
+            ["HM-1", "https://example.test/x", "CR-2"]
+        );
+    }
+
+    #[test]
+    fn urls_are_found_with_no_configured_prefixes() {
+        let empty = crate::tickets::Config::default();
+        let s = "HM-1 https://example.test/x";
+        let got = find_links(s, &empty);
+        assert_eq!(got.len(), 1, "no prefixes configured, so only the URL");
+        assert_eq!(got[0].1, LinkKind::Url);
     }
 
     #[test]
