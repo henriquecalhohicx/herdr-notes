@@ -395,11 +395,30 @@ fn is_hr(t: &str) -> bool {
             .any(|m| bare.chars().all(|c| c == *m))
 }
 
+/// Per-char mask, index-aligned with `s.chars()`: true where that char falls
+/// inside a bare URL `find_url_ranges` finds in `s`. `parse_inline` consults
+/// this before opening a `*`/`_` marker: a URL's own underscores/asterisks
+/// (wiki titles, Confluence, S3 keys) are not emphasis, and if `parse_inline`
+/// split one into several spans, `style_links` — which scans per-span,
+/// AFTER this runs — would only ever see the fragment in whichever span
+/// happened to hold the scheme, silently truncating the hit text and the `o`
+/// target. Ticket keys can never contain these chars, so this codepath is
+/// URL-only; nothing here needs `cfg`.
+fn url_char_mask(s: &str) -> Vec<bool> {
+    let ranges = find_url_ranges(s);
+    s.char_indices().map(|(i, _)| ranges.iter().any(|r| r.contains(&i))).collect()
+}
+
 /// Inline spans: `` `code` ``, `**bold**`, `*italic*` / `_italic_`. Markers
 /// without a closing partner (or with empty content) render literally; no
-/// nesting — styled content is taken as-is.
+/// nesting — styled content is taken as-is. A `*`/`_` is never treated as a
+/// marker OPEN while it sits inside a bare URL (see `url_char_mask`) — the
+/// URL then survives as one plain run, which is what lets `style_links` find
+/// it whole afterwards.
 fn parse_inline(s: &str, base: Style) -> Vec<(String, Style)> {
     let chars: Vec<char> = s.chars().collect();
+    let in_url = url_char_mask(s);
+    let is_in_url = |i: usize| in_url.get(i).copied().unwrap_or(false);
     let mut out: Vec<(String, Style)> = Vec::new();
     let mut plain = String::new();
     let flush = |plain: &mut String, out: &mut Vec<(String, Style)>| {
@@ -418,7 +437,7 @@ fn parse_inline(s: &str, base: Style) -> Vec<(String, Style)> {
                 i = close + 1;
                 continue;
             }
-        } else if c == '*' && chars.get(i + 1) == Some(&'*') {
+        } else if c == '*' && chars.get(i + 1) == Some(&'*') && !is_in_url(i) {
             if let Some(close) = find_double_star(&chars, i + 2).filter(|&p| p > i + 2) {
                 flush(&mut plain, &mut out);
                 out.push((
@@ -429,6 +448,7 @@ fn parse_inline(s: &str, base: Style) -> Vec<(String, Style)> {
                 continue;
             }
         } else if (c == '*' || c == '_')
+            && !is_in_url(i)
             && let Some(off) = chars[i + 1..].iter().position(|&d| d == c).filter(|&o| o > 0)
         {
             let close = i + 1 + off;
@@ -1027,5 +1047,67 @@ mod tests {
             .map(|s| s.content.chars().count())
             .sum();
         assert_eq!(underlined, "https://example.test/xyz".chars().count());
+    }
+
+    #[test]
+    fn a_url_containing_underscores_is_not_split_by_emphasis_parsing() {
+        // parse_inline runs BEFORE style_links; without the fix, a matched
+        // `_..._` pair inside the URL gets parsed as italic and splits the
+        // URL across spans, so style_links (which scans per-span) only ever
+        // sees the fragment holding the scheme — a silently truncated hit.
+        let (lines, _, hits) =
+            render_markdown_links("see https://example.test/a_b_c now", 40, &cfg(), None);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].text, "https://example.test/a_b_c");
+        let underlined: usize = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .filter(|s| s.style.add_modifier.contains(Modifier::UNDERLINED))
+            .map(|s| s.content.chars().count())
+            .sum();
+        assert_eq!(underlined, "https://example.test/a_b_c".chars().count());
+    }
+
+    #[test]
+    fn a_url_containing_asterisks_is_not_split_by_emphasis_parsing() {
+        let (lines, _, hits) =
+            render_markdown_links("see https://example.test/a*b*c now", 40, &cfg(), None);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].text, "https://example.test/a*b*c");
+        let underlined: usize = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .filter(|s| s.style.add_modifier.contains(Modifier::UNDERLINED))
+            .map(|s| s.content.chars().count())
+            .sum();
+        assert_eq!(underlined, "https://example.test/a*b*c".chars().count());
+    }
+
+    #[test]
+    fn a_url_inside_bold_still_yields_one_whole_hit() {
+        let (lines, _, hits) =
+            render_markdown_links("**https://example.test/a_b_c**", 40, &cfg(), None);
+        assert_eq!(hits.len(), 1, "markdown markers must not split the url");
+        assert_eq!(hits[0].text, "https://example.test/a_b_c");
+        let st = hit_style(&lines, "https://example.test/a_b_c");
+        assert!(st.add_modifier.contains(Modifier::BOLD));
+        assert!(st.add_modifier.contains(Modifier::UNDERLINED));
+    }
+
+    #[test]
+    fn emphasis_still_works_when_no_url_is_present() {
+        // Regression guard for the fix above: plain markers away from any URL
+        // must still open/close exactly as before (same assertions as
+        // `bold_italic_and_unclosed_markers`, which already covers this
+        // through `render_markdown` — kept as its own test so it fails on its
+        // own if a future change to `url_char_mask`/`is_in_url` regresses it).
+        let lines = render_markdown("**bold** and *it* and _us_", 60);
+        let spans = &lines[0].spans;
+        assert!(spans.iter().any(|s| s.content == "bold"
+            && s.style.add_modifier.contains(Modifier::BOLD)));
+        assert!(spans.iter().any(|s| s.content == "it"
+            && s.style.add_modifier.contains(Modifier::ITALIC)));
+        assert!(spans.iter().any(|s| s.content == "us"
+            && s.style.add_modifier.contains(Modifier::ITALIC)));
     }
 }
