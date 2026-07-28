@@ -347,7 +347,7 @@ fn find_url_ranges(s: &str) -> Vec<std::ops::Range<usize>> {
         };
         let body = i + scheme.len();
         let end = s[body..].find(char::is_whitespace).map_or(s.len(), |off| body + off);
-        let end = trim_url_end(s, body, end);
+        let end = trim_url_end(s, i, body, end);
         if end == body {
             continue; // nothing after `//`
         }
@@ -359,21 +359,35 @@ fn find_url_ranges(s: &str) -> Vec<std::ops::Range<usize>> {
 
 /// Trims trailing sentence punctuation from a URL, and a trailing `)`/`]`/`}`
 /// only when the URL holds no matching opener — so `(see https://x/y)` gives
-/// the bracket back to the prose while `https://x/a_(b)` keeps it. `*`/`_`
-/// trim the same simple way as `.`/`,`: a URL glued to a following `**bold**`
-/// or `*italic*`/`_italic_` with no separating whitespace (`**https://x/y**`)
-/// otherwise has no boundary at all to stop at, so the match runs to the end
-/// of the line and swallows the closing marker — `parse_inline`'s own
-/// URL-vs-marker guard (`url_char_mask`) then disagrees with what
-/// `style_links` computes after the marker is stripped, and the trailing
-/// `**`/`__` ends up IN the reported hit text.
-fn trim_url_end(s: &str, start: usize, mut end: usize) -> usize {
+/// the bracket back to the prose while `https://x/a_(b)` keeps it. A
+/// trailing `*`/`_` run trims ONLY when the SAME marker char sits immediately
+/// before `match_start` (the byte the scheme match itself began at) —
+/// `**https://x/y**` and `_https://x/y_` are glued emphasis wrapping the
+/// whole URL and must lose the wrapper, but `.../keys/report_` or
+/// `.../Page_` followed by nothing but whitespace/end-of-line, with no
+/// marker glued in front, is real URL content and must keep it: trimming
+/// unconditionally (the first cut of this fix) silently dropped that
+/// trailing character from BOTH the hit text and the `o` target, the exact
+/// failure class this whole fix exists to close. Remaining imprecision,
+/// deliberately not chased further: this only compares CHARACTERS, not
+/// counts or balance, so `*https://x/a**` (one leading star, two trailing)
+/// still trims both trailing stars, and a URL wrapped by a DIFFERENT marker
+/// on each side (`_https://x/a*`) trims neither, since front and back don't
+/// match. Both are rare, already-malformed markdown shapes; getting them
+/// exactly right would mean tracking how many markers preceded the URL, not
+/// just whether one did.
+fn trim_url_end(s: &str, match_start: usize, start: usize, mut end: usize) -> usize {
     let bytes = s.as_bytes();
+    let marker_before = match_start.checked_sub(1).map(|p| bytes[p]);
     while end > start {
         // Always safe: end > start and we're indexing bytes
         let last = bytes[end - 1];
         let opener = match last {
-            b'.' | b',' | b';' | b':' | b'!' | b'?' | b'\'' | b'"' | b'*' | b'_' => {
+            b'.' | b',' | b';' | b':' | b'!' | b'?' | b'\'' | b'"' => {
+                end -= 1;
+                continue;
+            }
+            b'*' | b'_' if marker_before == Some(last) => {
                 end -= 1;
                 continue;
             }
@@ -1174,5 +1188,44 @@ mod tests {
             .map(|s| s.content.chars().count())
             .sum();
         assert_eq!(underlined, "https://example.test/x*y".chars().count());
+    }
+
+    #[test]
+    fn a_url_that_legitimately_ends_in_an_underscore_keeps_it() {
+        // No marker glued in front, just whitespace after — the trailing `_`
+        // is real URL content (S3-key-style), not an emphasis closer, and
+        // must survive both the hit text and (by extension) the `o` target.
+        let (_, _, hits) = render_markdown_links(
+            "upload to https://s3.example.test/keys/report_ then ping me",
+            80,
+            &cfg(),
+            None,
+        );
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].text.ends_with('_'), "{:?}", hits[0].text);
+        assert_eq!(hits[0].text, "https://s3.example.test/keys/report_");
+    }
+
+    #[test]
+    fn a_url_that_legitimately_ends_in_an_asterisk_keeps_it() {
+        let (_, _, hits) = render_markdown_links(
+            "see https://wiki.example.test/Page* for the draft",
+            80,
+            &cfg(),
+            None,
+        );
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].text.ends_with('*'), "{:?}", hits[0].text);
+        assert_eq!(hits[0].text, "https://wiki.example.test/Page*");
+    }
+
+    #[test]
+    fn a_url_wrapped_in_a_single_underscore_marker_loses_only_the_wrapper() {
+        let (lines, _, hits) = render_markdown_links("_https://example.test/a_", 40, &cfg(), None);
+        assert_eq!(hits.len(), 1, "the wrapping underscores must not split the url");
+        assert_eq!(hits[0].text, "https://example.test/a");
+        let st = hit_style(&lines, "https://example.test/a");
+        assert!(st.add_modifier.contains(Modifier::ITALIC));
+        assert!(st.add_modifier.contains(Modifier::UNDERLINED));
     }
 }
