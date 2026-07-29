@@ -12,13 +12,14 @@ const CODE: Color = Color::Yellow;
 const CHECK: Color = Color::Green;
 
 /// One openable target found while rendering: its text, what kind of target it
-/// is, and the rendered row its first character landed on. Document order ==
-/// the order `n`/`N` walk.
+/// is, and the rendered row its first character landed on — `None` for a hit in
+/// a region that has no scrollable row (the header title, whose 1-row
+/// `Paragraph` sits outside the body). Document order == the order `n`/`N` walk.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LinkHit {
     pub text: String,
     pub kind: LinkKind,
-    pub row: usize,
+    pub row: Option<usize>,
 }
 
 /// Per-render link state: what to match, which hit is cursored, and the hits
@@ -531,7 +532,7 @@ fn emit(
     let offsets: Vec<usize> = marks.iter().map(|(off, _, _)| *off).collect();
     let rows = wrap_into_marked(out, spans, width, hang, &offsets);
     for ((_, text, kind), row) in marks.into_iter().zip(rows) {
-        ctx.hits.push(LinkHit { text, kind, row: base + row });
+        ctx.hits.push(LinkHit { text, kind, row: Some(base + row) });
     }
 }
 
@@ -984,7 +985,7 @@ mod tests {
     fn ticket_keys_render_as_their_own_underlined_span() {
         let (lines, _, hits) =
             render_markdown_links("To estimate HM-54561 today", 40, &cfg(), None);
-        assert_eq!(hits, vec![LinkHit { text: "HM-54561".into(), kind: LinkKind::Ticket, row: 0 }]);
+        assert_eq!(hits, vec![LinkHit { text: "HM-54561".into(), kind: LinkKind::Ticket, row: Some(0) }]);
         let st = hit_style(&lines, "HM-54561");
         assert!(st.add_modifier.contains(Modifier::UNDERLINED));
         assert!(!st.add_modifier.contains(Modifier::REVERSED));
@@ -1003,7 +1004,7 @@ mod tests {
     fn hits_carry_the_row_they_landed_on() {
         let text = "# Head\n\n- first HM-1\n- second CR-2";
         let (_, _, hits) = render_markdown_links(text, 40, &cfg(), None);
-        let rows: Vec<usize> = hits.iter().map(|h| h.row).collect();
+        let rows: Vec<usize> = hits.iter().map(|h| h.row.expect("body hit has a row")).collect();
         assert_eq!(hits.iter().map(|h| h.text.as_str()).collect::<Vec<_>>(), ["HM-1", "CR-2"]);
         assert!(rows[0] < rows[1], "rows ascend with document order: {rows:?}");
     }
@@ -1038,7 +1039,7 @@ mod tests {
             .map(|s| s.content.chars().count())
             .sum();
         assert_eq!(underlined, "HM-12345".chars().count());
-        assert!(hits[0].row < lines.len());
+        assert!(hits[0].row.expect("body hit has a row") < lines.len());
     }
 
     #[test]

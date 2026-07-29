@@ -1689,7 +1689,7 @@ impl App {
                     // body ordinals are offset by `block_hits.len()`, done
                     // below where `all` is assembled.
                     for hit in &mut hits {
-                        hit.row += n;
+                        hit.row = hit.row.map(|r| r + n);
                     }
                 }
                 // Block hits occupy the FIRST ordinals; the body's own hits
@@ -1735,7 +1735,12 @@ impl App {
         // moved the cursor, never merely because a cursor exists — otherwise
         // every other scroll key looks broken while a link is selected.
         if self.follow_link {
-            if let Some(row) = self.link_cursor.and_then(|c| self.link_hits.get(c)).map(|h| h.row) {
+            // A rowless hit (the header title) has nothing to scroll to.
+            if let Some(row) = self
+                .link_cursor
+                .and_then(|c| self.link_hits.get(c))
+                .and_then(|h| h.row)
+            {
                 let h = usize::from(area.height).max(1);
                 if row < self.preview_scroll {
                     self.preview_scroll = row;
@@ -2199,7 +2204,7 @@ fn block_line(
             st = st.add_modifier(Modifier::REVERSED);
         }
         spans.push(Span::styled(kept[range.clone()].to_string(), st));
-        hits.push(markdown::LinkHit { text: kept[range.clone()].to_string(), kind, row });
+        hits.push(markdown::LinkHit { text: kept[range.clone()].to_string(), kind, row: Some(row) });
         last = range.end;
     }
     if last < kept.len() {
@@ -2656,9 +2661,9 @@ mod tests {
         // source line and carries no hits of its own).
         let (block_lines, _) = prompt_block(&a.labelled_prompts(), 59, &a.tickets, None);
         assert!(
-            a.link_hits[0].row < block_lines.len(),
+            a.link_hits[0].row.expect("body hit has a row") < block_lines.len(),
             "hit row {} must point into the block (len {})",
-            a.link_hits[0].row,
+            a.link_hits[0].row.expect("body hit has a row"),
             block_lines.len()
         );
         // And `pending_open` must actually resolve through this path — the
@@ -5239,6 +5244,22 @@ mod tests {
 
     // ----- ticket cursor: n/N navigation -----------------------------------
 
+    #[test]
+    fn block_and_body_hits_always_carry_a_row() {
+        // Only the header title is rowless (Task 2). Anything rendered into the
+        // scrollable body must keep a row, or the cursor's scroll-follow has
+        // nothing to aim at.
+        let mut a = ticket_app("body HM-2 here\n");
+        a.prompts = vec![crate::prompts::PromptGroup {
+            pane: "w1:p5".into(),
+            prompts: vec![prompt(1, "prompt HM-1 here")],
+        }];
+        a.prompt_labels = vec!["claude p5".into()];
+        rendered(&mut a, 60, 20);
+        assert_eq!(a.link_hits.len(), 2);
+        assert!(a.link_hits.iter().all(|h| h.row.is_some()), "{:?}", a.link_hits);
+    }
+
     fn ticket_app(text: &str) -> App {
         let mut a = app(text);
         a.tickets = crate::tickets::Config::from_json(
@@ -5349,7 +5370,7 @@ mod tests {
         // hit's row.)
         let mut a = ticket_app("HM-1 here\n");
         rendered(&mut a, 40, 20);
-        let without = a.link_hits[0].row;
+        let without = a.link_hits[0].row.expect("body hit has a row");
         a.prompts = vec![crate::prompts::PromptGroup {
             pane: "w1:p5".into(),
             prompts: vec![prompt(1, "look at HM-2")],
@@ -5358,7 +5379,7 @@ mod tests {
         rendered(&mut a, 40, 20);
         assert_eq!(a.link_hits.len(), 2, "one block hit, one body hit");
         let body_hit = a.link_hits.iter().find(|h| h.text == "HM-1").unwrap();
-        assert!(body_hit.row > without, "row shifted past the block");
+        assert!(body_hit.row.expect("body hit has a row") > without, "row shifted past the block");
     }
 
     #[test]
