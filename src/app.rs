@@ -2718,6 +2718,24 @@ mod tests {
     }
 
     #[test]
+    fn prompt_block_orders_a_full_ring_oldest_to_newest_top_to_bottom() {
+        // Two prompts (the test above) can't rule out an off-by-one at the
+        // RING boundary — this is the full `RING` (3) a real pane can hold,
+        // so a reversal that mishandles the first or last element would
+        // show up here even if it happened to look right for a pair.
+        let groups = vec![group("claude p5", &["newest", "middle", "oldest"])];
+        let (lines, _) = prompt_block(&groups, 60, &ticket_cfg(), None);
+        let rows: Vec<String> = lines.iter().map(line_text).collect();
+        let bullets: Vec<&str> =
+            rows.iter().map(String::as_str).filter(|r| r.starts_with("- ")).collect();
+        assert_eq!(
+            bullets,
+            vec!["- oldest", "- middle", "- newest"],
+            "oldest first, newest last, the whole ring through: {rows:?}"
+        );
+    }
+
+    #[test]
     fn prompt_block_is_empty_without_groups() {
         assert!(prompt_block(&[], 60, &ticket_cfg(), None).0.is_empty());
         assert!(
