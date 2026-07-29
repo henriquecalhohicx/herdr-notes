@@ -44,12 +44,15 @@ findings doc (and the reference implementation, `herdr-sidebar`) lives in
   header TITLE's own links are scanned in `draw` BEFORE `draw_preview` runs
   at all — a pure `find_links` over `self.note.title`, no rendering, because
   the BODY has to render first (`draw_preview` returns the scroll hint the
-  title line itself displays) — producing `LinkHit`s with `row: None`, since
-  the header is a 1-row no-wrap `Paragraph` outside the scrollable body and
-  can never host a cursor; `n`/`N` therefore never land there, but the title
-  is still styled with the same underline (REVERSED at its own ordinal) for
-  whichever of its links is selected. That count is handed to `draw_preview`
-  as the offset the block's and body's own cursors are rebased behind
+  title line itself displays) — producing `LinkHit`s with `row: None`. That
+  `None` means no SCROLLABLE row, not no cursor: `n`/`N` DO reach title
+  links, as the very first ordinals in `link_hits` (`move_link` walks the
+  same list regardless of which region a hit came from), and the title span
+  loop applies the same REVERSED at its own ordinal as any other region once
+  `self.link_cursor` points there — the header is just a 1-row no-wrap
+  `Paragraph` outside the scrollable body, so it has no source row to
+  record. That count is handed to `draw_preview` as the offset the block's
+  and body's own cursors are rebased behind
   (`cursor.checked_sub(offset)`, `None` once the cursor is in an EARLIER
   region, since that region already applied its own REVERSED). The block
   above the note (rendered by `prompt_block`) occupies the next ordinals, and
@@ -93,10 +96,15 @@ findings doc (and the reference implementation, `herdr-sidebar`) lives in
   exact outputs this produces for `HINTS_PREVIEW` at 79/46/37 columns are
   pinned by dedicated tests (`src/app.rs`) so a rank change is caught rather
   than silently reshaping the footer. `HINTS_PREVIEW` now carries `o open`
-  too — bare `o` works whenever any link is on screen, not only once a link
+  too — bare `o` works whenever any link exists in the note (title, block,
+  or body — regardless of scroll position, since `link_hits` spans the
+  whole rendered note, not just the visible rows), not only once a link
   cursor is live, so it earns a place in the base state, one rank behind
   `n/N link`; at 46 columns it is `j/k spc tick` that pays for the room,
-  making `e edit  n/N link  o open  q quit` the floor form. There is also a
+  making `e edit  n/N link  o open  q quit` the form a 37–46-column dock gets
+  (not the terminal's own floor — that form is itself 33 columns wide and
+  keeps shedding by rank below it, `e edit` next at 32; `q quit` alone is
+  what survives to whatever width the terminal clips at). There is also a
   notes-list overlay
   (`l` in preview: navigate with Up/Down or j/k, `enter` opens a read-only
   scrollable preview of the selected note, `r` renames it, `d` deletes it
@@ -807,8 +815,16 @@ Learned building this plugin:
   A link cursor left pointing at the title when `e` is pressed would
   therefore stay REVERSED under the `[edit]` header, where `o` is plain text
   insertion — `enter_edit` now calls `clear_link_cursor()` for exactly this
-  reason, the same way `x`'s confirm and the overlay's self-delete already
-  had to.
+  reason. Deliberately NOT the broader `clear_cursors` that
+  `toggle_global`/`x`'s confirm/the overlay's self-delete need: nothing in
+  edit mode reads `box_cursor` the way the header reads `link_cursor`, and
+  `box_cursor` is meant to survive a trip through edit —
+  `leaving_edit_drops_a_cursor_with_nothing_to_point_at` sets one, enters
+  edit, and relies on `leave_edit`'s `clamp_box_cursor` to drop it only
+  because the edit removed the box, not because entering edit already had.
+  Calling `clear_cursors` here would make that test pass for the wrong
+  reason while quietly removing "resume where you left off" for the
+  checkbox cursor.
 
 ## README screenshots (Alex's criteria — follow on every reshoot)
 

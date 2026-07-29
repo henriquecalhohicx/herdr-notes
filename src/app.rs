@@ -1265,7 +1265,11 @@ impl App {
     /// the cursored hit; with NO cursor it is hit 0 — which, on a note named
     /// after its ticket, IS the title's link, so the one-keystroke path costs
     /// no special case. `link_hits` is a draw product and the loop always
-    /// draws before reading a key, so "first" means the first link on screen.
+    /// draws before reading a key, so "first" means the first link in the
+    /// rendered note, not necessarily the visible one: `render_markdown_links`
+    /// takes no scroll offset and scans the WHOLE wrapped text, so a note
+    /// scrolled down can have hit 0 sitting above the fold — exactly why
+    /// `follow_link` exists, to scroll a selected hit into view.
     ///
     /// The global note's title cannot leak here: in Global mode the header
     /// renders `— ★ Global` and no title, so `draw` contributes no title hits.
@@ -1330,9 +1334,20 @@ impl App {
         // place that re-derives `link_hits`/clamps the cursor — never runs in
         // edit mode. A cursor left pointing at the title would therefore stay
         // REVERSED under the `[edit]` header, where `n`/`N`/`o` do not exist
-        // and `o` is plain text insertion. Dropping it here treats "enter
-        // edit" the same as every other context switch that ends the preview
-        // cursor session (`x`'s confirm, the overlay, `toggle_global`).
+        // and `o` is plain text insertion. This is deliberately NOT the
+        // `clear_cursors` shape that `toggle_global`/`x`'s confirm/the
+        // overlay's self-delete need (that rule is for paths that swap or
+        // wipe the buffer out from under both cursors at once): nothing in
+        // edit mode reads `box_cursor` the way the header reads
+        // `link_cursor` here, and it is meant to survive a trip through edit
+        // — `leaving_edit_drops_a_cursor_with_nothing_to_point_at` pins
+        // exactly that, then relies on `leave_edit`'s `clamp_box_cursor` to
+        // drop it ONLY if the edit actually removed the box it pointed at.
+        // Calling `clear_cursors` here instead would make that test pass for
+        // the wrong reason (the cursor already gone before the edit, not
+        // clamped because of it) while quietly taking away the "resume where
+        // you left off" behavior for the checkbox cursor. So: link cursor
+        // only.
         self.clear_link_cursor();
         // Lazy seed: a tab you merely toggled Notes into and never edited
         // still writes no file. `dirty` so the seed survives to the next
@@ -1614,14 +1629,16 @@ impl App {
         // in `HINTS_BOX`/`HINTS_LINK`, not `HINTS_PREVIEW` — advertising it
         // with no cursor live would spend scarce columns on a key that does
         // nothing. `o open` is different: bare `o` (no cursor live) now opens
-        // the first link on screen — title, then the prompt block, then the
-        // body — so it works whenever ANY link is on screen, not just when
-        // the title happens to have one. That makes it common enough to earn
-        // a place in `HINTS_PREVIEW` itself, one rank behind `n/N link` so
-        // the two link keys are the last things to go. It also means the
-        // footer now advertises a key that is a silent no-op on a note with
-        // no links at all — accepted, over a footer that would otherwise
-        // have to change with link PRESENCE as well as cursor state.
+        // the first link in the rendered note — title, then the prompt
+        // block, then the body, in that order, wherever it sits in the
+        // scroll (see `pending_open`) — so it works whenever ANY link
+        // exists in the note, not just when the title happens to have one.
+        // That makes it common enough to earn a place in `HINTS_PREVIEW`
+        // itself, one rank behind `n/N link` so the two link keys are the
+        // last things to go. It also means the footer now advertises a key
+        // that is a silent no-op on a note with no links at all — accepted,
+        // over a footer that would otherwise have to change with link
+        // PRESENCE as well as cursor state.
         let hints = match self.note.mode {
             Mode::Preview => {
                 let tokens = if self.link_cursor.is_some() {
@@ -5854,13 +5871,12 @@ mod tests {
         // mode, but the header's title-span loop is unconditional and still
         // reads `self.link_cursor` — so a cursor left pointing at the title
         // when `e` is pressed would keep that key REVERSED under the
-        // `[edit]` header, where `o` is now plain text insertion. Chosen fix:
-        // clear the link cursor in `enter_edit` (rather than gate the span
-        // loop on `Mode::Preview`) — entering edit is one more context switch
-        // that ends the preview cursor session, the same as the overlay's
-        // self-delete or `x`'s confirm already do via `clear_cursors`, so
-        // this reads as one more site on that list, not a special case added
-        // to the render path.
+        // `[edit]` header, where `o` is now plain text insertion. Chosen
+        // fix: `clear_link_cursor()` in `enter_edit` (rather than gate the
+        // span loop on `Mode::Preview`) — NOT the broader `clear_cursors`,
+        // because `box_cursor` has no equivalent bleed (nothing in edit
+        // mode reads it) and is meant to survive a trip through edit (see
+        // `leaving_edit_drops_a_cursor_with_nothing_to_point_at`).
         let mut a = ticket_app("body\n");
         a.note.title = "titled HM-1".into();
         rendered(&mut a, 60, 10);
