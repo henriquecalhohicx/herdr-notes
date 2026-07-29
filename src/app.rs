@@ -2208,12 +2208,13 @@ fn block_line(
     Line::from(spans)
 }
 
-/// The dim per-agent prompt block rendered above the note: one heading per
-/// group, its prompts numbered from 1, a blank line between groups, and a
-/// rule at the end. Empty groups and an empty list render nothing at all, so
-/// the note keeps the space. There is deliberately no single "Last Prompts"
-/// heading — the agent's own label is the more informative one, and two
-/// heading levels in a five-row block is noise.
+/// The dim per-agent prompt block rendered above the note: a "Last prompts"
+/// heading (once, so the block reads unambiguously as history rather than a
+/// second title), then one sub-heading per group (its own resolved label)
+/// with its prompts as plain bullets oldest-first — the most recent prompt
+/// sits at the bottom, closest to the note it precedes — a blank line
+/// between groups, and a rule at the end. Empty groups and an empty list
+/// render nothing at all, so the note keeps the space.
 ///
 /// Returns the rows and every link found in them — rows here are 1:1 with
 /// lines (truncated, never wrapped), so a hit's row is its line index.
@@ -2227,27 +2228,22 @@ fn prompt_block(
 ) -> (Vec<Line<'static>>, Vec<markdown::LinkHit>) {
     let dim = Style::default().add_modifier(Modifier::DIM);
     let head = Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM);
+    let title = Style::default().add_modifier(Modifier::DIM).add_modifier(Modifier::BOLD);
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut hits: Vec<markdown::LinkHit> = Vec::new();
     for (label, prompts) in groups.iter().filter(|(_, p)| !p.is_empty()) {
-        if !out.is_empty() {
+        if out.is_empty() {
+            let row = out.len();
+            out.push(block_line("", "Last prompts", width, title, cfg, cursor, row, &mut hits));
+        } else {
             out.push(Line::raw(""));
         }
         let row = out.len();
         out.push(block_line("", label, width, head, cfg, cursor, row, &mut hits));
-        for (i, p) in prompts.iter().enumerate() {
-            // The number and its separator cost 3 columns.
+        for p in prompts.iter().rev() {
+            // The bullet and its separator cost 2 columns.
             let row = out.len();
-            out.push(block_line(
-                &format!("{}. ", i + 1),
-                &p.text,
-                width.saturating_sub(3),
-                dim,
-                cfg,
-                cursor,
-                row,
-                &mut hits,
-            ));
+            out.push(block_line("- ", &p.text, width.saturating_sub(2), dim, cfg, cursor, row, &mut hits));
         }
     }
     if !out.is_empty() {
@@ -2385,7 +2381,7 @@ mod tests {
     #[test]
     fn the_prompt_block_is_absent_without_prompts() {
         // No groups -> no heading, no rows, and no trailing rule (the only
-        // marker `prompt_block` ever emits with no prompts to number); this
+        // marker `prompt_block` ever emits with no prompts to list); this
         // fixture's note text has no markdown hr of its own to confuse it.
         let mut a = app("## Status\nmid-refactor");
         assert!(!rendered(&mut a, 60, 14).contains('─'));
@@ -2686,31 +2682,34 @@ mod tests {
         let joined = rows.join("\n");
         assert!(joined.contains("HM-54271 Importer"), "{joined}");
         assert!(joined.contains("claude pB"), "{joined}");
-        assert!(joined.contains("1. add the rate limiter"), "{joined}");
-        assert!(joined.contains("2. why is auth flaky"), "{joined}");
-        // The discriminating assertion: group two's FIRST row restarts at 1.
-        // Continuous cross-group numbering (the bug this guards against)
-        // would render this row "3. run the migration" instead, since it is
-        // the third prompt overall.
+        assert!(joined.contains("- add the rate limiter"), "{joined}");
+        assert!(joined.contains("- why is auth flaky"), "{joined}");
+        assert!(joined.contains("- run the migration"), "{joined}");
+        assert!(!joined.contains("1."), "numbers are gone, plain bullets only: {joined}");
+        // The discriminating assertion: within a group, the OLDEST prompt
+        // ("why is auth flaky", ts 99) renders above the newest ("add the
+        // rate limiter", ts 100) — most recent sits at the bottom.
         assert!(
-            joined.contains("1. run the migration"),
-            "numbering restarts per group, not continues across them: {joined}"
+            rows.iter().position(|r| r.contains("why is auth flaky")).unwrap()
+                < rows.iter().position(|r| r.contains("add the rate limiter")).unwrap(),
+            "oldest prompt first, newest last: {joined}"
         );
         assert!(
             rows.iter().position(|r| r.contains("HM-54271")).unwrap()
                 < rows.iter().position(|r| r.contains("claude pB")).unwrap(),
             "group order is preserved: {joined}"
         );
-        // A blank separator sits between the two groups, and nowhere else —
-        // not before the first heading.
+        // The block opens with one generic heading, so the block reads
+        // unambiguously as prompt history rather than a second title.
         assert_eq!(
             rows.first().map(String::as_str),
-            Some("HM-54271 Importer"),
-            "no leading blank before the first group: {joined}"
+            Some("Last prompts"),
+            "the block opens with a generic heading: {joined}"
         );
+        let heading1 = rows.iter().position(|r| r == "HM-54271 Importer").unwrap();
+        assert_eq!(heading1, 1, "the first group's label follows the heading directly, no blank: {joined}");
         let heading2 = rows.iter().position(|r| r == "claude pB").unwrap();
         assert_eq!(rows[heading2 - 1], "", "a blank line separates the groups: {joined}");
-        assert!(!joined.contains("Last Prompts"), "the single heading is gone: {joined}");
     }
 
     #[test]

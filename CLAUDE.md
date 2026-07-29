@@ -235,11 +235,13 @@ findings doc (and the reference implementation, `herdr-sidebar`) lives in
   layout drift would stop capture with no diagnostic anywhere. `App.prompts`
   (`app.rs`)
   re-reads via `load_for_tab` into a `Vec<PromptGroup>`, and `prompt_block`
-  renders one heading per group above the note in preview — there is
-  deliberately NO single "Last Prompts" heading any more, each group is headed
-  by its own resolved label, numbering restarts at 1 per group, and a blank
-  line separates groups — including above the empty-note help, since a titled
-  body-less note keeps its file and so keeps accumulating prompts — gated on
+  renders above the note in preview: one generic "Last prompts" heading
+  (once, so the block reads unambiguously as history rather than a second
+  title), then one sub-heading per group headed by its own resolved label,
+  each group's prompts as plain bullets (no numbering) oldest-first — most
+  recent at the bottom, closest to the note — and a blank line separates
+  groups — including above the empty-note help, since a titled body-less
+  note keeps its file and so keeps accumulating prompts — gated on
   `showing_tab_note()` (the global note is not a tab and carries no prompts).
   `refresh_prompts` runs at construction, at the end of `toggle_global`, and
   on the 5s heartbeat: the first two exist so the block is never blank while
@@ -248,11 +250,15 @@ findings doc (and the reference implementation, `herdr-sidebar`) lives in
 - `src/template.rs` — the Status/Next/Notes skeleton, one const. Every
   section ships EMPTY — no placeholder prose: edit mode has no line-kill,
   word-delete or selection, so a placeholder would cost `End` plus one
-  Backspace per character on every new note. The `[ ] ` line's TRAILING
-  SPACE is load-bearing (`is_blank` compares the buffer to the const with
-  `==`; whitespace-stripping editor tooling silently breaks it — verify with
-  `git show HEAD:src/template.rs | cat -A`). `is_blank`
-  treats the pristine template as blank, so seeding cannot leak orphan files
+  Backspace per character on every new note. Every heading is followed by a
+  blank line before its content, so a heading never sits flush against the
+  text under it — `enter_edit`'s cursor row (the first line under
+  `## Status`) is unaffected, since that line was already blank. The
+  `[ ] ` line's TRAILING SPACE is load-bearing (`is_blank` compares the
+  buffer to the const with `==`; whitespace-stripping editor tooling
+  silently breaks it — verify with `git show HEAD:src/template.rs | cat -A`).
+  `is_blank` treats the pristine template as blank, so seeding cannot leak
+  orphan files
 - `src/state.rs` — `{text, mode, title, title_auto, tab_id, created, updated}`
   JSON (v2 — older `{text, mode}` files still load, missing fields fall back
   to defaults; `created` is stamped once, `updated` bumps on every save).
