@@ -101,6 +101,34 @@ Edit:
 <img src="docs/media/edit.png" alt="Edit mode: the same note as plain markdown with a block cursor" width="920">
 </div>
 
+### Links
+
+Configured issue keys (`HM-54599`) and bare `http(s)://` URLs in the note are
+underlined. `n`/`N` walk them — the captured-prompt block above the note counts
+too, and its links come first — `o` opens the selected one in your browser,
+`esc` drops the cursor. With NO cursor live, `o` opens the first LINK (a key
+or a URL) in the note's title, which is where the ticket usually is.
+
+Create `tickets.json` beside the note files (`%LOCALAPPDATA%\herdr\plugins\herdr-notes\`
+inside herdr, `%APPDATA%\herdr\notes\` outside it; unix
+`~/.local/share/herdr/plugins/herdr-notes/` and `~/.config/herdr/notes/`):
+
+```json
+{
+  "HM": "https://your-org.atlassian.net/browse/{key}",
+  "CR": "https://your-tracker.example/issue/{key}"
+}
+```
+
+The config itself accepts any non-empty prefix — `tickets.json` isn't
+validated against a shape — but only a prefix of two or more ASCII UPPERCASE
+letters is ever matched in text, so a lowercase, non-ASCII, or single-letter
+prefix loads without complaint and then simply never highlights or opens
+anything. Only listed prefixes are detected — an unmapped key is never
+underlined and never pretends to be openable. Edits are picked up within
+about five seconds, no restart needed. A missing or malformed file simply
+turns issue keys off; URLs need no config.
+
 ## Persistence
 
 Each herdr tab gets its own note, stored as `<tab-key>.json` in herdr's

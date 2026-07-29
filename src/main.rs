@@ -12,6 +12,7 @@ mod markdown;
 mod prompts;
 mod state;
 mod template;
+mod tickets;
 
 use std::io::Read;
 use std::time::Duration;

@@ -17,7 +17,7 @@ use ratatui::widgets::{
 };
 use unicode_width::UnicodeWidthChar;
 
-use crate::markdown::{self, render_markdown, render_markdown_mapped};
+use crate::markdown::{self, render_markdown};
 use crate::state::{self, METADATA_SOURCE, Mode, Note, PANE_LABEL};
 use crate::template;
 
@@ -397,6 +397,27 @@ pub struct App {
     /// — draw clears it once applied — so a cursor merely existing does not
     /// fight manual scrolling (`Up`/`Dn`/`g`/`G`/PgUp/PgDn) on every frame.
     follow_box: bool,
+    /// Prefix→URL templates for issue keys, loaded at construction and
+    /// hot-reloaded on the heartbeat (see `tickets_mtime`). Default-empty in
+    /// `with_note`, so unit tests never read the store dir.
+    tickets: crate::tickets::Config,
+    /// Modification time of `tickets.json` as of the last read, so the
+    /// heartbeat can reload only when it actually changed.
+    tickets_mtime: Option<std::time::SystemTime>,
+    /// Links (ticket keys and URLs) found by the last preview draw, in
+    /// document order. The draw is the single scan that both styles the
+    /// targets and lists them, so nav and highlight cannot disagree. The loop
+    /// always draws before reading a target, so this is never consulted stale.
+    link_hits: Vec<markdown::LinkHit>,
+    /// Ordinal into `link_hits` — which target `o` would open. Mutually
+    /// exclusive with `box_cursor`: one cursor at a time keeps `esc` and
+    /// `space` unambiguous.
+    link_cursor: Option<usize>,
+    /// One-shot scroll-follow, same contract as `follow_box`.
+    follow_link: bool,
+    /// Browser launches still running, reaped on the heartbeat so unix does not
+    /// accumulate a zombie per `o`.
+    open_children: Vec<std::process::Child>,
     /// The tab's captured prompts, grouped per agent pane and newest group
     /// first, each with the heading resolved at refresh time. Refreshed on the
     /// heartbeat rather than per draw. Rendered above the note, never part of
@@ -447,6 +468,12 @@ impl App {
         // real store dir (`refresh_prompts` early-returns on !persist anyway —
         // this is belt and braces).
         app.refresh_prompts();
+        // Real disk read, so it belongs beside `refresh_prompts` here rather
+        // than in `with_note` — the test constructor must stay hermetic.
+        app.tickets = crate::tickets::Config::load();
+        app.tickets_mtime = crate::tickets::config_path()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .and_then(|m| m.modified().ok());
         app
     }
 
@@ -460,6 +487,12 @@ impl App {
             preview_scroll: 0,
             box_cursor: None,
             follow_box: false,
+            tickets: crate::tickets::Config::default(),
+            tickets_mtime: None,
+            link_hits: Vec::new(),
+            link_cursor: None,
+            follow_link: false,
+            open_children: Vec::new(),
             prompts: Vec::new(),
             prompt_labels: Vec::new(),
             git_tried: std::collections::HashMap::new(),
@@ -546,11 +579,13 @@ impl App {
             };
         }
         self.note.mode = Mode::Preview;
-        // Everything per-DOCUMENT resets: a scroll offset and a checkbox
-        // ordinal both mean nothing in the other note. Anything added to this
-        // struct that describes a position INSIDE the note belongs here too.
+        // Everything per-DOCUMENT resets: a scroll offset, a checkbox ordinal
+        // and a link ordinal all mean nothing in the other note. Anything
+        // added to this struct that describes a position INSIDE the note
+        // belongs here too.
         self.preview_scroll = 0;
-        self.clear_box_cursor();
+        self.clear_cursors();
+        self.link_hits.clear();
         self.dirty = false;
         // The prompt block belongs to the TAB note only, so it has to be
         // dropped going out and rebuilt coming back — immediately, not on the
@@ -588,6 +623,44 @@ impl App {
             return;
         }
         self.last_beat = Instant::now();
+        // Non-blocking: a browser still running just stays in the list.
+        self.open_children.retain_mut(|c| !matches!(c.try_wait(), Ok(Some(_)) | Err(_)));
+        // Config hot-reload: ONE local `metadata` stat per beat, and a real
+        // read only when the mtime moved. Deliberately not the `git_branch`
+        // class of gotcha — that one is about SPAWNING a process on the
+        // event-loop thread; a stat of a local file is not in that class. Keep
+        // it that way: anything heavier here freezes input, drawing AND the
+        // identity re-stamp. A missing file gives `None`, which differs from a
+        // stamped `Some` and so reloads to an empty config — the feature going
+        // dormant, symmetric with never having had a config at all.
+        //
+        // `tickets_mtime` is stamped ONLY on `Absent`/`Loaded` — both real
+        // outcomes, either of which means this mtime has been fully dealt
+        // with. A `ReadError` (AV scan, a sharing violation while an editor
+        // rewrites the file, a network store hiccup) leaves it untouched, so
+        // the identical stat next beat still reads as "changed" and retries —
+        // stamping it here would silently and PERMANENTLY disable the
+        // feature, since nothing else would ever make the mtime move again.
+        // The truncate-then-write case still self-heals on its own: the
+        // content write bumps the mtime a second time.
+        if self.persist {
+            let mtime = crate::tickets::config_path()
+                .and_then(|p| std::fs::metadata(p).ok())
+                .and_then(|m| m.modified().ok());
+            if mtime != self.tickets_mtime {
+                match crate::tickets::try_load() {
+                    crate::tickets::LoadResult::Absent => {
+                        self.tickets_mtime = mtime;
+                        self.tickets = crate::tickets::Config::default();
+                    }
+                    crate::tickets::LoadResult::Loaded(cfg) => {
+                        self.tickets_mtime = mtime;
+                        self.tickets = cfg;
+                    }
+                    crate::tickets::LoadResult::ReadError => {}
+                }
+            }
+        }
         self.report_tokens();
         // Prompt labels and the auto-title both read the SAME `pane.list`
         // snapshot. Fetching one each meant two round-trips on every beat —
@@ -853,7 +926,7 @@ impl App {
                 // A cursor ordinal outlives the text it indexed: benign only
                 // while `cursor_line()` returns None on empty text, and no
                 // longer benign the moment text comes back (`e` re-seeds).
-                self.clear_box_cursor();
+                self.clear_cursors();
                 self.save();
             }
             self.confirm_clear = false;
@@ -878,15 +951,27 @@ impl App {
             KeyCode::Char('e') | KeyCode::Enter => self.enter_edit(true),
             KeyCode::Up => self.preview_scroll = self.preview_scroll.saturating_sub(1),
             KeyCode::Down => self.preview_scroll = self.preview_scroll.saturating_add(1),
-            KeyCode::Char('j') => self.move_box(1),
-            KeyCode::Char('k') => self.move_box(-1),
-            KeyCode::Char(' ') => self.toggle_box(),
-            // The only way out of the checkbox cursor. Without it the
+            KeyCode::Char('j') => {
+                self.clear_link_cursor();
+                self.move_box(1)
+            }
+            KeyCode::Char('k') => {
+                self.clear_link_cursor();
+                self.move_box(-1)
+            }
+            KeyCode::Char(' ') => {
+                self.clear_link_cursor();
+                self.toggle_box()
+            }
+            KeyCode::Char('n') => self.move_link(1),
+            KeyCode::Char('N') => self.move_link(-1),
+            KeyCode::Char('o') => self.open_ticket(),
+            // The only way out of either preview cursor. Without it the
             // highlight is a mode you can enter and not leave — the other
             // exits are all side effects (swap documents, `x` clear, edit the
-            // last box away). Esc is otherwise unbound here and still must
-            // never quit the TUI.
-            KeyCode::Esc => self.clear_box_cursor(),
+            // last box/link away). Esc is otherwise unbound here and still
+            // must never quit the TUI.
+            KeyCode::Esc => self.clear_cursors(),
             KeyCode::PageUp => self.preview_scroll = self.preview_scroll.saturating_sub(page),
             KeyCode::PageDown => self.preview_scroll = self.preview_scroll.saturating_add(page),
             // g/G because herdr `pane send-keys` rejects Home/End.
@@ -1091,7 +1176,7 @@ impl App {
                             // Same rule as the rename path: a wiped title is
                             // derivable again, in memory as well as on disk.
                             self.note.title_auto = self.note.title.is_empty();
-                            self.clear_box_cursor();
+                            self.clear_cursors();
                         }
                         ov.entries.remove(idx);
                     }
@@ -1125,10 +1210,94 @@ impl App {
 
     /// Drops the checkbox cursor and any pending scroll-follow. Both are
     /// per-DOCUMENT state, so every path that swaps or wipes the buffer
-    /// (`toggle_global`, `x` clear, overlay self-delete) must call this.
+    /// (`toggle_global`, `x` clear, overlay self-delete) must call
+    /// `clear_cursors`, not this directly — a cursor added later (the link
+    /// one did) would otherwise survive a swap this function alone cannot see.
     fn clear_box_cursor(&mut self) {
         self.box_cursor = None;
         self.follow_box = false;
+    }
+
+    /// Re-clamps the link ordinal against the hits the last draw found, and
+    /// drops it when there are none. Called from the draw, since the hit list
+    /// is a draw product and an edit can delete a target.
+    fn clamp_link_cursor(&mut self) {
+        let n = self.link_hits.len();
+        self.link_cursor = match self.link_cursor {
+            Some(c) if n > 0 => Some(c.min(n - 1)),
+            _ => None,
+        };
+    }
+
+    fn clear_link_cursor(&mut self) {
+        self.link_cursor = None;
+        self.follow_link = false;
+    }
+
+    /// Drops BOTH preview cursors. Every path that swaps or wipes the buffer
+    /// calls this rather than either single clear, so a cursor added later
+    /// cannot be missed by a document swap — the recurring bug class in this
+    /// crate (see the `toggle_global` / `global.json` gotchas).
+    fn clear_cursors(&mut self) {
+        self.clear_box_cursor();
+        self.clear_link_cursor();
+    }
+
+    /// Steps the link cursor over the last draw's hits. From no cursor, `n`
+    /// lands on the first target and `N` on the last. Clamps at both ends;
+    /// does nothing when the note has no links.
+    fn move_link(&mut self, delta: isize) {
+        self.clamp_link_cursor();
+        let n = self.link_hits.len();
+        if n == 0 {
+            return; // clamp already dropped the cursor
+        }
+        self.clear_box_cursor(); // one cursor at a time
+        self.link_cursor = Some(match self.link_cursor {
+            None if delta > 0 => 0,
+            None => n - 1,
+            Some(c) => c.saturating_add_signed(delta).min(n - 1),
+        });
+        self.follow_link = true;
+    }
+
+    /// The URL `o` would open right now, or `None`. With a cursor live it is the
+    /// cursored hit; with no cursor it is the header TITLE's first link, which
+    /// is where the ticket usually is and which no cursor can reach. Separate
+    /// from `open_ticket` so the resolution is testable without a browser.
+    ///
+    /// The no-cursor arm is gated on `showing_tab_note()`: in Global mode
+    /// `self.note` IS the shared global note, whose title is user-settable
+    /// with `r` ungated on which note is showing, but the header renders
+    /// `— ★ Global` and never a title in that mode. Without this gate, `o`
+    /// could open a link derived from text the user was never shown — the
+    /// governing rule this feature does not get to break just because a
+    /// second document was added later (see the two-document-buffer Gotchas).
+    fn pending_open(&self) -> Option<String> {
+        let (text, kind) = match self.link_cursor.and_then(|c| self.link_hits.get(c)) {
+            Some(hit) => (hit.text.clone(), hit.kind),
+            None => {
+                if !self.showing_tab_note() {
+                    return None;
+                }
+                let (range, kind) =
+                    markdown::find_links(&self.note.title, &self.tickets).into_iter().next()?;
+                (self.note.title[range].to_string(), kind)
+            }
+        };
+        match kind {
+            markdown::LinkKind::Ticket => crate::tickets::ticket_url(&self.tickets, &text),
+            markdown::LinkKind::Url => Some(text),
+        }
+    }
+
+    /// Opens the cursored link. Silent no-op when there is no cursor, no
+    /// mapping, or the spawn fails — nothing may print from the TUI.
+    fn open_ticket(&mut self) {
+        let Some(url) = self.pending_open() else { return };
+        if let Some(child) = crate::tickets::open(&url) {
+            self.open_children.push(child);
+        }
     }
 
     /// Steps the checkbox cursor. From no cursor, `j` lands on the first box
@@ -1350,10 +1519,26 @@ impl App {
                 ));
             } else if !self.note.title.trim().is_empty() {
                 title.push(Span::raw(" —"));
-                title.push(Span::styled(
-                    format!(" {}", self.note.title),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ));
+                let bold = Style::default().add_modifier(Modifier::BOLD);
+                // Underlined for consistency with the body, but cursorless: the
+                // header is a 1-row no-wrap Paragraph outside the scrollable
+                // body, so `n`/`N` can never reach it. Bare `o` is the
+                // affordance instead (see `pending_open`).
+                let text = format!(" {}", self.note.title);
+                let mut last = 0usize;
+                for (range, _) in markdown::find_links(&text, &self.tickets) {
+                    if range.start > last {
+                        title.push(Span::styled(text[last..range.start].to_string(), bold));
+                    }
+                    title.push(Span::styled(
+                        text[range.clone()].to_string(),
+                        bold.add_modifier(Modifier::UNDERLINED),
+                    ));
+                    last = range.end;
+                }
+                if last < text.len() {
+                    title.push(Span::styled(text[last..].to_string(), bold));
+                }
             }
             if let Some(hint) = scroll_hint {
                 title.push(Span::styled(
@@ -1379,31 +1564,38 @@ impl App {
         }
         frame.render_widget(Paragraph::new(Line::from(title)), title_a);
 
-        // The full hint line no longer fits a narrow right dock, and it ends
-        // in `q quit` — exactly what clipping would eat. Each form is picked
-        // by width so `q quit` survives down to the shortest one's own length
-        // (37 columns bare, 39 with the cursor hint); below that it clips.
-        // `esc drop` appears only while a checkbox cursor is live: it is the
-        // only exit from that cursor, and advertising it unconditionally
-        // would spend scarce columns on a key that does nothing. It costs
-        // `l list` its place in the narrow cursor form — while you are stuck
-        // in a cursor, the way out beats the way to the dashboard.
-        const PREVIEW_HINTS: &str =
-            " e edit  j/k spc tick  r title  l list  Up/Dn scroll  x clear  q quit";
-        const PREVIEW_HINTS_SHORT: &str = " e edit  j/k spc tick  l list  q quit";
-        const PREVIEW_HINTS_CURSOR: &str =
-            " e edit  j/k spc tick  esc drop  r title  l list  Up/Dn scroll  x clear  q quit";
-        const PREVIEW_HINTS_CURSOR_SHORT: &str = " e edit  j/k spc tick  esc drop  q quit";
+        // The full hint line no longer fits a narrow right dock (the user's
+        // real dock is ~46 columns), so tokens degrade one at a time by rank
+        // instead of jumping between two fixed forms — the old short form
+        // had no room for the link hint at all, making `n`/`N` invisible in
+        // exactly the pane the feature ships in. `q quit` is rank 0 and
+        // never drops; below its own length the terminal clips, same as
+        // before. `esc drop` is state-scoped: it is the only exit from
+        // whichever cursor is live (checkbox or link), so it is offered only
+        // in `HINTS_BOX`/`HINTS_LINK`, not `HINTS_PREVIEW` — advertising it
+        // with no cursor live would spend scarce columns on a key that does
+        // nothing. `o open` is `HINTS_LINK`-only too, but NOT for that same
+        // reason any more: bare `o` (no cursor live) opens the title's first
+        // link, so it is never a no-op key. It stays out of `HINTS_PREVIEW`
+        // because most notes have no link in their title at all, so
+        // advertising it there would spend scarce columns on a key with
+        // nothing to open more often than not — whereas once a link cursor
+        // exists (`n`/`N`), `o` is guaranteed a target, the cursored hit
+        // itself. Whether `o open` belongs in `HINTS_PREVIEW` regardless is a
+        // separate product decision, not settled here — the token tables
+        // themselves are unchanged.
         let hints = match self.note.mode {
             Mode::Preview => {
-                let (full, short) = if self.box_cursor.is_some() {
-                    (PREVIEW_HINTS_CURSOR, PREVIEW_HINTS_CURSOR_SHORT)
+                let tokens = if self.link_cursor.is_some() {
+                    HINTS_LINK
+                } else if self.box_cursor.is_some() {
+                    HINTS_BOX
                 } else {
-                    (PREVIEW_HINTS, PREVIEW_HINTS_SHORT)
+                    HINTS_PREVIEW
                 };
-                if usize::from(hint_a.width) >= full.chars().count() { full } else { short }
+                fit_hints(tokens, usize::from(hint_a.width))
             }
-            Mode::Edit => " Esc preview (saves)   Ctrl+S save",
+            Mode::Edit => " Esc preview (saves)   Ctrl+S save".to_string(),
         };
         frame.render_widget(
             Paragraph::new(Span::styled(hints, Style::default().add_modifier(Modifier::DIM))),
@@ -1433,11 +1625,16 @@ impl App {
         // without going through it, so the render site re-checks
         // `showing_tab_note()` itself rather than trusting that invariant to
         // still hold by the time we draw.
-        let block = if self.showing_tab_note() {
-            prompt_block(&self.labelled_prompts(), text_w)
+        let (block, block_hits) = if self.showing_tab_note() {
+            prompt_block(&self.labelled_prompts(), text_w, &self.tickets, self.link_cursor)
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
+        // The block sits above the note, so its hits are the FIRST ordinals and
+        // a body cursor is offset by however many the block holds. `None` here
+        // means "the cursor is in the block" — the block already applied its own
+        // REVERSED, so the body render must not claim the ordinal too.
+        let body_cursor = self.link_cursor.and_then(|c| c.checked_sub(block_hits.len()));
         // The empty-note help used to be a fixed-height special case (forced
         // `preview_scroll = 0`, no hint, no scrollbar) on the assumption the
         // block could never exceed a couple of rows. Grouping removed that
@@ -1454,6 +1651,11 @@ impl App {
         // what `map` contains.
         let (mut lines, map): (Vec<Line<'static>>, Vec<Option<usize>>) =
             if self.note.text.trim().is_empty() {
+                // No body, so no body links — but the block's hits survive: a
+                // titled, body-less note still accumulates prompts, and those
+                // prompts are the only links it has. Clearing here would drop
+                // them the instant the note itself goes empty.
+                self.link_hits = block_hits;
                 let mut lines = block;
                 lines.extend(empty_help().lines().map(|l| {
                     Line::from(Span::styled(l.to_string(), Style::default().add_modifier(Modifier::DIM)))
@@ -1461,7 +1663,12 @@ impl App {
                 let map = vec![None; lines.len()];
                 (lines, map)
             } else {
-                let (mut lines, mut map) = render_markdown_mapped(&self.note.text, text_w);
+                let (mut lines, mut map, mut hits) = markdown::render_markdown_links(
+                    &self.note.text,
+                    text_w,
+                    &self.tickets,
+                    body_cursor,
+                );
                 // The block's rows map to NO source line, so the checkbox cursor can
                 // never land on one and the highlight/scroll-follow keep pointing at
                 // real note lines. Edit mode never reaches here.
@@ -1473,9 +1680,29 @@ impl App {
                     let mut merged_map = vec![None; n];
                     merged_map.append(&mut map);
                     map = merged_map;
+                    // Hit rows index the FINAL list: body rows shift by
+                    // `block.len()` (`n`) here. The block IS scanned for links
+                    // (via `prompt_block`/`block_line`) and its hits already
+                    // carry correct rows, so they are untouched — only these
+                    // body-side rows need the shift. Ordinals are a separate
+                    // axis from rows: block hits take the FIRST ordinals and
+                    // body ordinals are offset by `block_hits.len()`, done
+                    // below where `all` is assembled.
+                    for hit in &mut hits {
+                        hit.row += n;
+                    }
                 }
+                // Block hits occupy the FIRST ordinals; the body's own hits
+                // (already reversed by `render_markdown_links` at `body_cursor`)
+                // are appended after them, matching the offset computed above.
+                let mut all = block_hits;
+                all.extend(hits);
+                self.link_hits = all;
                 (lines, map)
             };
+        // The hit list is a draw product; an edit may have deleted the target
+        // the ordinal pointed at.
+        self.clamp_link_cursor();
         let total = lines.len();
         let max = total.saturating_sub(usize::from(area.height));
         if let Some(src) = self.cursor_line() {
@@ -1503,6 +1730,20 @@ impl App {
                 }
                 self.follow_box = false;
             }
+        }
+        // Same one-shot contract as `follow_box`: only right after `n`/`N`
+        // moved the cursor, never merely because a cursor exists — otherwise
+        // every other scroll key looks broken while a link is selected.
+        if self.follow_link {
+            if let Some(row) = self.link_cursor.and_then(|c| self.link_hits.get(c)).map(|h| h.row) {
+                let h = usize::from(area.height).max(1);
+                if row < self.preview_scroll {
+                    self.preview_scroll = row;
+                } else if row >= self.preview_scroll + h {
+                    self.preview_scroll = row + 1 - h;
+                }
+            }
+            self.follow_link = false;
         }
         self.preview_scroll = clamp_scroll(self.preview_scroll, total, usize::from(area.height));
         let scroll = u16::try_from(self.preview_scroll).unwrap_or(u16::MAX);
@@ -1822,34 +2063,197 @@ fn fit_right(context: &str, progress: &str, age: &str, budget: usize) -> String 
     .unwrap_or_default()
 }
 
+/// Footer hint tokens for one preview state, in DISPLAY order, each with a drop
+/// rank: when the line does not fit, the highest rank goes first and ties break
+/// on the later slice position. Rank 0 never drops, so `q quit` survives to the
+/// floor and only below that does the terminal clip — which is what the six
+/// fixed hint strings used to guarantee, at the cost of a step change between
+/// two widths and nothing in between.
+type Hints = &'static [(&'static str, u8)];
+
+const HINTS_PREVIEW: Hints = &[
+    ("e edit", 3),
+    ("j/k spc tick", 4),
+    ("n/N link", 2),
+    ("r title", 6),
+    ("l list", 5),
+    ("Up/Dn scroll", 7),
+    ("x clear", 8),
+    ("q quit", 0),
+];
+
+/// While a checkbox cursor is live, `esc drop` is the only way out of it, so it
+/// outranks everything but `q quit`.
+const HINTS_BOX: Hints = &[
+    ("e edit", 3),
+    ("j/k spc tick", 4),
+    ("esc drop", 1),
+    ("r title", 6),
+    ("l list", 5),
+    ("Up/Dn scroll", 7),
+    ("x clear", 8),
+    ("q quit", 0),
+];
+
+/// While a link cursor is live, opening is the point (`o open`) and `esc drop`
+/// is the way out; `x clear` is not offered at all — wiping the note under a
+/// live link cursor is not a thing anyone reaches for.
+const HINTS_LINK: Hints = &[
+    ("e edit", 4),
+    ("n/N link", 3),
+    ("o open", 1),
+    ("esc drop", 2),
+    ("r title", 6),
+    ("l list", 5),
+    ("Up/Dn scroll", 7),
+    ("q quit", 0),
+];
+
+/// Renders `tokens` into a footer line of at most `width` display COLUMNS,
+/// dropping by rank until it fits. Greedy by rank rather than optimal packing:
+/// a lower-ranked token that would still have fitted is not re-added, which
+/// keeps the rule one sentence long and the output predictable.
+fn fit_hints(tokens: Hints, width: usize) -> String {
+    let mut keep: Vec<(&str, u8)> = tokens.to_vec();
+    loop {
+        let line = render_hints(&keep);
+        if dwidth(&line) <= width {
+            return line;
+        }
+        let Some(pos) = keep
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, rank))| *rank > 0)
+            .max_by_key(|(i, (_, rank))| (*rank, *i))
+            .map(|(i, _)| i)
+        else {
+            return line; // only rank 0 left: let the terminal clip, as before
+        };
+        keep.remove(pos);
+    }
+}
+
+/// One leading space, two spaces between tokens — the shape the fixed hint
+/// strings had.
+fn render_hints(keep: &[(&str, u8)]) -> String {
+    let joined: Vec<&str> = keep.iter().map(|(t, _)| *t).collect();
+    format!(" {}", joined.join("  "))
+}
+
+/// One prompt-block row: `text` truncated to `budget` display columns, with
+/// every link inside the RETAINED prefix split into its own underlined span
+/// (REVERSED when its ordinal is `cursor`). Hits are appended to `hits` with
+/// `row`.
+///
+/// Truncation is the hazard here, and there are TWO sources of it. Render
+/// truncation: `truncate_w` appends NO ellipsis, so a cut `HM-54283` would
+/// read as a perfectly valid `HM-542` and `o` would open the wrong ticket.
+/// The scan therefore runs on the FULL text and keeps only hits that end
+/// inside the retained prefix — which is a byte prefix, so the offsets line
+/// up. STORAGE truncation: `prompts::condense` already cut `text` at
+/// `MAX_CHARS` and appended a real `…` before this function ever sees it,
+/// and `…` is neither ASCII-alphanumeric nor `_`, so it satisfies
+/// `find_ticket_ranges`'/`find_url_ranges`' right-hand boundary just as well
+/// as a space would — a key or URL straddling THAT cut looks bounded and
+/// complete on the stored text alone, and the render-side guard above never
+/// fires because the cut already happened upstream. So: when `text` ends
+/// with `…`, any hit ending at or after the ellipsis's start byte is dropped
+/// too. This is deliberately conservative — it also drops a complete key or
+/// URL that happens to sit immediately before the cut, since nothing here
+/// can tell that case apart from a genuinely truncated one without the
+/// original, untruncated prompt `condense` never keeps — but the
+/// alternative is `o` opening a ticket or URL that was never in the prompt.
+#[allow(clippy::too_many_arguments)] // one row-render call site per block line; a struct would just rename these fields
+fn block_line(
+    number: &str,
+    text: &str,
+    budget: usize,
+    style: Style,
+    cfg: &crate::tickets::Config,
+    cursor: Option<usize>,
+    row: usize,
+    hits: &mut Vec<markdown::LinkHit>,
+) -> Line<'static> {
+    let kept = truncate_w(text, budget);
+    // `None` when `text` doesn't end in a stored ellipsis at all — the
+    // common case, and the check below is then always false.
+    let ellipsis_at = text.ends_with('…').then(|| text.len() - '…'.len_utf8());
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    if !number.is_empty() {
+        spans.push(Span::styled(number.to_string(), style));
+    }
+    let mut last = 0usize;
+    // Both cutoffs only get stricter as the scan moves right (`find_links`
+    // returns ranges in ascending, non-overlapping order, so ends only grow),
+    // so `break` on either is as safe as the pre-existing `kept.len()` check
+    // alone was.
+    for (range, kind) in markdown::find_links(text, cfg) {
+        if range.end > kept.len() || ellipsis_at.is_some_and(|e| range.end >= e) {
+            break;
+        }
+        if range.start > last {
+            spans.push(Span::styled(kept[last..range.start].to_string(), style));
+        }
+        let mut st = style.add_modifier(Modifier::UNDERLINED);
+        if cursor == Some(hits.len()) {
+            st = st.add_modifier(Modifier::REVERSED);
+        }
+        spans.push(Span::styled(kept[range.clone()].to_string(), st));
+        hits.push(markdown::LinkHit { text: kept[range.clone()].to_string(), kind, row });
+        last = range.end;
+    }
+    if last < kept.len() {
+        spans.push(Span::styled(kept[last..].to_string(), style));
+    }
+    Line::from(spans)
+}
+
 /// The dim per-agent prompt block rendered above the note: one heading per
 /// group, its prompts numbered from 1, a blank line between groups, and a
 /// rule at the end. Empty groups and an empty list render nothing at all, so
 /// the note keeps the space. There is deliberately no single "Last Prompts"
 /// heading — the agent's own label is the more informative one, and two
 /// heading levels in a five-row block is noise.
+///
+/// Returns the rows and every link found in them — rows here are 1:1 with
+/// lines (truncated, never wrapped), so a hit's row is its line index.
+/// `cursor` is an ordinal into THIS block's hits, which are the first ones
+/// in the pane's list.
 fn prompt_block(
     groups: &[(String, Vec<crate::prompts::Prompt>)],
     width: usize,
-) -> Vec<Line<'static>> {
+    cfg: &crate::tickets::Config,
+    cursor: Option<usize>,
+) -> (Vec<Line<'static>>, Vec<markdown::LinkHit>) {
     let dim = Style::default().add_modifier(Modifier::DIM);
     let head = Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM);
     let mut out: Vec<Line<'static>> = Vec::new();
+    let mut hits: Vec<markdown::LinkHit> = Vec::new();
     for (label, prompts) in groups.iter().filter(|(_, p)| !p.is_empty()) {
         if !out.is_empty() {
             out.push(Line::raw(""));
         }
-        out.push(Line::from(Span::styled(truncate_w(label, width), head)));
+        let row = out.len();
+        out.push(block_line("", label, width, head, cfg, cursor, row, &mut hits));
         for (i, p) in prompts.iter().enumerate() {
             // The number and its separator cost 3 columns.
-            let body = truncate_w(&p.text, width.saturating_sub(3));
-            out.push(Line::from(Span::styled(format!("{}. {body}", i + 1), dim)));
+            let row = out.len();
+            out.push(block_line(
+                &format!("{}. ", i + 1),
+                &p.text,
+                width.saturating_sub(3),
+                dim,
+                cfg,
+                cursor,
+                row,
+                &mut hits,
+            ));
         }
     }
     if !out.is_empty() {
         out.push(Line::from(Span::styled("─".repeat(width), dim)));
     }
-    out
+    (out, hits)
 }
 
 fn format_row(marker: &str, self_mark: &str, name: &str, right: &str, inner_width: usize) -> String {
@@ -2084,13 +2488,201 @@ mod tests {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
     }
 
+    /// The config `ticket_app` injects, for the free-function tests.
+    fn ticket_cfg() -> crate::tickets::Config {
+        crate::tickets::Config::from_json(r#"{"HM":"https://example.test/browse/{key}"}"#)
+    }
+
+    fn block_of(text: &str) -> (Vec<Line<'static>>, Vec<markdown::LinkHit>) {
+        let groups = vec![("claude p5".to_string(), vec![prompt(1, text)])];
+        prompt_block(&groups, 60, &ticket_cfg(), None)
+    }
+
+    #[test]
+    fn a_key_in_the_prompt_block_is_a_hit() {
+        let (_, hits) = block_of("look at HM-54283 today");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].text, "HM-54283");
+        assert_eq!(hits[0].kind, markdown::LinkKind::Ticket);
+    }
+
+    #[test]
+    fn a_key_cut_by_truncation_is_not_a_hit() {
+        // `truncate_w` appends NO ellipsis, so a cut key looks perfectly valid
+        // and `o` would open the wrong ticket.
+        let groups = vec![("claude p5".to_string(), vec![prompt(1, "padding HM-54283")])];
+        let (lines, hits) = prompt_block(&groups, 14, &ticket_cfg(), None);
+        assert!(hits.is_empty(), "{lines:?}");
+    }
+
+    /// A key straddling the cut `prompts::condense` makes on-disk, built from
+    /// `MAX_CHARS` rather than a hand-counted literal so this can't rot if
+    /// that constant moves. `budget` is generous (well past the condensed
+    /// text's own length) so only the STORED-ellipsis guard, not the
+    /// render-side `truncate_w` one, could possibly be catching this.
+    #[test]
+    fn a_stored_ellipsis_does_not_reopen_a_cut_key() {
+        let key = "HM-54283";
+        // Land the cut mid-key: pad (plus one boundary space, so the key's
+        // LEFT side is legitimately bounded and only the ellipsis-cut RIGHT
+        // side is under test) so the key starts a few chars before the
+        // condensed length, then let the rest of the line run well past it.
+        let pad = "x".repeat(crate::prompts::MAX_CHARS - 1 - 1 - key.len() / 2);
+        let raw = format!("{pad} {key} trailing text long enough to force condense to cut and ellipsize this line");
+        let stored = crate::prompts::condense(&raw);
+        assert!(stored.ends_with('…'), "fixture must actually get condensed: {stored:?}");
+        let groups = vec![("claude p5".to_string(), vec![prompt(1, &stored)])];
+        let (_, hits) = prompt_block(&groups, 200, &ticket_cfg(), None);
+        assert!(hits.is_empty(), "a key straddling the stored ellipsis must not become a hit: {stored:?}");
+    }
+
+    /// Deliberately conservative case: the key itself is NOT cut — it ends
+    /// exactly where `condense`'s cut lands, so the stored text reads
+    /// `...HM-54283…` — but nothing at this point can distinguish "complete
+    /// key, cut landed right after" from "key cut mid-way" without the
+    /// original, untruncated prompt, which `condense` never keeps. Losing
+    /// this one link is the accepted cost of never opening a ticket that was
+    /// never in the prompt.
+    #[test]
+    fn a_complete_key_immediately_before_the_stored_ellipsis_is_still_dropped() {
+        let key = "HM-54283";
+        // Boundary space for the same reason as the test above: the key's
+        // LEFT side must be legitimately bounded so this test exercises the
+        // ellipsis handling specifically, not an unrelated boundary miss.
+        let pad = "x".repeat(crate::prompts::MAX_CHARS - 1 - 1 - key.len());
+        let raw = format!("{pad} {key} trailing text long enough to force condense to cut and ellipsize this line");
+        let stored = crate::prompts::condense(&raw);
+        assert!(
+            stored.ends_with(&format!("{key}…")),
+            "fixture must place a complete key right at the cut: {stored:?}"
+        );
+        let groups = vec![("claude p5".to_string(), vec![prompt(1, &stored)])];
+        let (_, hits) = prompt_block(&groups, 200, &ticket_cfg(), None);
+        assert!(hits.is_empty(), "conservative: a complete key immediately before the stored ellipsis is dropped too");
+    }
+
+    /// The URL shape of the same hazard: `find_url_ranges` runs to the next
+    /// whitespace, and with no whitespace between the URL and the stored `…`
+    /// the match absorbs the ellipsis — which would otherwise open a broken
+    /// URL that was never actually in the prompt.
+    #[test]
+    fn a_url_absorbing_the_stored_ellipsis_is_not_a_hit() {
+        let raw = format!("see https://example.test/{}", "y".repeat(200));
+        let stored = crate::prompts::condense(&raw);
+        assert!(stored.ends_with('…'), "fixture must actually get condensed: {stored:?}");
+        let groups = vec![("claude p5".to_string(), vec![prompt(1, &stored)])];
+        let (_, hits) = prompt_block(&groups, 200, &ticket_cfg(), None);
+        assert!(hits.is_empty(), "a URL absorbing the stored ellipsis must not become a hit: {stored:?}");
+    }
+
+    /// Guards against over-rejecting: an ordinary, un-truncated prompt's URL
+    /// must still link (its key counterpart is
+    /// `a_key_in_the_prompt_block_is_a_hit` above).
+    #[test]
+    fn a_short_prompt_with_a_url_still_gets_a_hit() {
+        let groups = vec![("claude p5".to_string(), vec![prompt(1, "see https://example.test/doc please")])];
+        let (_, hits) = prompt_block(&groups, 60, &ticket_cfg(), None);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].kind, markdown::LinkKind::Url);
+    }
+
+    #[test]
+    fn block_hits_come_before_body_hits() {
+        let mut a = ticket_app("body HM-2 here\n");
+        a.prompts = vec![crate::prompts::PromptGroup {
+            pane: "w1:p5".into(),
+            prompts: vec![prompt(1, "prompt HM-1 here")],
+        }];
+        a.prompt_labels = vec!["claude p5".into()];
+        rendered(&mut a, 60, 20);
+        assert_eq!(
+            a.link_hits.iter().map(|h| h.text.as_str()).collect::<Vec<_>>(),
+            ["HM-1", "HM-2"]
+        );
+        a.on_key(key(KeyCode::Char('n')));
+        assert_eq!(a.pending_open().as_deref(), Some("https://example.test/browse/HM-1"));
+        a.on_key(key(KeyCode::Char('n')));
+        assert_eq!(a.pending_open().as_deref(), Some("https://example.test/browse/HM-2"));
+    }
+
+    #[test]
+    fn the_highlight_and_the_open_target_agree_across_both_regions() {
+        // The one place two hit lists must agree on an order. Presence alone
+        // (`reversed.contains(expected)`) is not enough: deleting the
+        // `checked_sub` in `draw_preview` and passing `link_cursor` straight
+        // to the body render — the exact regression this split guards
+        // against — would highlight BOTH the block hit and the body hit for
+        // the same ordinal, and a presence-only check would still pass. So
+        // for each ordinal we also assert the OTHER region's link is NOT
+        // reversed.
+        let mut a = ticket_app("body HM-2 here\n");
+        a.prompts = vec![crate::prompts::PromptGroup {
+            pane: "w1:p5".into(),
+            prompts: vec![prompt(1, "prompt HM-1 here")],
+        }];
+        a.prompt_labels = vec!["claude p5".into()];
+        rendered(&mut a, 60, 20);
+        for (ordinal, expected, other) in [(0usize, "HM-1", "HM-2"), (1, "HM-2", "HM-1")] {
+            a.link_cursor = Some(ordinal);
+            let mut term =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 20)).unwrap();
+            term.draw(|f| a.draw(f)).unwrap();
+            let buf = term.backend().buffer();
+            let reversed: String = (0..20)
+                .flat_map(|y| (0..60).map(move |x| (x, y)))
+                .filter_map(|(x, y)| buf.cell((x, y)))
+                .filter(|c| c.modifier.contains(Modifier::REVERSED))
+                .map(|c| c.symbol().to_string())
+                .collect();
+            assert!(reversed.contains(expected), "ordinal {ordinal}: reversed={reversed:?}");
+            assert!(
+                !reversed.contains(other),
+                "ordinal {ordinal}: the region NOT selected must stay unhighlighted, reversed={reversed:?}"
+            );
+            assert!(a.pending_open().unwrap().ends_with(expected));
+        }
+    }
+
+    #[test]
+    fn a_titled_body_less_note_still_carries_its_block_hits() {
+        let mut a = ticket_app("");
+        a.note.title = "named".into();
+        a.prompts = vec![crate::prompts::PromptGroup {
+            pane: "w1:p5".into(),
+            prompts: vec![prompt(1, "prompt HM-1 here")],
+        }];
+        a.prompt_labels = vec!["claude p5".into()];
+        rendered(&mut a, 60, 20);
+        assert_eq!(a.link_hits.len(), 1, "the empty-note path must not drop block hits");
+        // The empty-note branch renders the block, then the help text, with
+        // no body lines at all — so the hit's row must land inside the
+        // block's own line count, not spill into the help (which maps to no
+        // source line and carries no hits of its own).
+        let (block_lines, _) = prompt_block(&a.labelled_prompts(), 59, &a.tickets, None);
+        assert!(
+            a.link_hits[0].row < block_lines.len(),
+            "hit row {} must point into the block (len {})",
+            a.link_hits[0].row,
+            block_lines.len()
+        );
+        // And `pending_open` must actually resolve through this path — the
+        // body is empty, so the only way this can succeed is via the block.
+        a.link_cursor = Some(0);
+        assert_eq!(
+            a.pending_open().as_deref(),
+            Some("https://example.test/browse/HM-1"),
+            "pending_open must resolve the block hit on a titled, body-less note"
+        );
+    }
+
     #[test]
     fn prompt_block_heads_each_group_with_its_label() {
         let groups = vec![
             group("HM-54271 Importer", &["add the rate limiter", "why is auth flaky"]),
             group("claude pB", &["run the migration"]),
         ];
-        let rows: Vec<String> = prompt_block(&groups, 60).iter().map(line_text).collect();
+        let (lines, _) = prompt_block(&groups, 60, &ticket_cfg(), None);
+        let rows: Vec<String> = lines.iter().map(line_text).collect();
         let joined = rows.join("\n");
         assert!(joined.contains("HM-54271 Importer"), "{joined}");
         assert!(joined.contains("claude pB"), "{joined}");
@@ -2123,8 +2715,11 @@ mod tests {
 
     #[test]
     fn prompt_block_is_empty_without_groups() {
-        assert!(prompt_block(&[], 60).is_empty());
-        assert!(prompt_block(&[("solo".into(), vec![])], 60).is_empty(), "a group with no prompts renders nothing");
+        assert!(prompt_block(&[], 60, &ticket_cfg(), None).0.is_empty());
+        assert!(
+            prompt_block(&[("solo".into(), vec![])], 60, &ticket_cfg(), None).0.is_empty(),
+            "a group with no prompts renders nothing"
+        );
     }
 
     #[test]
@@ -2134,7 +2729,8 @@ mod tests {
         // heading is user-supplied too and gets the same treatment.
         let groups = vec![group(&"文".repeat(80), &[&"文".repeat(80)])];
         for width in [12usize, 30, 60] {
-            for line in prompt_block(&groups, width) {
+            let (lines, _) = prompt_block(&groups, width, &ticket_cfg(), None);
+            for line in lines {
                 let text = line_text(&line);
                 assert!(dwidth(&text) <= width, "row {text:?} is {} cols, want <= {width}", dwidth(&text));
             }
@@ -2201,7 +2797,7 @@ mod tests {
         // Matches draw_preview's own `text_w` derivation: area.width - 1 for
         // the scrollbar column, with the 60-wide `rendered()` call above.
         let text_w = usize::from(60u16).saturating_sub(1).max(1);
-        let block_rows = prompt_block(&with_block.labelled_prompts(), text_w).len();
+        let block_rows = prompt_block(&with_block.labelled_prompts(), text_w, &with_block.tickets, None).0.len();
         assert!(block_rows > 0, "the fixture must actually produce a block");
         assert_eq!(
             with_block.preview_scroll,
@@ -2922,6 +3518,94 @@ mod tests {
         assert!(!a.dirty, "an unchanged pane-derived candidate must not touch() the note");
 
         restore_env(prev);
+    }
+
+    #[test]
+    fn the_heartbeat_picks_up_an_edited_config() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("notes-hotreload-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("no-such.sock");
+        let prev = swap_env(&[
+            ("HERDR_PLUGIN_STATE_DIR", Some(dir.as_os_str())),
+            ("HERDR_TAB_ID", Some(std::ffi::OsStr::new("w1:t1"))),
+            ("HERDR_PANE_ID", None),
+            ("HERDR_SOCKET_PATH", Some(sock.as_os_str())),
+        ]);
+
+        let mut a = App::new();
+        assert!(a.tickets.is_empty(), "no config file yet");
+
+        let path = dir.join(crate::tickets::FILE);
+        std::fs::write(&path, r#"{"TT":"https://example.test/{key}"}"#).unwrap();
+        a.last_beat = Instant::now() - HEARTBEAT_EVERY;
+        a.heartbeat();
+        assert!(a.tickets.has_prefix("TT"), "an edited config is picked up");
+
+        // An UNCHANGED mtime must not reload: clobber the in-memory config and
+        // check the beat leaves it alone.
+        a.tickets = crate::tickets::Config::default();
+        a.last_beat = Instant::now() - HEARTBEAT_EVERY;
+        a.heartbeat();
+        assert!(a.tickets.is_empty(), "unchanged mtime: no reload");
+        a.tickets = crate::tickets::Config::load(); // put it back for the next step
+
+        std::fs::remove_file(&path).unwrap();
+        a.last_beat = Instant::now() - HEARTBEAT_EVERY;
+        a.heartbeat();
+        assert!(a.tickets.is_empty(), "a deleted config turns the feature off");
+
+        restore_env(prev);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_transient_read_failure_does_not_cache_the_new_mtime() {
+        // Important 3: `tickets_mtime` must be stamped only on a REAL
+        // outcome (file absent, or read+parsed) — never on a read failure.
+        // Stamping it on a transient failure (AV scan, a sharing violation
+        // while an editor rewrites the file, a network store hiccup) turns
+        // the feature off and leaves it dormant until the user next touches
+        // the file, since nothing else would ever make the mtime "move"
+        // again. Forced portably (no permissions API needed, same on
+        // Windows and Unix): a DIRECTORY in place of the file gives a real
+        // `metadata` success — a new, different mtime, so the beat sees it
+        // as "changed" — but a real `read_to_string` failure, the same
+        // shape `try_load` sees from an actual sharing violation.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("notes-hotreload-err-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("no-such.sock");
+        let prev = swap_env(&[
+            ("HERDR_PLUGIN_STATE_DIR", Some(dir.as_os_str())),
+            ("HERDR_TAB_ID", Some(std::ffi::OsStr::new("w1:t1"))),
+            ("HERDR_PANE_ID", None),
+            ("HERDR_SOCKET_PATH", Some(sock.as_os_str())),
+        ]);
+
+        let mut a = App::new();
+        let path = dir.join(crate::tickets::FILE);
+        std::fs::write(&path, r#"{"TT":"https://example.test/{key}"}"#).unwrap();
+        a.last_beat = Instant::now() - HEARTBEAT_EVERY;
+        a.heartbeat();
+        assert!(a.tickets.has_prefix("TT"), "a real config is picked up");
+        let good_mtime = a.tickets_mtime;
+
+        // Replace the file with a directory of the same name.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir_all(&path).unwrap();
+        a.last_beat = Instant::now() - HEARTBEAT_EVERY;
+        a.heartbeat();
+        assert!(a.tickets.has_prefix("TT"), "a read failure must not clear the existing config");
+        assert_eq!(
+            a.tickets_mtime, good_mtime,
+            "a read failure must not cache the mtime it was chasing, or the retry never fires"
+        );
+
+        restore_env(prev);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -4281,6 +4965,65 @@ mod tests {
     }
 
     #[test]
+    fn the_full_footer_shows_every_token() {
+        assert_eq!(
+            fit_hints(HINTS_PREVIEW, 79),
+            " e edit  j/k spc tick  n/N link  r title  l list  Up/Dn scroll  x clear  q quit"
+        );
+    }
+
+    #[test]
+    fn a_narrow_dock_drops_tokens_by_rank() {
+        // 46 columns is a typical right dock. Ranks drop x clear, Up/Dn scroll,
+        // r title and l list in that order; what is left fits in 39.
+        assert_eq!(fit_hints(HINTS_PREVIEW, 46), " e edit  j/k spc tick  n/N link  q quit");
+        // At the 37-column floor the checkbox hint goes too. Greedy by rank,
+        // not optimal packing: something shorter could still have fitted, and
+        // that is the accepted trade for one simple rule.
+        assert_eq!(fit_hints(HINTS_PREVIEW, 37), " e edit  n/N link  q quit");
+    }
+
+    #[test]
+    fn the_link_state_keeps_o_open_and_esc_drop_to_the_floor() {
+        for w in [37, 46, 60] {
+            let line = fit_hints(HINTS_LINK, w);
+            assert!(line.contains("o open"), "{w}: {line}");
+            assert!(line.contains("esc drop"), "{w}: {line}");
+            assert!(dwidth(&line) <= w, "{w}: {line}");
+        }
+    }
+
+    #[test]
+    fn every_state_keeps_q_quit_at_every_width() {
+        for tokens in [HINTS_PREVIEW, HINTS_BOX, HINTS_LINK] {
+            for w in 10..=90 {
+                assert!(fit_hints(tokens, w).contains("q quit"), "width {w}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_wider_pane_never_shows_fewer_tokens() {
+        for tokens in [HINTS_PREVIEW, HINTS_BOX, HINTS_LINK] {
+            let mut prev = 0;
+            for w in 10..=100 {
+                let n = fit_hints(tokens, w).split("  ").count();
+                assert!(n >= prev, "width {w} regressed from {prev} to {n}");
+                prev = n;
+            }
+        }
+    }
+
+    #[test]
+    fn the_footer_advertises_the_link_key_in_a_narrow_dock() {
+        // The whole point of this task: at 46 columns the old short form had no
+        // room for it, so the feature was invisible.
+        let mut a = ticket_app("HM-1\n");
+        let screen = rendered(&mut a, 46, 10);
+        assert!(screen.contains("n/N link"), "{screen}");
+    }
+
+    #[test]
     fn esc_drops_the_checkbox_cursor() {
         // A mode you can enter must be a mode you can leave. Esc is the only
         // free key in preview and it must still never quit the TUI.
@@ -4327,6 +5070,19 @@ mod tests {
     }
 
     #[test]
+    fn toggle_global_drops_the_ticket_cursor() {
+        // Same shape as the checkbox cursor above: an ordinal into THIS
+        // document's ticket hits means nothing once the buffer swaps.
+        let mut a = ticket_app("first HM-1\nsecond HM-2\n");
+        rendered(&mut a, 40, 10);
+        a.on_key(key(KeyCode::Char('n')));
+        assert_eq!(a.link_cursor, Some(0));
+        a.toggle_global();
+        assert_eq!(a.link_cursor, None, "the cursor is per-document, like preview_scroll");
+        assert!(!a.follow_link, "and so is its pending scroll-follow");
+    }
+
+    #[test]
     fn clearing_the_note_drops_the_checkbox_cursor() {
         let mut a = app("[ ] one\n[ ] two");
         a.on_key(key(KeyCode::Char('j')));
@@ -4351,6 +5107,22 @@ mod tests {
         assert_eq!(a.note.text, "");
         assert_eq!(a.box_cursor, None, "clearing the buffer clears its cursor");
         assert!(!a.follow_box);
+    }
+
+    #[test]
+    fn overlay_self_delete_drops_the_ticket_cursor() {
+        let mut a = ticket_app("first HM-1\nsecond HM-2\n");
+        rendered(&mut a, 40, 10);
+        a.on_key(key(KeyCode::Char('n')));
+        assert_eq!(a.link_cursor, Some(0));
+        a.overlay = Some(Overlay::from_entries(vec![
+            OverlayEntry { is_self: true, ..entry("X", state::TabStatus::Closed) },
+        ]));
+        a.on_key(key(KeyCode::Char('d')));
+        a.on_key(key(KeyCode::Char('y')));
+        assert_eq!(a.note.text, "");
+        assert_eq!(a.link_cursor, None, "clearing the buffer clears its cursor");
+        assert!(!a.follow_link);
     }
 
     #[test]
@@ -4464,5 +5236,309 @@ mod tests {
         assert!(screen.contains("Release"), "the name must not collapse to a column or two: {screen}");
         assert!(screen.contains("acme-app"), "session context still fits: {screen}");
         assert!(!screen.contains("2/3"), "the progress count is the first thing dropped: {screen}");
+    }
+
+    // ----- ticket cursor: n/N navigation -----------------------------------
+
+    fn ticket_app(text: &str) -> App {
+        let mut a = app(text);
+        a.tickets = crate::tickets::Config::from_json(
+            r#"{"HM":"https://example.test/browse/{key}"}"#,
+        );
+        a
+    }
+
+    #[test]
+    fn n_and_n_upper_walk_the_ticket_cursor_and_clamp() {
+        let mut a = ticket_app("first HM-1\nsecond HM-2\n");
+        rendered(&mut a, 40, 10);
+        assert_eq!(a.link_cursor, None, "no cursor until you ask for one");
+        a.on_key(key(KeyCode::Char('n')));
+        assert_eq!(a.link_cursor, Some(0));
+        a.on_key(key(KeyCode::Char('n')));
+        assert_eq!(a.link_cursor, Some(1));
+        a.on_key(key(KeyCode::Char('n')));
+        assert_eq!(a.link_cursor, Some(1), "clamps at the last ticket");
+        a.on_key(key(KeyCode::Char('N')));
+        assert_eq!(a.link_cursor, Some(0));
+        a.on_key(key(KeyCode::Char('N')));
+        assert_eq!(a.link_cursor, Some(0), "clamps at the first ticket");
+    }
+
+    #[test]
+    fn n_upper_with_no_cursor_lands_on_the_last_hit() {
+        // From `None`, `move_link`'s `None => n - 1` arm is only reachable
+        // when `N` (delta < 0) is the FIRST key pressed — every other test in
+        // this module presses `n` first, so that arm would go unexercised
+        // (and a `None => 0` typo there would still pass the suite) without
+        // this one starting cold on `N`.
+        let mut a = ticket_app("first HM-1\nsecond HM-2\n");
+        rendered(&mut a, 40, 10);
+        assert_eq!(a.link_cursor, None, "no cursor until you ask for one");
+        a.on_key(key(KeyCode::Char('N')));
+        assert_eq!(a.link_cursor, Some(1), "N from no cursor lands on the last hit");
+    }
+
+    #[test]
+    fn n_does_nothing_without_configured_tickets() {
+        let mut a = app("HM-1 here"); // no config injected
+        rendered(&mut a, 40, 10);
+        a.on_key(key(KeyCode::Char('n')));
+        assert_eq!(a.link_cursor, None);
+        assert!(a.link_hits.is_empty());
+    }
+
+    #[test]
+    fn the_two_cursors_are_mutually_exclusive() {
+        let mut a = ticket_app("[ ] task HM-1\n[ ] other\n");
+        rendered(&mut a, 40, 10);
+        a.on_key(key(KeyCode::Char('j')));
+        assert_eq!(a.box_cursor, Some(0));
+        a.on_key(key(KeyCode::Char('n')));
+        assert_eq!(a.link_cursor, Some(0));
+        assert_eq!(a.box_cursor, None, "n drops the checkbox cursor");
+        a.on_key(key(KeyCode::Char('j')));
+        assert_eq!(a.box_cursor, Some(0));
+        assert_eq!(a.link_cursor, None, "j drops the ticket cursor");
+    }
+
+    #[test]
+    fn esc_drops_both_cursors() {
+        let mut a = ticket_app("[ ] task HM-1\n");
+        rendered(&mut a, 40, 10);
+        a.on_key(key(KeyCode::Char('n')));
+        a.on_key(key(KeyCode::Esc));
+        assert_eq!(a.link_cursor, None);
+        assert!(!a.follow_link, "and the pending scroll-follow with it");
+        assert_eq!(a.box_cursor, None);
+    }
+
+    #[test]
+    fn clearing_the_note_drops_the_ticket_cursor() {
+        // A stale ordinal is harmless only while there is no text under it.
+        let mut a = ticket_app("HM-1\n");
+        rendered(&mut a, 40, 10);
+        a.on_key(key(KeyCode::Char('n')));
+        assert_eq!(a.link_cursor, Some(0));
+        a.on_key(key(KeyCode::Char('x')));
+        a.on_key(key(KeyCode::Char('y')));
+        assert_eq!(a.link_cursor, None);
+    }
+
+    #[test]
+    fn an_edit_that_removes_a_ticket_reclamps_the_cursor() {
+        let mut a = ticket_app("HM-1 and HM-2\n");
+        rendered(&mut a, 40, 10);
+        a.on_key(key(KeyCode::Char('n')));
+        a.on_key(key(KeyCode::Char('n')));
+        assert_eq!(a.link_cursor, Some(1));
+        a.note.text = "HM-1 only\n".to_string();
+        rendered(&mut a, 40, 10);
+        assert_eq!(a.link_cursor, Some(0), "clamped to the surviving ticket");
+        a.note.text = "nothing here\n".to_string();
+        rendered(&mut a, 40, 10);
+        assert_eq!(a.link_cursor, None);
+    }
+
+    #[test]
+    fn the_prompt_block_offsets_ticket_rows() {
+        // Hit rows index the FINAL preview line list, so a BODY hit must be
+        // shifted past the prompt block the same way `map` is. (The block is
+        // now scanned for tickets too, so a prompt referencing HM-2 adds a
+        // hit of its own ahead of the body's — that hit is asserted in
+        // `block_hits_come_before_body_hits`; this test's job is the body
+        // hit's row.)
+        let mut a = ticket_app("HM-1 here\n");
+        rendered(&mut a, 40, 20);
+        let without = a.link_hits[0].row;
+        a.prompts = vec![crate::prompts::PromptGroup {
+            pane: "w1:p5".into(),
+            prompts: vec![prompt(1, "look at HM-2")],
+        }];
+        a.prompt_labels = vec!["claude p5".into()];
+        rendered(&mut a, 40, 20);
+        assert_eq!(a.link_hits.len(), 2, "one block hit, one body hit");
+        let body_hit = a.link_hits.iter().find(|h| h.text == "HM-1").unwrap();
+        assert!(body_hit.row > without, "row shifted past the block");
+    }
+
+    #[test]
+    fn an_empty_note_has_no_hits() {
+        let mut a = ticket_app("");
+        rendered(&mut a, 40, 10);
+        assert!(a.link_hits.is_empty());
+        assert_eq!(a.link_cursor, None);
+    }
+
+    #[test]
+    fn the_ticket_cursor_scrolls_itself_into_view_once() {
+        let mut a = ticket_app(&format!("{}HM-1 at the bottom\n", "filler\n".repeat(40)));
+        rendered(&mut a, 40, 10);
+        assert_eq!(a.preview_scroll, 0);
+        a.on_key(key(KeyCode::Char('n')));
+        rendered(&mut a, 40, 10);
+        assert!(a.preview_scroll > 0, "scrolled to the only ticket");
+        assert!(!a.follow_link, "one-shot: cleared after the draw");
+        let settled = a.preview_scroll;
+        a.on_key(key(KeyCode::Char('g')));
+        rendered(&mut a, 40, 10);
+        assert_eq!(a.preview_scroll, 0, "manual scrolling is not fought");
+        assert!(settled > 0);
+    }
+
+    #[test]
+    fn the_footer_advertises_the_ticket_keys_while_the_cursor_is_live() {
+        let mut a = ticket_app("HM-1\n");
+        rendered(&mut a, 90, 10);
+        a.on_key(key(KeyCode::Char('n')));
+        let screen = rendered(&mut a, 90, 10);
+        assert!(screen.contains("o open"), "{screen}");
+        assert!(screen.contains("esc drop"));
+    }
+
+    #[test]
+    fn every_short_footer_form_keeps_the_quit_hint() {
+        let mut a = ticket_app("HM-1\n");
+        rendered(&mut a, 40, 10);
+        a.on_key(key(KeyCode::Char('n')));
+        let screen = rendered(&mut a, 40, 10);
+        assert!(screen.contains("q quit"), "{screen}");
+    }
+
+    #[test]
+    fn the_cursor_ordinal_spans_source_lines() {
+        // Guards the render's ordinal formula: a per-line reset would highlight
+        // the wrong key on any multi-line note.
+        let mut a = ticket_app("HM-1 here\n\nHM-2 there\n");
+        rendered(&mut a, 40, 10);
+        a.on_key(key(KeyCode::Char('n')));
+        a.on_key(key(KeyCode::Char('n')));
+        assert_eq!(a.link_cursor, Some(1));
+        assert_eq!(a.link_hits[1].text, "HM-2");
+        assert!(a.link_hits[0].row < a.link_hits[1].row);
+    }
+
+    // ----- o opens the cursored ticket in the browser ----------------------
+
+    #[test]
+    fn o_without_a_cursor_or_config_does_nothing() {
+        // No panic, no child, no output — the whole failure contract.
+        let mut a = ticket_app("HM-1\n");
+        rendered(&mut a, 40, 10);
+        a.on_key(key(KeyCode::Char('o')));
+        assert!(a.open_children.is_empty(), "no cursor, nothing to open");
+
+        let mut b = app("HM-1\n"); // no config
+        rendered(&mut b, 40, 10);
+        b.on_key(key(KeyCode::Char('n')));
+        b.on_key(key(KeyCode::Char('o')));
+        assert!(b.open_children.is_empty());
+    }
+
+    #[test]
+    fn o_resolves_the_cursored_key_to_a_url() {
+        // The URL, not the spawn, is the tested part: `pending_open` returns
+        // what `o` would hand to the browser.
+        let mut a = ticket_app("first HM-1\nsecond HM-2\n");
+        rendered(&mut a, 40, 10);
+        a.on_key(key(KeyCode::Char('n')));
+        a.on_key(key(KeyCode::Char('n')));
+        assert_eq!(
+            a.pending_open().as_deref(),
+            Some("https://example.test/browse/HM-2")
+        );
+    }
+
+    #[test]
+    fn a_url_in_the_note_is_navigable_and_opens_itself() {
+        let mut a = ticket_app("read https://example.test/doc later\n");
+        rendered(&mut a, 40, 10);
+        assert_eq!(a.link_hits.len(), 1);
+        a.on_key(key(KeyCode::Char('n')));
+        assert_eq!(a.pending_open().as_deref(), Some("https://example.test/doc"));
+    }
+
+    #[test]
+    fn one_cursor_walks_tickets_and_urls_in_document_order() {
+        let mut a = ticket_app("HM-1 then https://example.test/x\n");
+        rendered(&mut a, 60, 10);
+        a.on_key(key(KeyCode::Char('n')));
+        assert_eq!(a.pending_open().as_deref(), Some("https://example.test/browse/HM-1"));
+        a.on_key(key(KeyCode::Char('n')));
+        assert_eq!(a.pending_open().as_deref(), Some("https://example.test/x"));
+    }
+
+    // ----- the header title underlines its key, and bare `o` opens it ------
+
+    #[test]
+    fn the_header_title_underlines_its_key() {
+        let mut a = ticket_app("body\n");
+        a.note.title = "Design new ticket HM-54599".into();
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 10)).unwrap();
+        term.draw(|f| a.draw(f)).unwrap();
+        let buf = term.backend().buffer();
+        let underlined: String = (0..60)
+            .filter_map(|x| buf.cell((x, 0)))
+            .filter(|c| c.modifier.contains(Modifier::UNDERLINED))
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert_eq!(underlined, "HM-54599");
+    }
+
+    #[test]
+    fn bare_o_opens_the_titles_key() {
+        // The note is usually named after its ticket, and no cursor can live in
+        // the header, so `o` with no cursor is the one-keystroke path.
+        let mut a = ticket_app("body with no keys\n");
+        a.note.title = "Design new ticket HM-54599".into();
+        rendered(&mut a, 60, 10);
+        assert_eq!(
+            a.pending_open().as_deref(),
+            Some("https://example.test/browse/HM-54599")
+        );
+    }
+
+    #[test]
+    fn a_live_cursor_beats_the_title() {
+        let mut a = ticket_app("body HM-2 here\n");
+        a.note.title = "titled HM-1".into();
+        rendered(&mut a, 60, 10);
+        a.on_key(key(KeyCode::Char('n')));
+        assert_eq!(a.pending_open().as_deref(), Some("https://example.test/browse/HM-2"));
+    }
+
+    #[test]
+    fn bare_o_with_no_key_in_the_title_is_a_no_op() {
+        let mut a = ticket_app("body with no keys\n");
+        a.note.title = "just a name".into();
+        rendered(&mut a, 60, 10);
+        assert_eq!(a.pending_open(), None);
+        a.on_key(key(KeyCode::Char('o')));
+        assert!(a.open_children.is_empty());
+    }
+
+    #[test]
+    fn bare_o_ignores_the_tab_notes_title_while_showing_global() {
+        // `self.note` IS the global note in Global mode, and its title is
+        // user-settable with `r` ungated on `showing_tab_note()` — but the
+        // header shows `— ★ Global` and never a title in that mode. Without
+        // the gate in `pending_open`, `o` would launch a browser at a link
+        // derived from text nowhere on screen.
+        let mut a = ticket_app("body with no keys\n");
+        a.note.title = "titled HM-1".into();
+        a.active = ActiveNote::Global;
+        rendered(&mut a, 60, 10);
+        assert_eq!(a.pending_open(), None);
+        a.on_key(key(KeyCode::Char('o')));
+        assert!(a.open_children.is_empty(), "o must spawn nothing");
+    }
+
+    #[test]
+    fn bare_o_opens_the_first_of_two_links_in_the_title() {
+        // The README promises "first"; nothing previously pinned `.next()`.
+        let mut a = ticket_app("body with no keys\n");
+        a.note.title = "HM-1 and HM-2".into();
+        rendered(&mut a, 60, 10);
+        assert_eq!(a.pending_open().as_deref(), Some("https://example.test/browse/HM-1"));
     }
 }
