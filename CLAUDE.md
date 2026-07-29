@@ -40,20 +40,31 @@ findings doc (and the reference implementation, `herdr-sidebar`) lives in
   checkboxes, `j`/`k`/`space` still silently drop the link cursor and then
   do nothing else, since `move_box` has nothing to move to either — a `j`
   that looks like a no-op quietly deselects the link. `App.link_hits` is
-  assembled from TWO sources with the captured-prompt block FIRST: the block
-  above the note (rendered by `prompt_block`) is scanned for its own links,
-  occupying the first ordinals, and the note body's hits (from
-  `render_markdown_links`, offset so its own internal numbering starts at 0)
-  are appended after — `draw_preview` passes the block's hit count as an
-  offset (`cursor - block_hits.len()`, `None` when the cursor is IN the
-  block, since the block already applied its own REVERSED) so the two lists
-  never disagree about which ordinal is cursored. The header TITLE is styled
-  with the same underline for its own first link but can never host a
-  cursor — it is a 1-row no-wrap `Paragraph` outside the scrollable body — so
-  `n`/`N` never land there; bare `o` (no cursor live) opens the title's first
-  link instead, which is the affordance that replaces a title cursor.
-  `o` (`open_ticket`) resolves the cursored (or, with none live, the title's)
-  target through `pending_open` (the pure, tested seam)
+  assembled from THREE regions, ordinals running title → block → body. The
+  header TITLE's own links are scanned in `draw` BEFORE `draw_preview` runs
+  at all — a pure `find_links` over `self.note.title`, no rendering, because
+  the BODY has to render first (`draw_preview` returns the scroll hint the
+  title line itself displays) — producing `LinkHit`s with `row: None`, since
+  the header is a 1-row no-wrap `Paragraph` outside the scrollable body and
+  can never host a cursor; `n`/`N` therefore never land there, but the title
+  is still styled with the same underline (REVERSED at its own ordinal) for
+  whichever of its links is selected. That count is handed to `draw_preview`
+  as the offset the block's and body's own cursors are rebased behind
+  (`cursor.checked_sub(offset)`, `None` once the cursor is in an EARLIER
+  region, since that region already applied its own REVERSED). The block
+  above the note (rendered by `prompt_block`) occupies the next ordinals, and
+  the note body's hits (from `render_markdown_links`) are appended last,
+  offset behind both. Title hits exist only when a title is actually
+  rendered — not in Global mode, not while the title editor (`title_input`)
+  is open, not for a blank title — which is the whole mechanism stopping
+  `n`/`N`/bare `o` from ever reaching text the header is not showing; there
+  is no gate in `pending_open` for this any more (see Gotchas). A rowless
+  hit's `row: Option<usize>` being `None` also means `follow_link` skips
+  scrolling for it, so selecting the title hit leaves `preview_scroll`
+  untouched. `pending_open` is simply the cursored hit if `link_cursor` is
+  set, else `link_hits.first()` — bare `o` needs no title-specific case any
+  more, since on a ticket-named note the title's link just IS hit 0.
+  `o` (`open_ticket`) resolves through `pending_open` (the pure, tested seam)
   and hands the URL to `tickets::open`, pushing the returned `Child` onto
   `App.open_children` for the heartbeat to reap non-blockingly. `esc`
   (`clear_cursors`) is the ONE place both cursors are dropped together, and
@@ -81,7 +92,12 @@ findings doc (and the reference implementation, `herdr-sidebar`) lives in
   sentence long at the cost of not being the tightest possible line; the
   exact outputs this produces for `HINTS_PREVIEW` at 79/46/37 columns are
   pinned by dedicated tests (`src/app.rs`) so a rank change is caught rather
-  than silently reshaping the footer. There is also a notes-list overlay
+  than silently reshaping the footer. `HINTS_PREVIEW` now carries `o open`
+  too — bare `o` works whenever any link is on screen, not only once a link
+  cursor is live, so it earns a place in the base state, one rank behind
+  `n/N link`; at 46 columns it is `j/k spc tick` that pays for the room,
+  making `e edit  n/N link  o open  q quit` the floor form. There is also a
+  notes-list overlay
   (`l` in preview: navigate with Up/Down or j/k, `enter` opens a read-only
   scrollable preview of the selected note, `r` renames it, `d` deletes it
   with a y/N confirm, `esc`/`l` closes the overlay). v2 turned the overlay
@@ -764,6 +780,35 @@ Learned building this plugin:
   re-derive from the one `link_hits` list on the same draw), but a link
   cursor left live across such a change can silently retarget to a different
   link than the one the user pointed it at.
+- Title links are the FIRST ordinals, but the title is rendered LAST — `draw`
+  renders the body first because `draw_preview` returns the scroll hint the
+  title line displays. So the title is SCANNED early (a pure `find_links`, no
+  rendering) and its count is handed to `draw_preview` as the offset the
+  block and body cursors sit behind. Moving that scan after the body render
+  silently renumbers every ordinal.
+- Title hits exist only when a title is actually on screen: not in Global
+  mode, not while `title_input` is open, not for a blank title. That is the
+  whole mechanism stopping bare `o` from opening text the user was never
+  shown — there is no gate in `pending_open` any more, so a future header
+  state that hides the title has to be added to that condition too.
+- `LinkHit.row` is `Option<usize>` because the header is a 1-row no-wrap
+  `Paragraph` outside the scrollable body. `follow_link` skips a `None` row; a
+  sentinel row number instead would scroll the body to an arbitrary line the
+  moment a title link is selected.
+- The title's spans slice the RAW `note.title` and emit the leading space as
+  its own span, so `find_links`' offsets need no shift. The assembled width is
+  unchanged, which the header's ALL-OR-NOTHING age token depends on — it sums
+  `dwidth` over every span already pushed.
+- The header (mode/title/scroll-hint/age) is built in `draw` UNCONDITIONALLY
+  — it is not behind the `Mode::Preview`/`Mode::Edit` match, only the BODY is.
+  So the title span loop's `self.link_cursor == Some(i)` check still runs,
+  and still reads, in edit mode too, even though `draw_preview` (the only
+  place that re-derives `link_hits` and clamps the cursor) never runs there.
+  A link cursor left pointing at the title when `e` is pressed would
+  therefore stay REVERSED under the `[edit]` header, where `o` is plain text
+  insertion — `enter_edit` now calls `clear_link_cursor()` for exactly this
+  reason, the same way `x`'s confirm and the overlay's self-delete already
+  had to.
 
 ## README screenshots (Alex's criteria — follow on every reshoot)
 

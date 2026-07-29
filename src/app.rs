@@ -1261,33 +1261,24 @@ impl App {
         self.follow_link = true;
     }
 
-    /// The URL `o` would open right now, or `None`. With a cursor live it is the
-    /// cursored hit; with no cursor it is the header TITLE's first link, which
-    /// is where the ticket usually is and which no cursor can reach. Separate
-    /// from `open_ticket` so the resolution is testable without a browser.
+    /// The URL `o` would open right now, or `None`. With a cursor live it is
+    /// the cursored hit; with NO cursor it is hit 0 — which, on a note named
+    /// after its ticket, IS the title's link, so the one-keystroke path costs
+    /// no special case. `link_hits` is a draw product and the loop always
+    /// draws before reading a key, so "first" means the first link on screen.
     ///
-    /// The no-cursor arm is gated on `showing_tab_note()`: in Global mode
-    /// `self.note` IS the shared global note, whose title is user-settable
-    /// with `r` ungated on which note is showing, but the header renders
-    /// `— ★ Global` and never a title in that mode. Without this gate, `o`
-    /// could open a link derived from text the user was never shown — the
-    /// governing rule this feature does not get to break just because a
-    /// second document was added later (see the two-document-buffer Gotchas).
+    /// The global note's title cannot leak here: in Global mode the header
+    /// renders `— ★ Global` and no title, so `draw` contributes no title hits.
+    /// Separate from `open_ticket` so the resolution is testable without a
+    /// browser.
     fn pending_open(&self) -> Option<String> {
-        let (text, kind) = match self.link_cursor.and_then(|c| self.link_hits.get(c)) {
-            Some(hit) => (hit.text.clone(), hit.kind),
-            None => {
-                if !self.showing_tab_note() {
-                    return None;
-                }
-                let (range, kind) =
-                    markdown::find_links(&self.note.title, &self.tickets).into_iter().next()?;
-                (self.note.title[range].to_string(), kind)
-            }
+        let hit = match self.link_cursor {
+            Some(c) => self.link_hits.get(c)?,
+            None => self.link_hits.first()?,
         };
-        match kind {
-            markdown::LinkKind::Ticket => crate::tickets::ticket_url(&self.tickets, &text),
-            markdown::LinkKind::Url => Some(text),
+        match hit.kind {
+            markdown::LinkKind::Ticket => crate::tickets::ticket_url(&self.tickets, &hit.text),
+            markdown::LinkKind::Url => Some(hit.text.clone()),
         }
     }
 
@@ -1334,6 +1325,15 @@ impl App {
     /// note autosaved mid-edit comes back as Edit, and an unconditional seed
     /// would hand it a body the user never typed and autosave it 2s later.
     fn enter_edit(&mut self, seed: bool) {
+        // The header's title-span loop reads `self.link_cursor` unconditionally
+        // (it is not gated on preview mode), and `draw_preview` — the only
+        // place that re-derives `link_hits`/clamps the cursor — never runs in
+        // edit mode. A cursor left pointing at the title would therefore stay
+        // REVERSED under the `[edit]` header, where `n`/`N`/`o` do not exist
+        // and `o` is plain text insertion. Dropping it here treats "enter
+        // edit" the same as every other context switch that ends the preview
+        // cursor session (`x`'s confirm, the overlay, `toggle_global`).
+        self.clear_link_cursor();
         // Lazy seed: a tab you merely toggled Notes into and never edited
         // still writes no file. `dirty` so the seed survives to the next
         // autosave; `is_blank` deletes it again if it stays untouched.
@@ -1613,16 +1613,15 @@ impl App {
         // whichever cursor is live (checkbox or link), so it is offered only
         // in `HINTS_BOX`/`HINTS_LINK`, not `HINTS_PREVIEW` — advertising it
         // with no cursor live would spend scarce columns on a key that does
-        // nothing. `o open` is `HINTS_LINK`-only too, but NOT for that same
-        // reason any more: bare `o` (no cursor live) opens the title's first
-        // link, so it is never a no-op key. It stays out of `HINTS_PREVIEW`
-        // because most notes have no link in their title at all, so
-        // advertising it there would spend scarce columns on a key with
-        // nothing to open more often than not — whereas once a link cursor
-        // exists (`n`/`N`), `o` is guaranteed a target, the cursored hit
-        // itself. Whether `o open` belongs in `HINTS_PREVIEW` regardless is a
-        // separate product decision, not settled here — the token tables
-        // themselves are unchanged.
+        // nothing. `o open` is different: bare `o` (no cursor live) now opens
+        // the first link on screen — title, then the prompt block, then the
+        // body — so it works whenever ANY link is on screen, not just when
+        // the title happens to have one. That makes it common enough to earn
+        // a place in `HINTS_PREVIEW` itself, one rank behind `n/N link` so
+        // the two link keys are the last things to go. It also means the
+        // footer now advertises a key that is a silent no-op on a note with
+        // no links at all — accepted, over a footer that would otherwise
+        // have to change with link PRESENCE as well as cursor state.
         let hints = match self.note.mode {
             Mode::Preview => {
                 let tokens = if self.link_cursor.is_some() {
@@ -1662,6 +1661,12 @@ impl App {
         // The rightmost column is reserved for the overflow scrollbar so text
         // never sits underneath it.
         let text_w = usize::from(area.width).saturating_sub(1).max(1);
+        // Ordinals run title → block → body. Each region gets the cursor
+        // rebased into its own numbering, and `None` means "the cursor is in an
+        // earlier region" — that region already applied its own REVERSED, so a
+        // later one must not claim the ordinal too.
+        let offset = title_hits.len();
+        let block_cursor = self.link_cursor.and_then(|c| c.checked_sub(offset));
         // Built BEFORE the empty-note branch: a note with a title but no body
         // is not blank, so its file persists, so capture's note-file gate keeps
         // passing and prompts keep accumulating for it. Rendering only the help
@@ -1671,12 +1676,6 @@ impl App {
         // without going through it, so the render site re-checks
         // `showing_tab_note()` itself rather than trusting that invariant to
         // still hold by the time we draw.
-        // Ordinals run title → block → body. Each region gets the cursor
-        // rebased into its own numbering, and `None` means "the cursor is in an
-        // earlier region" — that region already applied its own REVERSED, so a
-        // later one must not claim the ordinal too.
-        let offset = title_hits.len();
-        let block_cursor = self.link_cursor.and_then(|c| c.checked_sub(offset));
         let (block, block_hits) = if self.showing_tab_note() {
             prompt_block(&self.labelled_prompts(), text_w, &self.tickets, block_cursor)
         } else {
@@ -2134,13 +2133,14 @@ fn fit_right(context: &str, progress: &str, age: &str, budget: usize) -> String 
 type Hints = &'static [(&'static str, u8)];
 
 const HINTS_PREVIEW: Hints = &[
-    ("e edit", 3),
-    ("j/k spc tick", 4),
+    ("e edit", 4),
+    ("j/k spc tick", 5),
     ("n/N link", 2),
-    ("r title", 6),
-    ("l list", 5),
-    ("Up/Dn scroll", 7),
-    ("x clear", 8),
+    ("o open", 3),
+    ("r title", 7),
+    ("l list", 6),
+    ("Up/Dn scroll", 8),
+    ("x clear", 9),
     ("q quit", 0),
 ];
 
@@ -5038,28 +5038,49 @@ mod tests {
     fn preview_footer_falls_back_to_the_short_form_when_narrow() {
         let mut a = app("body");
         assert!(rendered(&mut a, 90, 8).contains("Up/Dn scroll"), "wide pane shows the full hints");
-        let narrow = rendered(&mut a, 40, 8);
+        // 50, not 40: now that `o open` has a rank of its own, `j/k spc tick`
+        // is what pays for it below 47 columns (see
+        // `the_base_footer_advertises_o_open`), so 40 no longer keeps it.
+        let narrow = rendered(&mut a, 50, 8);
         assert!(narrow.contains("j/k spc tick"), "the new binding survives truncation: {narrow}");
         assert!(narrow.contains("q quit"), "quit must never be the thing that gets clipped: {narrow}");
     }
 
     #[test]
     fn the_full_footer_shows_every_token() {
+        // 87 columns is the narrowest width that fits the whole table now
+        // that `o open` is in it — 79 no longer does (see
+        // `the_base_footer_advertises_o_open`, which drops `x clear` there).
         assert_eq!(
-            fit_hints(HINTS_PREVIEW, 79),
-            " e edit  j/k spc tick  n/N link  r title  l list  Up/Dn scroll  x clear  q quit"
+            fit_hints(HINTS_PREVIEW, 87),
+            " e edit  j/k spc tick  n/N link  o open  r title  l list  Up/Dn scroll  x clear  q quit"
         );
     }
 
     #[test]
     fn a_narrow_dock_drops_tokens_by_rank() {
-        // 46 columns is a typical right dock. Ranks drop x clear, Up/Dn scroll,
-        // r title and l list in that order; what is left fits in 39.
-        assert_eq!(fit_hints(HINTS_PREVIEW, 46), " e edit  j/k spc tick  n/N link  q quit");
-        // At the 37-column floor the checkbox hint goes too. Greedy by rank,
-        // not optimal packing: something shorter could still have fitted, and
-        // that is the accepted trade for one simple rule.
-        assert_eq!(fit_hints(HINTS_PREVIEW, 37), " e edit  n/N link  q quit");
+        // Ranks drop x clear, Up/Dn scroll, r title and l list in that order
+        // before `o open`'s own rank (3) is ever at risk; `the_base_footer_-
+        // advertises_o_open` picks up the story from here down to 46/37,
+        // where `j/k spc tick` is the last thing paid for `o open`'s place.
+        assert_eq!(
+            fit_hints(HINTS_PREVIEW, 78),
+            " e edit  j/k spc tick  n/N link  o open  r title  l list  Up/Dn scroll  q quit"
+        );
+        assert_eq!(
+            fit_hints(HINTS_PREVIEW, 64),
+            " e edit  j/k spc tick  n/N link  o open  r title  l list  q quit"
+        );
+        assert_eq!(
+            fit_hints(HINTS_PREVIEW, 55),
+            " e edit  j/k spc tick  n/N link  o open  l list  q quit"
+        );
+        // Greedy by rank, not optimal packing: something shorter could still
+        // have fitted, and that is the accepted trade for one simple rule.
+        assert_eq!(
+            fit_hints(HINTS_PREVIEW, 47),
+            " e edit  j/k spc tick  n/N link  o open  q quit"
+        );
     }
 
     #[test]
@@ -5516,18 +5537,29 @@ mod tests {
     // ----- o opens the cursored ticket in the browser ----------------------
 
     #[test]
-    fn o_without_a_cursor_or_config_does_nothing() {
+    fn o_finds_nothing_without_configured_tickets() {
         // No panic, no child, no output — the whole failure contract.
-        let mut a = ticket_app("HM-1\n");
+        // Ticket-shaped text resolves to no link at all without a `tickets`
+        // config, cursored or not: `link_hits` is empty either way, so bare
+        // `o`'s hit-0 behavior (`bare_o_opens_the_first_link_on_screen`) has
+        // nothing to reach.
+        //
+        // This test used to also cover a CONFIGURED note with no cursor
+        // pressed and no assertion about what should happen — that scenario
+        // is gone because "no cursor" is no longer a no-op: bare `o` now
+        // opens hit 0, and a body `HM-1` under `ticket_app` IS one. Exercising
+        // that via `on_key('o')` in a test would spawn a real child process
+        // (`tickets::open` really `spawn()`s a browser command), so that case
+        // is covered through `pending_open()` instead, which resolves the URL
+        // without launching anything (see `bare_o_opens_the_first_link_on_-
+        // screen`).
+        let mut a = app("HM-1\n"); // no config
         rendered(&mut a, 40, 10);
+        a.on_key(key(KeyCode::Char('o'))); // bare: no hit 0 exists either
+        assert!(a.open_children.is_empty());
+        a.on_key(key(KeyCode::Char('n')));
         a.on_key(key(KeyCode::Char('o')));
-        assert!(a.open_children.is_empty(), "no cursor, nothing to open");
-
-        let mut b = app("HM-1\n"); // no config
-        rendered(&mut b, 40, 10);
-        b.on_key(key(KeyCode::Char('n')));
-        b.on_key(key(KeyCode::Char('o')));
-        assert!(b.open_children.is_empty());
+        assert!(a.open_children.is_empty());
     }
 
     #[test]
@@ -5724,9 +5756,11 @@ mod tests {
     fn bare_o_ignores_the_tab_notes_title_while_showing_global() {
         // `self.note` IS the global note in Global mode, and its title is
         // user-settable with `r` ungated on `showing_tab_note()` — but the
-        // header shows `— ★ Global` and never a title in that mode. Without
-        // the gate in `pending_open`, `o` would launch a browser at a link
-        // derived from text nowhere on screen.
+        // header shows `— ★ Global` and never a title in that mode. There is
+        // no gate in `pending_open` any more (Task 3 removed it): `draw`
+        // itself contributes no title hits while Global is showing, so hit 0
+        // simply is not the title — without THAT restriction, `o` would still
+        // launch a browser at a link derived from text nowhere on screen.
         let mut a = ticket_app("body with no keys\n");
         a.note.title = "titled HM-1".into();
         a.active = ActiveNote::Global;
@@ -5743,5 +5777,143 @@ mod tests {
         a.note.title = "HM-1 and HM-2".into();
         rendered(&mut a, 60, 10);
         assert_eq!(a.pending_open().as_deref(), Some("https://example.test/browse/HM-1"));
+    }
+
+    // ----- Task 3: bare `o` is hit 0, no special case -----
+
+    #[test]
+    fn bare_o_opens_the_first_link_on_screen() {
+        // One rule, three shapes. Title first when it has a link…
+        let mut a = ticket_app("body HM-3 here\n");
+        a.note.title = "titled HM-1".into();
+        rendered(&mut a, 60, 10);
+        assert_eq!(a.pending_open().as_deref(), Some("https://example.test/browse/HM-1"));
+
+        // …the block when the title has none…
+        let mut b = ticket_app("body HM-3 here\n");
+        b.note.title = "no key here".into();
+        b.prompts = vec![crate::prompts::PromptGroup {
+            pane: "w1:p5".into(),
+            prompts: vec![prompt(1, "prompt HM-2 here")],
+        }];
+        b.prompt_labels = vec!["claude p5".into()];
+        rendered(&mut b, 60, 20);
+        assert_eq!(b.pending_open().as_deref(), Some("https://example.test/browse/HM-2"));
+
+        // …and the body when neither has one.
+        let mut c = ticket_app("body HM-3 here\n");
+        c.note.title = "no key here".into();
+        rendered(&mut c, 60, 10);
+        assert_eq!(c.pending_open().as_deref(), Some("https://example.test/browse/HM-3"));
+    }
+
+    #[test]
+    fn bare_o_with_no_links_anywhere_is_a_no_op() {
+        let mut a = ticket_app("nothing to open here\n");
+        a.note.title = "no key here".into();
+        rendered(&mut a, 60, 10);
+        assert_eq!(a.pending_open(), None);
+        a.on_key(key(KeyCode::Char('o')));
+        assert!(a.open_children.is_empty());
+    }
+
+    #[test]
+    fn a_cursor_still_beats_hit_zero() {
+        let mut a = ticket_app("body HM-3 here\n");
+        a.note.title = "titled HM-1".into();
+        rendered(&mut a, 60, 10);
+        a.on_key(key(KeyCode::Char('N'))); // cold N lands on the LAST hit
+        assert_eq!(a.pending_open().as_deref(), Some("https://example.test/browse/HM-3"));
+    }
+
+    #[test]
+    fn the_global_notes_title_is_still_unreachable_by_bare_o() {
+        // Not by a gate any more: in Global mode the header renders no title,
+        // so the title contributes no hits at all.
+        let mut a = ticket_app("");
+        a.note.title = "titled HM-1".into();
+        a.active = ActiveNote::Global;
+        rendered(&mut a, 60, 10);
+        assert_eq!(a.pending_open(), None);
+    }
+
+    #[test]
+    fn the_base_footer_advertises_o_open() {
+        assert_eq!(
+            fit_hints(HINTS_PREVIEW, 79),
+            " e edit  j/k spc tick  n/N link  o open  r title  l list  Up/Dn scroll  q quit"
+        );
+        // A 46-column dock keeps the two link keys and loses the checkbox hint.
+        assert_eq!(fit_hints(HINTS_PREVIEW, 46), " e edit  n/N link  o open  q quit");
+        assert_eq!(fit_hints(HINTS_PREVIEW, 37), " e edit  n/N link  o open  q quit");
+    }
+
+    #[test]
+    fn entering_edit_drops_a_live_title_link_cursor() {
+        // `draw_preview` (and its `clamp_link_cursor`) never runs in edit
+        // mode, but the header's title-span loop is unconditional and still
+        // reads `self.link_cursor` — so a cursor left pointing at the title
+        // when `e` is pressed would keep that key REVERSED under the
+        // `[edit]` header, where `o` is now plain text insertion. Chosen fix:
+        // clear the link cursor in `enter_edit` (rather than gate the span
+        // loop on `Mode::Preview`) — entering edit is one more context switch
+        // that ends the preview cursor session, the same as the overlay's
+        // self-delete or `x`'s confirm already do via `clear_cursors`, so
+        // this reads as one more site on that list, not a special case added
+        // to the render path.
+        let mut a = ticket_app("body\n");
+        a.note.title = "titled HM-1".into();
+        rendered(&mut a, 60, 10);
+        a.on_key(key(KeyCode::Char('n')));
+        assert_eq!(a.link_cursor, Some(0));
+        a.on_key(key(KeyCode::Char('e')));
+        assert_eq!(a.note.mode, Mode::Edit);
+        assert_eq!(a.link_cursor, None, "edit mode has no cursor concept");
+        assert_eq!(
+            reversed_on_row(&mut a, 60, 10, 0),
+            "",
+            "the title must not render inverse under the [edit] header"
+        );
+    }
+
+    #[test]
+    fn a_titled_body_less_note_still_orders_title_before_block() {
+        // All six of Task 2's ordinal tests give the note a body, so the
+        // empty-note branch's title-hit prepend
+        // (`let mut all = title_hits.to_vec(); all.extend(block_hits);`) went
+        // unexercised — despite a titled, body-less note being exactly why
+        // that branch exists (a titled note is not blank, so its file
+        // persists, and prompts keep accumulating on it).
+        let mut a = ticket_app("");
+        a.note.title = "titled HM-1".into();
+        a.prompts = vec![crate::prompts::PromptGroup {
+            pane: "w1:p5".into(),
+            prompts: vec![prompt(1, "prompt HM-2 here")],
+        }];
+        a.prompt_labels = vec!["claude p5".into()];
+        rendered(&mut a, 60, 20);
+        assert_eq!(
+            a.link_hits.iter().map(|h| h.text.as_str()).collect::<Vec<_>>(),
+            ["HM-1", "HM-2"],
+            "the title hit must precede the block hit on the empty-note branch too"
+        );
+        assert_eq!(
+            a.pending_open().as_deref(),
+            Some("https://example.test/browse/HM-1"),
+            "pending_open must resolve hit 0 through this branch too"
+        );
+    }
+
+    #[test]
+    fn a_multibyte_title_yields_one_hit_with_no_panic() {
+        // Panic-freedom here rests entirely on `find_links`' char-boundary
+        // guarantees — a byte-index slice through `café`/`✅` would panic.
+        let mut a = ticket_app("body\n");
+        a.note.title = "café HM-1 ✅".into();
+        rendered(&mut a, 60, 10); // must not panic
+        assert_eq!(
+            a.link_hits.iter().map(|h| h.text.as_str()).collect::<Vec<_>>(),
+            ["HM-1"]
+        );
     }
 }
