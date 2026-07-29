@@ -1484,9 +1484,37 @@ impl App {
                 .areas(area);
         self.body_height = usize::from(body_a.height);
 
+        // Title links are the FIRST ordinals — but the BODY renders first,
+        // because the preview returns the scroll hint this line displays. So
+        // scan the title NOW (a pure `find_links`, no rendering) and hand the
+        // count to the preview as the offset its own ordinals sit behind.
+        //
+        // Only when a title is actually on screen: never in Global mode (the
+        // header shows `★ Global`), never while the title editor is open, never
+        // for a blank title. That is what stops bare `o` opening text the user
+        // was never shown — by construction, not by a gate in `pending_open`.
+        let title_links: Vec<(std::ops::Range<usize>, markdown::LinkKind)> = if self
+            .title_input
+            .is_none()
+            && self.active != ActiveNote::Global
+            && !self.note.title.trim().is_empty()
+        {
+            markdown::find_links(&self.note.title, &self.tickets)
+        } else {
+            Vec::new()
+        };
+        let title_hits: Vec<markdown::LinkHit> = title_links
+            .iter()
+            .map(|(range, kind)| markdown::LinkHit {
+                text: self.note.title[range.clone()].to_string(),
+                kind: *kind,
+                row: None, // the header is a 1-row Paragraph outside the body
+            })
+            .collect();
+
         // Body first: the preview reports a scroll hint for the title line.
         let (mode, scroll_hint) = match self.note.mode {
-            Mode::Preview => ("preview", self.draw_preview(frame, body_a)),
+            Mode::Preview => ("preview", self.draw_preview(frame, body_a, &title_hits)),
             Mode::Edit => {
                 self.draw_edit(frame, body_a);
                 ("edit", None)
@@ -1520,24 +1548,35 @@ impl App {
             } else if !self.note.title.trim().is_empty() {
                 title.push(Span::raw(" —"));
                 let bold = Style::default().add_modifier(Modifier::BOLD);
-                // Underlined for consistency with the body, but cursorless: the
-                // header is a 1-row no-wrap Paragraph outside the scrollable
-                // body, so `n`/`N` can never reach it. Bare `o` is the
-                // affordance instead (see `pending_open`).
-                let text = format!(" {}", self.note.title);
+                // Underlined for consistency with the body. Once cursorless
+                // (the header is a 1-row no-wrap Paragraph outside the
+                // scrollable body, so `n`/`N` could never reach it) — now the
+                // title's links are the FIRST ordinals in `link_hits` (see
+                // `title_hits` above `draw_preview`) and reversed here exactly
+                // like any other region claims its own ordinal.
+                //
+                // The leading space is its own span so `title_links`' offsets
+                // index the raw title with no shift. Same total width as the
+                // old single ` {title}` span, which the age token's
+                // ALL-OR-NOTHING measurement below depends on.
+                title.push(Span::styled(" ", bold));
+                let t = &self.note.title;
                 let mut last = 0usize;
-                for (range, _) in markdown::find_links(&text, &self.tickets) {
+                for (i, (range, _)) in title_links.iter().enumerate() {
                     if range.start > last {
-                        title.push(Span::styled(text[last..range.start].to_string(), bold));
+                        title.push(Span::styled(t[last..range.start].to_string(), bold));
                     }
-                    title.push(Span::styled(
-                        text[range.clone()].to_string(),
-                        bold.add_modifier(Modifier::UNDERLINED),
-                    ));
+                    // Each region highlights its own ordinal; the title's are
+                    // the first ones, so the index IS the ordinal.
+                    let mut st = bold.add_modifier(Modifier::UNDERLINED);
+                    if self.link_cursor == Some(i) {
+                        st = st.add_modifier(Modifier::REVERSED);
+                    }
+                    title.push(Span::styled(t[range.clone()].to_string(), st));
                     last = range.end;
                 }
-                if last < text.len() {
-                    title.push(Span::styled(text[last..].to_string(), bold));
+                if last < t.len() {
+                    title.push(Span::styled(t[last..].to_string(), bold));
                 }
             }
             if let Some(hint) = scroll_hint {
@@ -1611,8 +1650,15 @@ impl App {
     }
 
     /// Renders the preview body; returns a "top-line/total" scroll hint when
-    /// the content overflows the pane.
-    fn draw_preview(&mut self, frame: &mut Frame, area: Rect) -> Option<String> {
+    /// the content overflows the pane. `title_hits` are the header's own link
+    /// hits (already ordinaled by `draw`, before this call) — the FIRST
+    /// ordinals in `link_hits`; everything found here is offset behind them.
+    fn draw_preview(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        title_hits: &[markdown::LinkHit],
+    ) -> Option<String> {
         // The rightmost column is reserved for the overflow scrollbar so text
         // never sits underneath it.
         let text_w = usize::from(area.width).saturating_sub(1).max(1);
@@ -1625,16 +1671,21 @@ impl App {
         // without going through it, so the render site re-checks
         // `showing_tab_note()` itself rather than trusting that invariant to
         // still hold by the time we draw.
+        // Ordinals run title → block → body. Each region gets the cursor
+        // rebased into its own numbering, and `None` means "the cursor is in an
+        // earlier region" — that region already applied its own REVERSED, so a
+        // later one must not claim the ordinal too.
+        let offset = title_hits.len();
+        let block_cursor = self.link_cursor.and_then(|c| c.checked_sub(offset));
         let (block, block_hits) = if self.showing_tab_note() {
-            prompt_block(&self.labelled_prompts(), text_w, &self.tickets, self.link_cursor)
+            prompt_block(&self.labelled_prompts(), text_w, &self.tickets, block_cursor)
         } else {
             (Vec::new(), Vec::new())
         };
-        // The block sits above the note, so its hits are the FIRST ordinals and
-        // a body cursor is offset by however many the block holds. `None` here
-        // means "the cursor is in the block" — the block already applied its own
-        // REVERSED, so the body render must not claim the ordinal too.
-        let body_cursor = self.link_cursor.and_then(|c| c.checked_sub(block_hits.len()));
+        // The block sits above the note, so its hits are the next ordinals
+        // behind the title's, and a body cursor is offset by however many the
+        // block holds on top of that.
+        let body_cursor = block_cursor.and_then(|c| c.checked_sub(block_hits.len()));
         // The empty-note help used to be a fixed-height special case (forced
         // `preview_scroll = 0`, no hint, no scrollbar) on the assumption the
         // block could never exceed a couple of rows. Grouping removed that
@@ -1651,11 +1702,14 @@ impl App {
         // what `map` contains.
         let (mut lines, map): (Vec<Line<'static>>, Vec<Option<usize>>) =
             if self.note.text.trim().is_empty() {
-                // No body, so no body links — but the block's hits survive: a
-                // titled, body-less note still accumulates prompts, and those
-                // prompts are the only links it has. Clearing here would drop
-                // them the instant the note itself goes empty.
-                self.link_hits = block_hits;
+                // No body, so no body links — but the title's and the
+                // block's hits survive: a titled, body-less note still
+                // accumulates prompts, and the title plus those prompts are
+                // the only links it has. Clearing here would drop them the
+                // instant the note itself goes empty.
+                let mut all = title_hits.to_vec();
+                all.extend(block_hits);
+                self.link_hits = all;
                 let mut lines = block;
                 lines.extend(empty_help().lines().map(|l| {
                     Line::from(Span::styled(l.to_string(), Style::default().add_modifier(Modifier::DIM)))
@@ -1685,17 +1739,20 @@ impl App {
                     // (via `prompt_block`/`block_line`) and its hits already
                     // carry correct rows, so they are untouched — only these
                     // body-side rows need the shift. Ordinals are a separate
-                    // axis from rows: block hits take the FIRST ordinals and
-                    // body ordinals are offset by `block_hits.len()`, done
-                    // below where `all` is assembled.
+                    // axis from rows: title hits take the FIRST ordinals, block
+                    // hits the next, and body ordinals are offset by
+                    // `title_hits.len() + block_hits.len()`, done below where
+                    // `all` is assembled.
                     for hit in &mut hits {
                         hit.row = hit.row.map(|r| r + n);
                     }
                 }
-                // Block hits occupy the FIRST ordinals; the body's own hits
-                // (already reversed by `render_markdown_links` at `body_cursor`)
-                // are appended after them, matching the offset computed above.
-                let mut all = block_hits;
+                // Title hits occupy the FIRST ordinals, block hits the next,
+                // and the body's own hits (already reversed by
+                // `render_markdown_links` at `body_cursor`) are appended after
+                // them, matching the offset computed above.
+                let mut all = title_hits.to_vec();
+                all.extend(block_hits);
                 all.extend(hits);
                 self.link_hits = all;
                 (lines, map)
@@ -5536,13 +5593,121 @@ mod tests {
         );
     }
 
+    /// Reversed cells on one row of a rendered frame, as text.
+    fn reversed_on_row(a: &mut App, w: u16, h: u16, row: u16) -> String {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|f| a.draw(f)).unwrap();
+        let buf = term.backend().buffer();
+        (0..w)
+            .filter_map(|x| buf.cell((x, row)))
+            .filter(|c| c.modifier.contains(Modifier::REVERSED))
+            .map(|c| c.symbol().to_string())
+            .collect()
+    }
+
+    /// Every reversed cell in a rendered frame, as text.
+    fn reversed_all(a: &mut App, w: u16, h: u16) -> String {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|f| a.draw(f)).unwrap();
+        let buf = term.backend().buffer();
+        (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .filter_map(|(x, y)| buf.cell((x, y)))
+            .filter(|c| c.modifier.contains(Modifier::REVERSED))
+            .map(|c| c.symbol().to_string())
+            .collect()
+    }
+
     #[test]
-    fn a_live_cursor_beats_the_title() {
+    fn n_from_cold_lands_on_the_titles_link() {
         let mut a = ticket_app("body HM-2 here\n");
         a.note.title = "titled HM-1".into();
         rendered(&mut a, 60, 10);
         a.on_key(key(KeyCode::Char('n')));
+        assert_eq!(a.link_cursor, Some(0));
+        assert_eq!(a.link_hits[0].text, "HM-1");
+        assert_eq!(a.link_hits[0].row, None, "the header has no scrollable row");
+        // Row 0 is the header.
+        assert_eq!(reversed_on_row(&mut a, 60, 10, 0), "HM-1");
+    }
+
+    #[test]
+    fn both_links_in_a_title_are_reachable() {
+        let mut a = ticket_app("body only\n");
+        a.note.title = "HM-1 and HM-2".into();
+        rendered(&mut a, 60, 10);
+        a.on_key(key(KeyCode::Char('n')));
+        assert_eq!(a.pending_open().as_deref(), Some("https://example.test/browse/HM-1"));
+        a.on_key(key(KeyCode::Char('n')));
         assert_eq!(a.pending_open().as_deref(), Some("https://example.test/browse/HM-2"));
+        assert_eq!(reversed_on_row(&mut a, 60, 10, 0), "HM-2");
+    }
+
+    #[test]
+    fn ordinals_walk_title_then_block_then_body() {
+        // The load-bearing test: three regions, one list, and exactly one
+        // region highlighted per ordinal. This is the third change to the
+        // ordinal offset and every previous bug hid in the two-list agreement.
+        let mut a = ticket_app("body HM-3 here\n");
+        a.note.title = "titled HM-1".into();
+        a.prompts = vec![crate::prompts::PromptGroup {
+            pane: "w1:p5".into(),
+            prompts: vec![prompt(1, "prompt HM-2 here")],
+        }];
+        a.prompt_labels = vec!["claude p5".into()];
+        rendered(&mut a, 60, 20);
+        assert_eq!(
+            a.link_hits.iter().map(|h| h.text.as_str()).collect::<Vec<_>>(),
+            ["HM-1", "HM-2", "HM-3"]
+        );
+        for (ordinal, expected, others) in
+            [(0usize, "HM-1", ["HM-2", "HM-3"]), (1, "HM-2", ["HM-1", "HM-3"]), (2, "HM-3", ["HM-1", "HM-2"])]
+        {
+            a.link_cursor = Some(ordinal);
+            let reversed = reversed_all(&mut a, 60, 20);
+            assert!(reversed.contains(expected), "ordinal {ordinal}: {reversed:?}");
+            for other in others {
+                assert!(!reversed.contains(other), "ordinal {ordinal} also reversed {other}");
+            }
+            assert!(a.pending_open().unwrap().ends_with(expected));
+        }
+    }
+
+    #[test]
+    fn selecting_a_title_link_does_not_scroll_the_body() {
+        let mut a = ticket_app(&format!("{}HM-2 at the bottom\n", "filler\n".repeat(40)));
+        a.note.title = "titled HM-1".into();
+        rendered(&mut a, 60, 10);
+        a.on_key(key(KeyCode::Char('n')));
+        rendered(&mut a, 60, 10);
+        assert_eq!(a.link_cursor, Some(0));
+        assert_eq!(a.preview_scroll, 0, "a rowless hit has nothing to scroll to");
+    }
+
+    #[test]
+    fn the_global_note_contributes_no_title_hits() {
+        let mut a = ticket_app("global body HM-2\n");
+        a.note.title = "titled HM-1".into();
+        a.active = ActiveNote::Global;
+        rendered(&mut a, 60, 10);
+        assert_eq!(
+            a.link_hits.iter().map(|h| h.text.as_str()).collect::<Vec<_>>(),
+            ["HM-2"],
+            "the header shows ★ Global and never a title, so its links are not on screen"
+        );
+    }
+
+    #[test]
+    fn the_open_title_editor_contributes_no_title_hits() {
+        let mut a = ticket_app("body HM-2 here\n");
+        a.note.title = "titled HM-1".into();
+        a.title_input = Some("titled HM-1".into());
+        rendered(&mut a, 60, 10);
+        assert_eq!(
+            a.link_hits.iter().map(|h| h.text.as_str()).collect::<Vec<_>>(),
+            ["HM-2"],
+            "the header shows the editor, not the title"
+        );
     }
 
     #[test]
