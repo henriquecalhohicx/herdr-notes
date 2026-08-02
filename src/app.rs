@@ -978,7 +978,18 @@ impl App {
             KeyCode::Home | KeyCode::Char('g') => self.preview_scroll = 0,
             KeyCode::End | KeyCode::Char('G') => self.preview_scroll = usize::MAX, // clamped in draw
             KeyCode::Char('x') => self.confirm_clear = true,
-            KeyCode::Char('r') => self.title_input = Some(self.note.title.clone()),
+            KeyCode::Char('r') => {
+                // The title's hits vanish from `link_hits` the instant the
+                // editor is open (`draw`'s title-hit scan is gated on
+                // `title_input.is_none()`), so a cursor left pointing at the
+                // title would get rebased by the next `clamp_link_cursor`
+                // onto whatever is now first in the shortened list — the
+                // highlight visibly jumps from the title to an unrelated
+                // block/body link for as long as the editor stays open.
+                // Same shape as the bug `enter_edit` clears this for.
+                self.clear_link_cursor();
+                self.title_input = Some(self.note.title.clone());
+            }
             KeyCode::Char('l') => self.open_overlay(),
             _ => {}
         }
@@ -5313,6 +5324,27 @@ mod tests {
             rendered(&mut a, 44, 8).lines().next().unwrap().contains("2h ago"),
             "a wide enough header still shows the age"
         );
+
+        // The branch's own risk: a title with a link is assembled from
+        // MULTIPLE spans (plain text, then an underlined key, then more
+        // plain text), not the single span the sweep above measures. The
+        // ALL-OR-NOTHING width check sums `dwidth` over every span already
+        // pushed (`used: usize = title.iter().map(|s| dwidth(&s.content)).sum()`),
+        // so this must hold just as strictly for a multi-span title.
+        let mut b = ticket_app("body");
+        b.note.title = "HM-1 Sprint Notes".into();
+        b.note.updated = state::unix_now().saturating_sub(2 * 60 * 60);
+        for w in 16..=52u16 {
+            let screen = rendered(&mut b, w, 8);
+            let header = screen.lines().next().unwrap().to_string();
+            let whole = header.contains("2h ago");
+            assert!(whole || !header.contains("2h"), "partial age at width {w}: {header:?}");
+            assert!(whole || !header.contains("ag"), "partial age at width {w}: {header:?}");
+        }
+        assert!(
+            rendered(&mut b, 52, 8).lines().next().unwrap().contains("2h ago"),
+            "a wide enough header still shows the age behind a multi-span title"
+        );
     }
 
     // ----- overlay row layout ---------------------------------------------
@@ -5890,6 +5922,72 @@ mod tests {
             "",
             "the title must not render inverse under the [edit] header"
         );
+    }
+
+    #[test]
+    fn renaming_drops_a_live_title_link_cursor() {
+        // Same shape as `entering_edit_drops_a_live_title_link_cursor`, and
+        // also the title's hit count SHRINKING (to zero) under a live
+        // cursor: `r` opens the title editor, `draw`'s title-hit scan is
+        // gated on `title_input.is_none()` (see
+        // `the_open_title_editor_contributes_no_title_hits`), so the
+        // title's hits vanish from `link_hits` the instant the editor
+        // opens. Without clearing the link cursor here too,
+        // `clamp_link_cursor` on the next draw would rebase ordinal 0 onto
+        // whatever is now first in the shortened list (a block or body
+        // link), and the highlight would visibly jump off the title while
+        // the editor is open.
+        let mut a = ticket_app("body HM-2 here\n");
+        a.note.title = "titled HM-1".into();
+        rendered(&mut a, 60, 10);
+        a.on_key(key(KeyCode::Char('n')));
+        assert_eq!(a.link_cursor, Some(0));
+        a.on_key(key(KeyCode::Char('r')));
+        assert!(a.title_input.is_some(), "r must open the title editor");
+        assert_eq!(a.link_cursor, None, "the title editor has no cursor concept");
+        assert_eq!(
+            reversed_all(&mut a, 60, 10),
+            "",
+            "no link may render inverse while the title editor is open"
+        );
+    }
+
+    #[test]
+    fn n_and_n_upper_cross_region_boundaries() {
+        // `ordinals_walk_title_then_block_then_body` assigns `link_cursor`
+        // directly to prove each region highlights the right ordinal at a
+        // given ordinal; nothing exercises `move_link` (the actual `n`/`N`
+        // handler) stepping ACROSS a region boundary. Three regions, one
+        // list: walk title -> block -> body forward with `n`, then walk
+        // body -> title backward with `N`.
+        let mut a = ticket_app("body HM-3 here\n");
+        a.note.title = "titled HM-1".into();
+        a.prompts = vec![crate::prompts::PromptGroup {
+            pane: "w1:p5".into(),
+            prompts: vec![prompt(1, "prompt HM-2 here")],
+        }];
+        a.prompt_labels = vec!["claude p5".into()];
+        rendered(&mut a, 60, 20);
+
+        a.on_key(key(KeyCode::Char('n')));
+        assert_eq!(a.link_cursor, Some(0), "n from cold lands on the title");
+        assert_eq!(a.pending_open().as_deref(), Some("https://example.test/browse/HM-1"));
+
+        a.on_key(key(KeyCode::Char('n')));
+        assert_eq!(a.link_cursor, Some(1), "n walks title -> block");
+        assert_eq!(a.pending_open().as_deref(), Some("https://example.test/browse/HM-2"));
+
+        a.on_key(key(KeyCode::Char('n')));
+        assert_eq!(a.link_cursor, Some(2), "n walks block -> body");
+        assert_eq!(a.pending_open().as_deref(), Some("https://example.test/browse/HM-3"));
+
+        a.on_key(key(KeyCode::Char('N')));
+        assert_eq!(a.link_cursor, Some(1), "N walks body -> block");
+        assert_eq!(a.pending_open().as_deref(), Some("https://example.test/browse/HM-2"));
+
+        a.on_key(key(KeyCode::Char('N')));
+        assert_eq!(a.link_cursor, Some(0), "N walks block -> title");
+        assert_eq!(a.pending_open().as_deref(), Some("https://example.test/browse/HM-1"));
     }
 
     #[test]

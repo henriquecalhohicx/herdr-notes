@@ -28,9 +28,13 @@ findings doc (and the reference implementation, `herdr-sidebar`) lives in
   cursor merely existing instead would re-force the viewport to it on every
   draw and make `Up`/`Down`/`g`/`G`/PgUp/PgDn look broken the instant a
   cursor is set. Preview also carries a SECOND cursor, `link_cursor` — an
-  ordinal into `App.link_hits`, the hit list the last preview draw's
-  `render_markdown_links` produced (see the `src/markdown.rs` entry below;
-  it is never a fresh scan) — mutually exclusive with `box_cursor` so `esc`
+  ordinal into `App.link_hits`, assembled by the CURRENT draw from three
+  sources, not by `render_markdown_links` alone (title hits from a fresh
+  `find_links` scan in `draw` itself, block hits from `block_line`, body
+  hits from `render_markdown_links`; see the `src/markdown.rs` entry below
+  and the THREE-REGION explanation a few sentences on) — never a scan
+  triggered BY a keypress, only ever a draw product read back afterward —
+  mutually exclusive with `box_cursor` so `esc`
   and `space` stay unambiguous: `n`/`N` (`move_link`) walk it and drop
   `box_cursor` doing so, `j`/`k`/`space` drop it back — NOT symmetrically:
   `j`/`k`/`space` call `clear_link_cursor` UNCONDITIONALLY before they touch
@@ -60,8 +64,11 @@ findings doc (and the reference implementation, `herdr-sidebar`) lives in
   offset behind both. Title hits exist only when a title is actually
   rendered — not in Global mode, not while the title editor (`title_input`)
   is open, not for a blank title — which is the whole mechanism stopping
-  `n`/`N`/bare `o` from ever reaching text the header is not showing; there
-  is no gate in `pending_open` for this any more (see Gotchas). A rowless
+  `n`/`N`/bare `o` from ever reaching text the header does not render at
+  all; there is no gate in `pending_open` for this any more (see Gotchas —
+  that same Gotchas entry also records a known, NOT-yet-fixed gap: this
+  stops hits on text the header never draws, not hits on text the header
+  draws but clips in a narrow dock). A rowless
   hit's `row: Option<usize>` being `None` also means `follow_link` skips
   scrolling for it, so selecting the title hit leaves `preview_scroll`
   untouched. `pending_open` is simply the cursored hit if `link_cursor` is
@@ -718,18 +725,39 @@ Learned building this plugin:
   them by `block.len()` exactly as it shifts `map` (the block's own hits
   already carry correct rows and are left alone). Forgetting that scrolls the
   link cursor to a row in the prompt block.
-- Block links occupy the FIRST ordinals and body links are offset by
-  `block_hits.len()`. `render_markdown_links` highlights the nth BODY hit, so
-  `draw_preview` passes `cursor - block_hits.len()` and `None` when the cursor
-  is in the block (the block applied its own REVERSED). Two hit lists agreeing
-  on one order is the same failure shape as the cross-line ordinal bug above.
+- Ordinals run title → block → body, in that order, even though the title is
+  RENDERED last: `draw` renders the body first (`draw_preview` returns the
+  scroll hint the title line itself displays), so the title is SCANNED early
+  instead — a pure `find_links` over `self.note.title`, no rendering — and
+  its count (`title_hits.len()`) is handed to `draw_preview` as the offset
+  the block's and body's own cursors are rebased behind. The block's hits
+  sit at the next ordinals (offset by `title_hits.len()`); the body's hits
+  are offset by `title_hits.len() + block_hits.len()`
+  (`render_markdown_links` highlights the nth BODY hit at that rebased
+  index, and `checked_sub` yields `None` once the cursor belongs to an
+  EARLIER region, since that region already applied its own REVERSED).
+  Moving the title scan after the body render, or getting either offset
+  wrong, silently renumbers or misdirects every later ordinal — three hit
+  lists agreeing on one order is the same failure shape as the cross-line
+  ordinal bug above. (This folds what used to be two Gotchas stating this
+  rule 70 lines apart, one of them describing a now-stale two-region
+  offset — keep it to the one bullet.)
 - The empty-note preview branch must KEEP the block's hits, not clear them: a
   titled, body-less note still has a note file and so still accumulates
   prompts, and those prompts are the only links it has.
-- The header title can be styled but can NEVER host a cursor — it is a 1-row
-  no-wrap `Paragraph` outside the scrollable body. Bare `o` (no cursor live)
-  opening the title's first link is the affordance that replaces one, and it
-  is why `pending_open` has a title fallback at all.
+- CORRECTED: the header title CAN host a cursor. Title links are the FIRST
+  ordinals in `link_hits`, and the title span loop in `draw` applies its own
+  REVERSED at its own ordinal exactly like any other region (`src/app.rs`,
+  the `self.link_cursor == Some(i)` check in the title-span loop). `o` with
+  no cursor live opens `link_hits.first()` — `pending_open` has no
+  title-specific branch at all, on a ticket-named note hit 0 simply IS the
+  title's link. (A task review already fixed this identical false claim
+  once, in the Layout section above; this was the second copy, in Gotchas,
+  which is the section this crate's bug attributions actually cite — check
+  both when a title-links claim turns out wrong.) What remains true and
+  worth keeping: the header hosts no SCROLLABLE row — it is a 1-row no-wrap
+  `Paragraph` outside the scrollable body — which is exactly why a title hit
+  carries `row: None` and `follow_link` never scrolls the body for it.
 - A ratatui widget cannot emit OSC 8 hyperlinks and herdr owns pane mouse
   events, so a mouse-clickable link is not reachable from this plugin at all.
   `n`/`N`/`o` is not a stylistic choice, it is the only mechanism available.
@@ -780,25 +808,50 @@ Learned building this plugin:
   edit that removed links renders with the STALE ordinal — nothing highlighted,
   because it points past the end of the new, shorter hit list — and only the
   very next `o` opens the already-clamped hit. One frame of no highlight,
-  accepted; do not "fix" it by re-rendering after the clamp.
-- The block/body ordinal offset (`block_hits.len()`) moves whenever the
-  block's own hit count changes — a heartbeat delivering a new prompt that
-  contains a link, or a resize that pushes a block link past `truncate_w` and
-  drops it. Highlight and open target still agree with each other (both
-  re-derive from the one `link_hits` list on the same draw), but a link
-  cursor left live across such a change can silently retarget to a different
-  link than the one the user pointed it at.
-- Title links are the FIRST ordinals, but the title is rendered LAST — `draw`
-  renders the body first because `draw_preview` returns the scroll hint the
-  title line displays. So the title is SCANNED early (a pure `find_links`, no
-  rendering) and its count is handed to `draw_preview` as the offset the
-  block and body cursors sit behind. Moving that scan after the body render
-  silently renumbers every ordinal.
-- Title hits exist only when a title is actually on screen: not in Global
-  mode, not while `title_input` is open, not for a blank title. That is the
-  whole mechanism stopping bare `o` from opening text the user was never
-  shown — there is no gate in `pending_open` any more, so a future header
-  state that hides the title has to be added to that condition too.
+  accepted; do not "fix" it by re-rendering after the clamp. Narrower than it
+  sounds, though: that clamp call sits at the end of `draw_preview`, AFTER
+  the block/body hits have already rendered (and reversed) using the STALE
+  cursor, but BEFORE `draw`'s title-span loop runs — the title spans are
+  built once `draw_preview` returns. So on a title-only note (no block/body
+  hits to go stale) the clamped ordinal highlights correctly in the very
+  same frame; the one-frame gap is a block/body-only symptom.
+- The block/body ordinal offset (now `title_hits.len() + block_hits.len()`)
+  moves whenever EITHER upstream region's hit count changes, not just the
+  block's: a heartbeat delivering a new prompt that contains a link, a
+  resize that pushes a block link past `truncate_w` and drops it, OR
+  `maybe_autotitle` re-deriving the auto title on that same heartbeat and
+  introducing (or removing) a ticket key in the title — which inserts (or
+  removes) ordinal 0 out from under a live cursor just as surely as a block
+  change does, and is the MORE frequent trigger of the two since it runs
+  every 5s heartbeat rather than only when a new prompt lands. Highlight and
+  open target still agree with each other (both re-derive from the one
+  `link_hits` list on the same draw), but a link cursor left live across
+  such a change can silently retarget to a different link than the one the
+  user pointed it at. (This folds a duplicate of the same bullet that only
+  named the block trigger and the pre-title-hits `block_hits.len()` offset —
+  keep it to the one bullet; see also the three-region rule earlier in this
+  section.)
+- Title hits exist only when a title is actually rendered at all: not in
+  Global mode, not while `title_input` is open, not for a blank title. That
+  is the whole mechanism stopping bare `o` from opening text the header does
+  not render at all — there is no gate in `pending_open` any more, so a
+  future header state that hides the title has to be added to that
+  condition too.
+- Known limitation, NOT fixed in this wave: "does not render" is not the
+  same as "does not FIT". The gate above stops `n`/`N`/bare `o` from
+  reaching text the header never draws at all (Global mode, the title
+  editor open, a blank title) — it does not stop them reaching text the
+  header draws but CLIPS. The header is a no-wrap `Paragraph` that
+  cell-clips at `title_a.width`, and the title scan (`markdown::find_links`
+  over the raw `self.note.title`) has no reference to that width, so in a
+  narrow dock a title whose key sits past the cut is still a selectable
+  ordinal — it highlights nothing visible on screen and `o` opens a URL the
+  user never saw. `follow_link` correctly skips a rowless hit (there is no
+  body row to scroll to), so no key can bring it into view either. Coupling
+  the scan to `title_a.width` (or otherwise excluding hits past the visible
+  cut) is a deliberate follow-up, not an oversight — left as documentation
+  only in this wave since it is a behavioural change to a title-links path
+  this branch only just stabilized.
 - `LinkHit.row` is `Option<usize>` because the header is a 1-row no-wrap
   `Paragraph` outside the scrollable body. `follow_link` skips a `None` row; a
   sentinel row number instead would scroll the body to an arbitrary line the
