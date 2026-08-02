@@ -5991,6 +5991,80 @@ mod tests {
     }
 
     #[test]
+    fn a_shrinking_title_retargets_a_live_cursor_rather_than_dropping_it() {
+        // The documented retarget hazard, from the trigger that fires most
+        // often in practice: `maybe_autotitle` re-derives an auto title on the
+        // heartbeat, so a pane rename can remove ordinal 0 out from under a
+        // live cursor. Nothing pinned what happens next — `clamp_link_cursor`
+        // only keeps the ordinal IN RANGE, so a still-valid ordinal survives
+        // and the selection silently moves to a different link.
+        let mut a = ticket_app("body HM-2 here\n");
+        a.note.title = "titled HM-1".into();
+        rendered(&mut a, 60, 10);
+        a.on_key(key(KeyCode::Char('n')));
+        assert_eq!(a.pending_open().as_deref(), Some("https://example.test/browse/HM-1"));
+
+        a.note.title = "renamed, no key".into();
+        rendered(&mut a, 60, 10);
+        assert_eq!(a.link_cursor, Some(0), "the ordinal is still in range, so it stays");
+        assert_eq!(
+            a.pending_open().as_deref(),
+            Some("https://example.test/browse/HM-2"),
+            "…but it now points at the body's link, not the title's"
+        );
+    }
+
+    #[test]
+    fn a_title_key_clipped_by_a_narrow_header_is_still_selectable() {
+        // KNOWN LIMITATION, pinned so the follow-up that fixes it has a
+        // before/after. The title scan reads the raw `note.title` and knows
+        // nothing about `title_a.width`, while the header is a no-wrap
+        // `Paragraph` that cell-clips — so a key past the cut is a real
+        // ordinal that highlights nothing visible, and `follow_link` cannot
+        // rescue it because a title hit is rowless by design.
+        let mut a = ticket_app("body without links\n");
+        a.note.title = "Investigate HM-1".into();
+        let screen = rendered(&mut a, 24, 10);
+        assert!(!screen.contains("HM-1"), "the key is clipped off the right edge: {screen:?}");
+        assert_eq!(a.link_hits.len(), 1, "…and yet it is a selectable hit");
+        a.on_key(key(KeyCode::Char('n')));
+        assert_eq!(a.link_cursor, Some(0));
+        assert_eq!(a.pending_open().as_deref(), Some("https://example.test/browse/HM-1"));
+    }
+
+    #[test]
+    fn fit_hints_breaks_a_rank_tie_on_the_later_slice_position() {
+        // All three real tables give every token a distinct rank, so the
+        // `(rank, index)` tie-break never fires — a future duplicate rank
+        // would drop whichever token the ordering happened to favour. Pin the
+        // documented rule: at equal rank, the LATER token in display order
+        // goes first.
+        const TIED: Hints = &[("aaa", 1), ("bbb", 1), ("q quit", 0)];
+        assert_eq!(fit_hints(TIED, 40), " aaa  bbb  q quit");
+        assert_eq!(fit_hints(TIED, 12), " aaa  q quit");
+        assert_eq!(fit_hints(TIED, 8), " q quit");
+    }
+
+    #[test]
+    fn o_opens_a_url_found_in_the_prompt_block() {
+        // `a_short_prompt_with_a_url_still_gets_a_hit` stops at the hit. This
+        // walks the whole path a user does: cursor onto the block's URL and
+        // resolve what `o` would hand the browser — a URL resolves to itself,
+        // never through the ticket config.
+        let mut a = ticket_app("");
+        a.note.title = "no key here".into();
+        a.prompts = vec![crate::prompts::PromptGroup {
+            pane: "w1:p5".into(),
+            prompts: vec![prompt(1, "see https://example.test/doc for context")],
+        }];
+        a.prompt_labels = vec!["claude p5".into()];
+        rendered(&mut a, 60, 20);
+        a.on_key(key(KeyCode::Char('n')));
+        assert_eq!(a.link_cursor, Some(0));
+        assert_eq!(a.pending_open().as_deref(), Some("https://example.test/doc"));
+    }
+
+    #[test]
     fn a_titled_body_less_note_still_orders_title_before_block() {
         // All six of Task 2's ordinal tests give the note a body, so the
         // empty-note branch's title-hit prepend

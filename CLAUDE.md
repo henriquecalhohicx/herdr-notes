@@ -364,9 +364,17 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
-All three must pass before shipping. `cargo build --release` fails with os error 5
-while the TUI is running in a pane — quit/close the pane first (and
-`Get-Process herdr-notes | Stop-Process` for stragglers).
+All three must pass before shipping. `cargo test --lib` does NOT work — this is a
+bin-only crate (`[[bin]]`, no `[lib]`), so every unit test lives in the binary's
+own test binary; use `cargo test` or `cargo test <name>`.
+
+`cargo build --release` fails with os error 5 while the TUI is running in a pane.
+Close it GRACEFULLY first — `herdr pane send-keys <pane> Escape` then
+`herdr pane send-keys <pane> q`, finding the pane by its `Notes` label in
+`herdr pane list`. That is a save-and-quit; `herdr pane close` and
+`Get-Process herdr-notes | Stop-Process` both kill without a signal and take the
+2s debounce buffer with them, so Stop-Process is a last resort for a pane that
+is already dead, not the way to free the binary.
 
 ## Plugin dev workflow
 
