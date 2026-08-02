@@ -25,3 +25,26 @@ pub const DEFAULT: &str = "\
 ## Notes
 
 ";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_has_a_blank_line_after_every_heading() {
+        // Pins the exact line list rather than just the Status insertion
+        // point (`app::tests::first_edit_seeds_the_template` covers that):
+        // a future edit to this const could reflow the blank lines around
+        // `## Next`/`## Notes` while still passing every OTHER existing
+        // check (`is_blank`'s `==`, `enter_edit`'s row-1 cursor) since none
+        // of those look past the Status section. The `[ ] ` line's trailing
+        // space is part of this literal comparison too — `cat -A` is the
+        // manual equivalent for anyone editing the const by hand.
+        let lines: Vec<&str> = DEFAULT.split('\n').collect();
+        assert_eq!(
+            lines,
+            vec!["## Status", "", "", "## Next", "", "[ ] ", "", "## Notes", "", ""],
+            "a blank line must sit between every heading and its content"
+        );
+    }
+}
