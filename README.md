@@ -104,10 +104,11 @@ Edit:
 ### Links
 
 Configured issue keys (`HM-54599`) and bare `http(s)://` URLs in the note are
-underlined. `n`/`N` walk them — the captured-prompt block above the note counts
-too, and its links come first — `o` opens the selected one in your browser,
-`esc` drops the cursor. With NO cursor live, `o` opens the first LINK (a key
-or a URL) in the note's title, which is where the ticket usually is.
+underlined. `n`/`N` walk every link in the note, in document order: the
+title first, then the captured-prompt block, then the note body — including
+links currently scrolled off screen. `o` opens the selected one; with no
+selection it opens the first link in the note, which on a ticket-named note
+is the title's. `esc` drops the cursor.
 
 Create `tickets.json` beside the note files (`%LOCALAPPDATA%\herdr\plugins\herdr-notes\`
 inside herdr, `%APPDATA%\herdr\notes\` outside it; unix
